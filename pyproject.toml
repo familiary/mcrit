@@ -64,7 +64,7 @@ dev = [
     # found #186, a parameter that had been silently ignored for as long as it existed. Take the
     # bump in its own change once the tree is clean under the new version, and never merge a red
     # one - during a deep PR queue it reddens every open branch for reasons unrelated to them.
-    "ty==0.0.79",
+    "ty==0.0.82",
 ]
 
 [project.urls]
