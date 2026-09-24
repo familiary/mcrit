@@ -10,11 +10,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)-15s %(message)s")
 logging.disable(logging.CRITICAL)
 
 
+class DummyShingler(AbstractShingler):
+    def _generateByteSequences(self, function_object):
+        return []
+
+
 class MinHashingTestSuite(unittest.TestCase):
     """Run a full example on a memory dump"""
 
     def testBucketing(self):
-        shingler = AbstractShingler("dummy")
+        shingler = DummyShingler("dummy")
         test_pairs = {
             0: (0, 0, 1),
             2: (1, 2, 3),
