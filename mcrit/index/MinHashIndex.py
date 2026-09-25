@@ -191,6 +191,12 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 raise MemoryError("Export running beyond the allocated maximum, aborting operation.")
         exported_data["content"]["num_families"] = len(family_mapping)
         exported_data["family_mapping"] = family_mapping
+        # the family attributes beyond the name (#57); an importer without this key ignores it
+        exported_data["family_actors"] = {}
+        for family_id in family_mapping:
+            family_entry = storage.getFamily(family_id)
+            if family_entry is not None and family_entry.actors:
+                exported_data["family_actors"][family_id] = list(family_entry.actors)
         exported_data["sample_entries"] = exported_sample_entries
         exported_data["function_entries"] = exported_function_entries
         return exported_data
@@ -283,6 +289,19 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             else:
                 import_report["num_families_skipped"] += 1
             family_id_remapping[exported_family_id] = remapped_family_id
+        # actors of imported families are merged into what this instance already knows (#57)
+        for exported_family_id, actors in (export_data.get("family_actors") or {}).items():
+            remapped_family_id = family_id_remapping.get(int(exported_family_id))
+            local_family = storage.getFamily(remapped_family_id) if remapped_family_id is not None else None
+            # held to what the API accepts: an export is data from elsewhere
+            valid_actors = [actor for actor in actors or [] if FamilyEntry.isValidActor(actor)]
+            if len(valid_actors) != len(actors or []):
+                LOGGER.warning("Dropping %d invalid actor name(s) of imported family %s.", len(actors or []) - len(valid_actors), exported_family_id)
+            actors = FamilyEntry.normalizeActors(valid_actors)
+            if local_family is not None and actors:
+                merged = list(local_family.actors) + [actor for actor in actors if actor not in local_family.actors]
+                if merged != local_family.actors:
+                    storage.modifyFamily(remapped_family_id, {"actors": merged})
         LOGGER.info("Family remapping created: %d families, %d samples.", len(family_id_remapping), len(export_data["sample_entries"]))
         # iterate samples
         index = 0

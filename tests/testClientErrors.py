@@ -109,6 +109,14 @@ class ClientModesTest(unittest.TestCase):
             with self.assertRaises(McritBadRequest):
                 client.deleteFamily(1)
 
+    def test_modify_family_raises_through_the_client_mode_too(self):
+        """modifyFamily grew its actors on a branch written before these modes existed, where
+        it called handle_response directly - which answers None whatever mode the client is in."""
+        client = McritClient("http://mcrit.test", raise_client_errors=True)
+        with patch("mcrit.client.McritClient.requests.put", return_value=answer(400, FAILED, url="http://mcrit.test/families/3")):
+            with self.assertRaises(McritBadRequest):
+                client.modifyFamily(3, actors=["APT-1"])
+
     def test_the_maintenance_jobs_raise_through_the_client_mode(self):
         """rebuildPicBlockHashIndex, repairMinHashes and recomputeFamilyStats landed while the
         modes were being written and kept calling handle_response directly, so they answered

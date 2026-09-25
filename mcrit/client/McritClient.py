@@ -318,13 +318,22 @@ class McritClient:
     ### Families
     ###########################################
 
-    def modifyFamily(self, family_id, family_name=None, is_library=None):
+    def modifyFamily(self, family_id, family_name=None, is_library=None, actors=None):
+        """
+        Modify a family: rename it, mark it as library, or set the actors it is attributed to (#57)
+        <actors> is a list of names; an empty list clears them
+        """
         update_dict = {}
         if family_name is not None:
             update_dict["family_name"] = family_name
         if is_library is not None:
             update_dict["is_library"] = is_library
-        response = requests.put(f"{self.mcrit_server}/families/{family_id}", update_dict, headers=self.headers, timeout=self.timeout)
+        if actors is not None:
+            update_dict["actors"] = list(actors)
+        # JSON, since a list of actors does not survive form encoding
+        response = requests.put(f"{self.mcrit_server}/families/{family_id}", json=update_dict, headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return response
         return self._handle(response)
 
     def getFamily(self, family_id: int, with_samples=True) -> Any:

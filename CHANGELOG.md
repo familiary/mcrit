@@ -15,6 +15,17 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- **Families carry `actors`, the names they are attributed to**, set through
+  `PUT /families/{id}` and `McritClient.modifyFamily(family_id, actors=[...])` (an empty list
+  clears them), kept through a rename, and carried by exports as `family_actors`, which imports
+  merge into what the target already knows. Names are 1-64 characters of letters, digits,
+  spaces, dots, dashes and underscores; anything else answers 400 without touching the family.
+  Families stored before read as an empty list, so no migration. NOTE that
+  `McritClient.modifyFamily` now sends its update as JSON, since a list does not survive form
+  encoding; the route accepts both ([#57]).
+
 ## [1.12.0] - 2026-09-25
 
 ### Added
@@ -586,3 +597,4 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#57]: https://github.com/danielplohmann/mcrit/issues/57

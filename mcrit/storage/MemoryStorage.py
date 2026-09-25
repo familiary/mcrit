@@ -292,6 +292,8 @@ class MemoryStorage(StorageInterface):
             return False
         old_family_info = self.getFamily(family_id)
         assert old_family_info is not None
+        if "actors" in update_information:
+            self._families[family_id].actors = FamilyEntry.normalizeActors(update_information["actors"])
         if "is_library" in update_information:
             for sample_id, sample_entry in self._samples.items():
                 if family_id == sample_entry.family_id:
@@ -309,6 +311,10 @@ class MemoryStorage(StorageInterface):
             new_num_samples = new_family_info.num_samples + old_family_info.num_samples
             new_num_functions = new_family_info.num_functions + old_family_info.num_functions
             new_num_lib_samples = new_family_info.num_library_samples + old_family_info.num_library_samples
+            # the attribution moves with the samples: a rename onto an existing family merges
+            # both actor lists (a review of #57 caught the rename dropping them)
+            merged_actors = FamilyEntry.normalizeActors(list(new_family_info.actors or []) + list(old_family_info.actors or []))
+            self._families[new_family_id].actors = merged_actors
             # update family_entry
             if family_id == 0:
                 self._families[0].num_samples = 0
