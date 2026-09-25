@@ -15,6 +15,15 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /samples/{id}/smda` and `McritClient.getSmdaReportForSample` rebuild a sample's SMDA
+  report from storage.** `SampleEntry` keeps `smda_extras` - the report's top-level fields and
+  metadata it holds no field for, minus `xcfg` - and the disassembly comes from the functions'
+  blobs in one batched fetch. The example report round-trips byte for byte. NOTE that entries
+  stored before this carry no extras and rebuild with an empty report's defaults for them, and
+  functions whose disassembly was dropped are absent from the rebuilt xcfg ([#94]).
+
 ## [1.12.0] - 2026-09-25
 
 ### Added
@@ -586,3 +595,4 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#94]: https://github.com/danielplohmann/mcrit/issues/94

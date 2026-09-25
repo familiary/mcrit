@@ -140,6 +140,8 @@ def get_app():
     #
     _app.add_route("/samples/sha256/{sample_sha256}", sample_resource, suffix="by_sha256")
     _app.add_route("/samples/{sample_id:int}/functions", sample_resource, suffix="functions")
+    # the SMDA report the sample was submitted as, rebuilt from storage (#94)
+    _app.add_route("/samples/{sample_id:int}/smda", sample_resource, suffix="smda_report")
     _app.add_route(
         "/samples/{sample_id:int}/functions/{function_id:int}",
         sample_resource,

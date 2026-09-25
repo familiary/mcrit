@@ -156,6 +156,20 @@ class MemoryStorageTest(TestCase):
         self.storage.deleteFamily(4)
         self.assertEqual(None, self.storage.getFamilyId("family_1a"))
 
+    def testTheSmdaReportCanBeRebuiltFromStorage(self):
+        # #94: nothing of the report but the functions' disassembly lives outside the sample entry
+        self.storage.clearStorage()
+        with open(self.example_file_path) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        report.data_refs_from = {4096: [4200]}
+        sample_entry = self.storage.addSmdaReport(report)
+        assert sample_entry is not None
+        rebuilt = self.storage.getSmdaReportForSample(sample_entry.sample_id)
+        assert rebuilt is not None
+        self.assertEqual(report.toDict(), rebuilt.toDict())
+        self.assertIsNone(self.storage.getSmdaReportForSample(4242))
+
     def _twoReports(self, family="family_1"):
         with open(self.example_file_path) as fjson:
             smda_json = json.load(fjson)
