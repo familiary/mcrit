@@ -439,6 +439,20 @@ class McritClient:
         if data is not None:
             return SampleEntry.fromDict(data)
 
+    def getSampleBinary(self, sample_id):
+        """
+        The raw binary the sample was submitted as, when the server keeps them (STORAGE_KEEP_SUBMITTED_BINARIES) and serves them (STORAGE_SERVE_SUBMITTED_BINARIES); None otherwise
+        None does not tell those cases apart: a server not serving binaries answers 403, which is also what a missing or invalid token gets; raise_client_errors raises McritUnauthorized or McritNotFound instead, and raw mode hands back the response to look at
+        """
+        response = requests.get(f"{self.mcrit_server}/samples/{sample_id}/binary", headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return response
+        if response.status_code != 200:
+            # the failure goes through the error modes every other call honours; the bytes of a
+            # 200 are the answer itself, not a JSON envelope
+            return self._handle(response)
+        return response.content
+
     def getSamplesByIds(self, sample_ids: List[int]) -> Any:
         """
         Get all SampleEntries identified by the provided list of sample_ids, in a dict with <sample_id> as key.

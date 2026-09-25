@@ -459,6 +459,16 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
     def getFunctionsBySampleId(self, sample_id):
         return self.getStorage().getFunctionsBySampleId(sample_id)
 
+    def getSampleBinary(self, sample_id):
+        return self.getStorage().getSampleBinary(sample_id)
+
+    def openSampleBinary(self, sample_id):
+        return self.getStorage().openSampleBinary(sample_id)
+
+    def isServingSampleBinaries(self) -> bool:
+        """Whether GET /samples/{id}/binary may hand out stored binaries (STORAGE_SERVE_SUBMITTED_BINARIES)."""
+        return bool(self._storage_config.STORAGE_SERVE_SUBMITTED_BINARIES)
+
     def isFunctionId(self, function_id):
         return self.getStorage().isFunctionId(function_id)
 

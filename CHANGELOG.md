@@ -15,6 +15,36 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- `STORAGE_KEEP_SUBMITTED_BINARIES` keeps the raw binary a sample was submitted as, in the
+  GridFS bucket `sample_binaries` beside the corpus, and `GET /samples/{sample_id}/binary` serves
+  it back (`McritClient.getSampleBinary`) once `STORAGE_SERVE_SUBMITTED_BINARIES` allows it. Both
+  are off by default. Keeping stores the sample a second time, so a corpus that turns it on grows
+  by the size of its submissions. Serving is its own switch because it is its own decision: the
+  binaries are, on most instances, malware, and serving makes the API a place to download them
+  from; until it is turned on, the route answers 403 for every sample, without saying whether
+  one exists or has a binary kept. A sample submitted before keeping was turned on has no binary
+  until it is submitted again, which the existing-sample path now completes instead of skipping.
+  A binary is stored once per content, keyed by `metadata.sha256`, with `metadata.sample_ids`
+  listing the samples it belongs to, so that the job queue's file parameters, which it already
+  shares by sha256, could later refer to the same file without a data migration. Deleting a sample
+  takes it off its binary and deletes the binary once no sample is left on it; a submission of the
+  same bytes racing that deletion stores a fresh copy rather than linking to the one being deleted.
+  A process dying between those steps can leave a file no sample refers to; nothing collects such
+  files yet ([#95]).
+
+- `StorageInterface.hasSampleBinary()` and `.openSampleBinary()`, so neither asking whether a
+  binary is stored nor serving one has to read the file. `openSampleBinary()` answers with a
+  stream (a GridFS `GridOut`, or a `BytesIO` from `MemoryStorage`) rather than bytes, and the
+  binary route serves through it: peak allocation while serving is bounded by the driver's
+  cursor batch instead of the sample size - measured flat at ~34 MiB for 32, 128 and 256 MiB
+  samples, against 64, 256 and 512 MiB for `getSampleBinary()`, which costs twice the file
+  because `GridOut.read()` joins the chunks it has collected. The resubmission check in
+  `Worker.addBinarySample` used `getSampleBinary(...) is None` and so streamed the whole file
+  to answer a yes/no question; it uses `hasSampleBinary()` now, which reads one metadata
+  document. `getSampleBinary()` is unchanged for callers that want the bytes.
+
 ## [1.12.0] - 2026-09-25
 
 ### Added
@@ -586,3 +616,4 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#95]: https://github.com/danielplohmann/mcrit/issues/95

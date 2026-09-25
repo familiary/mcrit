@@ -119,6 +119,9 @@ class MongoDbStorageDeleteSampleTest(TestCase):
             ),
         )
         setattr(self.storage, "_updateDbState", MethodType(lambda _self: None, self.storage))
+        # the stored-binary bucket is GridFS, which the fake database cannot provide (#95)
+        deleted_binaries = []
+        setattr(self.storage, "deleteSampleBinary", MethodType(lambda _self, sample_id: deleted_binaries.append(sample_id), self.storage))
 
         result = self.storage.deleteSample(7)
 
@@ -129,6 +132,7 @@ class MongoDbStorageDeleteSampleTest(TestCase):
         )
         self.assertEqual([{"sample_id": 7}], functions.delete_many_calls)
         self.assertEqual([{"sample_id": 7}], samples.delete_one_calls)
+        self.assertEqual([7], deleted_binaries)
         # decremented by what was deleted (two function documents, one sample), and the family
         # deleted because no sample references it any more (#151)
         self.assertEqual([(1, -1, -2, 0)], family_updates)

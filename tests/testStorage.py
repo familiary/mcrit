@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -331,6 +332,102 @@ class MemoryStorageTest(TestCase):
 
     def _numBandEntries(self):
         return sum(len(function_ids) for band in self.storage._bands.values() for function_ids in band.values())
+
+    def _numStoredBinaries(self):
+        return len(self.storage._sample_binaries)
+
+    def _addTwoSamples(self):
+        with open(self.example_file_path) as fjson:
+            smda_json = json.load(fjson)
+        sample_ids = []
+        for sha256 in (64 * "a", 64 * "b"):
+            report = SmdaReport.fromDict(smda_json)
+            assert report is not None
+            report.sha256 = sha256
+            sample_entry = self.storage.addSmdaReport(report)
+            assert sample_entry is not None
+            sample_ids.append(sample_entry.sample_id)
+        return sample_ids
+
+    def testTheSameBytesAreStoredOnceForEverySampleTheyBelongTo(self):
+        """#95: binaries are keyed by content, listing their samples, and a binary goes only with
+        the last sample that refers to it."""
+        self.storage.clearStorage()
+        sample_a, sample_b = self._addTwoSamples()
+        payload = b"MZ\x90\x00" * 5000
+        self.assertTrue(self.storage.storeSampleBinary(sample_a, payload))
+        self.assertTrue(self.storage.storeSampleBinary(sample_b, payload))
+        self.assertEqual(1, self._numStoredBinaries())
+        self.assertEqual(payload, self.storage.getSampleBinary(sample_a))
+        self.assertEqual(payload, self.storage.getSampleBinary(sample_b))
+        self.storage.deleteSample(sample_a)
+        self.assertFalse(self.storage.hasSampleBinary(sample_a))
+        self.assertEqual(payload, self.storage.getSampleBinary(sample_b), "still referred to by the other sample")
+        self.assertEqual(1, self._numStoredBinaries())
+        self.storage.deleteSample(sample_b)
+        self.assertEqual(0, self._numStoredBinaries())
+
+    def testStoringOtherBytesForASampleReleasesTheOnesItHadBefore(self):
+        self.storage.clearStorage()
+        sample_a, sample_b = self._addTwoSamples()
+        self.storage.storeSampleBinary(sample_a, b"shared")
+        self.storage.storeSampleBinary(sample_b, b"shared")
+        self.storage.storeSampleBinary(sample_a, b"only a")
+        self.assertEqual(b"only a", self.storage.getSampleBinary(sample_a))
+        self.assertEqual(b"shared", self.storage.getSampleBinary(sample_b))
+        self.assertEqual(2, self._numStoredBinaries())
+        self.storage.storeSampleBinary(sample_b, b"only a")
+        self.assertEqual(b"only a", self.storage.getSampleBinary(sample_b))
+        self.assertEqual(1, self._numStoredBinaries(), "the shared bytes went with the last sample on them")
+        # the same bytes again change nothing
+        self.assertTrue(self.storage.storeSampleBinary(sample_b, b"only a"))
+        self.assertEqual(1, self._numStoredBinaries())
+
+    def testABinaryCanBeCheckedForAndStreamedWithoutReadingItWhole(self):
+        """hasSampleBinary answers from the GridFS metadata and openSampleBinary hands back a
+        handle, so neither the resubmission check in Worker.addBinarySample nor serving a
+        sample pulls the whole file into memory."""
+        self.storage.clearStorage()
+        with open(self.example_file_path) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        sample_entry = self.storage.addSmdaReport(report)
+        assert sample_entry is not None
+        sample_id = sample_entry.sample_id
+        self.assertFalse(self.storage.hasSampleBinary(sample_id))
+        self.assertIsNone(self.storage.openSampleBinary(sample_id))
+        payload = b"MZ\x00\x01" * 1000
+        self.storage.storeSampleBinary(sample_id, payload)
+        self.assertTrue(self.storage.hasSampleBinary(sample_id))
+        handle = self.storage.openSampleBinary(sample_id)
+        assert handle is not None
+        self.assertEqual(payload[:4], handle.read(4), "a stream, not the whole file")
+        self.assertEqual(payload[4:], handle.read())
+        handle.close()
+        self.storage.deleteSampleBinary(sample_id)
+        self.assertFalse(self.storage.hasSampleBinary(sample_id))
+        self.assertFalse(self.storage.hasSampleBinary(4242))
+
+    def testASubmittedBinaryCanBeKeptAndGoesWithItsSample(self):
+        # #95
+        self.storage.clearStorage()
+        with open(self.example_file_path) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        sample_entry = self.storage.addSmdaReport(report)
+        assert sample_entry is not None
+        self.assertIsNone(self.storage.getSampleBinary(sample_entry.sample_id))
+        self.assertFalse(self.storage.storeSampleBinary(4242, b"nope"))
+        self.assertTrue(self.storage.storeSampleBinary(sample_entry.sample_id, b"MZ\x00\x01" * 1000))
+        self.assertEqual(b"MZ\x00\x01" * 1000, self.storage.getSampleBinary(sample_entry.sample_id))
+        # storing again replaces
+        self.assertTrue(self.storage.storeSampleBinary(sample_entry.sample_id, b"second"))
+        self.assertEqual(b"second", self.storage.getSampleBinary(sample_entry.sample_id))
+        self.assertTrue(self.storage.deleteSampleBinary(sample_entry.sample_id))
+        self.assertFalse(self.storage.deleteSampleBinary(sample_entry.sample_id))
+        self.storage.storeSampleBinary(sample_entry.sample_id, b"third")
+        self.storage.deleteSample(sample_entry.sample_id)
+        self.assertIsNone(self.storage.getSampleBinary(sample_entry.sample_id))
 
     def testSampleHandling(self):
         self.storage.clearStorage()
@@ -875,6 +972,88 @@ class MongoDbStorageTest(MemoryStorageTest):
             self.storage._updateFamilyStats(4242, 1, 10, 0)
         self.assertIn("has no document", logger.warning.call_args.args[0])
         self.assertEqual(4242, logger.warning.call_args.args[1])
+
+    def _numStoredBinaries(self):
+        db = self.storage._getDb()
+        num_files = db["sample_binaries.files"].count_documents({})
+        # every file's chunks and no others: a leak would show up here even when the files agree
+        chunk_owners = set(db["sample_binaries.chunks"].distinct("files_id"))
+        self.assertEqual({document["_id"] for document in db["sample_binaries.files"].find({}, {"_id": 1})}, chunk_owners)
+        return num_files
+
+    def testAStoredBinaryIsKeyedBySha256AndListsItsSamples(self):
+        self.storage.clearStorage()
+        sample_a, sample_b = self._addTwoSamples()
+        payload = b"MZ" + bytes(range(256)) * 2000
+        self.storage.storeSampleBinary(sample_a, payload)
+        self.storage.storeSampleBinary(sample_b, payload)
+        stored = list(self.storage._getDb()["sample_binaries.files"].find({}))
+        self.assertEqual(1, len(stored))
+        self.assertEqual(hashlib.sha256(payload).hexdigest(), stored[0]["metadata"]["sha256"])
+        self.assertEqual([sample_a, sample_b], stored[0]["metadata"]["sample_ids"])
+        self.assertEqual(len(payload), stored[0]["length"])
+
+    def testLosingTheRaceToStoreTheSameBytesLinksToTheWinnerAndLeavesNoChunks(self):
+        """Two submissions of the same bytes: the one whose put is refused by the unique sha256
+        index must drop the chunks GridFS already wrote for it, and link to the other's file."""
+        self.storage.clearStorage()
+        sample_a, sample_b = self._addTwoSamples()
+        payload = b"MZ" + bytes(range(256)) * 2000
+        self.storage.storeSampleBinary(sample_b, payload)
+        real_link = self.storage._linkBinaryFile
+        calls = []
+
+        def link_missing_the_winner_once(sha256, sample_id):
+            calls.append(sample_id)
+            return False if len(calls) == 1 else real_link(sha256, sample_id)
+
+        with patch.object(self.storage, "_linkBinaryFile", side_effect=link_missing_the_winner_once):
+            self.assertTrue(self.storage.storeSampleBinary(sample_a, payload))
+        self.assertEqual(2, len(calls), "linked again after the refused put")
+        self.assertEqual(1, self._numStoredBinaries())
+        self.assertEqual(payload, self.storage.getSampleBinary(sample_a))
+
+    def testASubmissionRacingTheDeletionOfItsBytesStoresAFreshCopy(self):
+        """A file whose last sample is taken off it is retired (its sha256 cleared) before it is
+        deleted. A submission of the same bytes arriving in between must store a fresh copy: had
+        it linked to the file about to be deleted, its sample would be left without a binary."""
+        self.storage.clearStorage()
+        sample_a, sample_b = self._addTwoSamples()
+        payload = b"MZ" + bytes(range(256)) * 2000
+        self.storage.storeSampleBinary(sample_a, payload)
+        real_bucket = self.storage._getBinaries()
+
+        class BucketWithASubmissionBeforeDelete:
+            def __init__(self, storage):
+                self.storage = storage
+                self.raced = False
+
+            def __getattr__(self, name):
+                return getattr(real_bucket, name)
+
+            def delete(self, file_id):
+                if not self.raced:
+                    self.raced = True
+                    # the other submission, landing between the retirement and the deletion
+                    with patch.object(self.storage, "_getBinaries", return_value=real_bucket):
+                        self.storage.storeSampleBinary(sample_b, payload)
+                real_bucket.delete(file_id)
+
+        racing_bucket = BucketWithASubmissionBeforeDelete(self.storage)
+        with patch.object(self.storage, "_getBinaries", return_value=racing_bucket):
+            self.storage.deleteSampleBinary(sample_a)
+        self.assertTrue(racing_bucket.raced)
+        self.assertFalse(self.storage.hasSampleBinary(sample_a))
+        self.assertEqual(payload, self.storage.getSampleBinary(sample_b))
+        self.assertEqual(1, self._numStoredBinaries())
+
+    def testABinaryStoredForASampleDeletedMeanwhileIsNotLeftBehind(self):
+        self.storage.clearStorage()
+        sample_a, _ = self._addTwoSamples()
+        # the sample exists when the store starts and is gone by the time it has linked the file
+        with patch.object(self.storage, "isSampleId", side_effect=[True, False, False]):
+            self.assertFalse(self.storage.storeSampleBinary(sample_a, b"MZ late"))
+        self.assertEqual(0, self._numStoredBinaries())
 
     def _numBandEntries(self):
         db = self.storage._getDb()

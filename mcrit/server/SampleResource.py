@@ -237,6 +237,40 @@ class SampleResource:
         db_log_msg(self.index, req, "SampleResource.on_get_function - success.")
 
     @timing
+    def on_get_binary(self, req, resp, sample_id=None):
+        """The raw binary the sample was submitted as, when STORAGE_KEEP_SUBMITTED_BINARIES kept it
+        and STORAGE_SERVE_SUBMITTED_BINARIES allows handing it out (#95)."""
+        # checked first, and answered the same for every sample: with serving off, the route does
+        # not even tell which samples exist or have a binary kept
+        if not self.index.isServingSampleBinaries():
+            resp.data = jsonify({"status": "failed", "data": {"message": "Serving stored binaries is disabled on this instance (STORAGE_SERVE_SUBMITTED_BINARIES)."}})
+            resp.status = falcon.HTTP_403
+            db_log_msg(self.index, req, "SampleResource.on_get_binary - failed - serving binaries is disabled.")
+            return
+        if not self.index.isSampleId(sample_id):
+            resp.data = jsonify({"status": "failed", "data": {"message": "We don't have a sample with that id."}})
+            resp.status = falcon.HTTP_404
+            db_log_msg(self.index, req, f"SampleResource.on_get_binary - failed - unknown sample_id {sample_id}.")
+            return
+        binary = self.index.openSampleBinary(sample_id)
+        if binary is None:
+            resp.data = jsonify({"status": "failed", "data": {"message": "No binary is stored for that sample."}})
+            resp.status = falcon.HTTP_404
+            db_log_msg(self.index, req, f"SampleResource.on_get_binary - failed - no binary for sample_id {sample_id}.")
+            return
+        resp.content_type = "application/octet-stream"
+        # streamed rather than read into resp.data: peak allocation while serving is then
+        # bounded by the driver's cursor batch instead of the sample size - measured flat at
+        # ~34 MiB for 32, 128 and 256 MiB samples, where getSampleBinary() costs twice the
+        # file (64, 256 and 512 MiB, since GridOut.read() joins the chunks it has collected).
+        # falcon closes the stream once the response is done.
+        resp.stream = binary
+        length = getattr(binary, "length", None)
+        if isinstance(length, int):
+            resp.content_length = length
+        db_log_msg(self.index, req, "SampleResource.on_get_binary - success.")
+
+    @timing
     def on_get_functions(self, req, resp, sample_id=None):
         if not self.index.isSampleId(sample_id):
             resp.data = jsonify(

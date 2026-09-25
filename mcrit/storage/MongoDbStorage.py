@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import json
 import logging
 import re
@@ -11,8 +12,11 @@ from itertools import zip_longest
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
+import gridfs
 import numpy as np
+from bson import ObjectId
 from bson import encode as bson_encode
+from gridfs.errors import FileExists
 from packaging import version
 from picblocks.blockhasher import BlockHasher
 from pymongo import MongoClient, UpdateMany, UpdateOne
@@ -40,7 +44,7 @@ from mcrit.storage.FunctionEntry import FunctionEntry
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
 from mcrit.storage.MatchingCache import MatchingCache
 from mcrit.storage.SampleEntry import SampleEntry
-from mcrit.storage.StorageInterface import StorageInterface
+from mcrit.storage.StorageInterface import BinaryStream, StorageInterface
 
 LOGGER = logging.getLogger(__name__)
 if MongoClient is None:
@@ -348,6 +352,10 @@ class MongoDbStorage(StorageInterface):
         self._getDb()["query_samples"].create_index("sha256")
         self._getDb()["query_functions"].create_index("function_id")
         self._getDb()["query_functions"].create_index("sample_id")
+        # stored binaries are keyed by content: one file per sha256, naming every sample it belongs to (#95).
+        # Partial, so that a file retired for deletion (its sha256 cleared) does not hold the key.
+        self._getDb()[self._BINARIES_BUCKET + ".files"].create_index("metadata.sha256", unique=True, partialFilterExpression={"metadata.sha256": {"$type": "string"}})
+        self._getDb()[self._BINARIES_BUCKET + ".files"].create_index("metadata.sample_ids")
         # ensure that their counters are at least 1, so that they never contain items with sample_id/function_id 0
         # the name-only filter with $max is idempotent: it matches an existing counter instead of upserting a duplicate (#105)
         self._getDb().counters.update_one({"name": "query_samples"}, {"$max": {"value": 1}}, upsert=True)
@@ -810,6 +818,8 @@ class MongoDbStorage(StorageInterface):
         num_functions_deleted = self._getDb().functions.delete_many({"sample_id": sample_id}).deleted_count
         # remove sample
         num_samples_deleted = self._getDb().samples.delete_one({"sample_id": sample_id}).deleted_count
+        # the raw submission goes with the sample it belongs to (#95)
+        self.deleteSampleBinary(sample_id)
         # update family stats by what was actually removed, not by what the sample claimed (#151)
         self._updateFamilyStats(sample_entry.family_id, -num_samples_deleted, -num_functions_deleted, -int(sample_entry.is_library and num_samples_deleted))
         self._deleteFamilyIfEmpty(sample_entry.family_id)
@@ -987,6 +997,89 @@ class MongoDbStorage(StorageInterface):
             self._updateDbState()
         return True
 
+    # raw submitted binaries live in their own GridFS bucket (#95), one file per distinct content:
+    # metadata.sha256 is the key and metadata.sample_ids lists the samples the binary belongs to.
+    # Keyed by content rather than by sample, so that anything else holding the same bytes - the
+    # file parameters of queue jobs, say - can refer to the same file without a data migration.
+    _BINARIES_BUCKET = "sample_binaries"
+
+    def _getBinaries(self) -> "gridfs.GridFS":
+        return gridfs.GridFS(self._getDb(), collection=self._BINARIES_BUCKET)
+
+    def _getBinaryFiles(self):
+        return self._getDb()[f"{self._BINARIES_BUCKET}.files"]
+
+    def storeSampleBinary(self, sample_id: int, binary: bytes) -> bool:
+        if not self.isSampleId(sample_id):
+            return False
+        binary = bytes(binary)
+        sha256 = hashlib.sha256(binary).hexdigest()
+        # a sample has one binary: let go of any other content it was linked to before
+        for stored in self._getBinaryFiles().find({"metadata.sample_ids": sample_id, "metadata.sha256": {"$ne": sha256}}, {"_id": 1}):
+            self._releaseBinaryFile(stored["_id"], sample_id)
+        while not self._linkBinaryFile(sha256, sample_id):
+            file_id = ObjectId()
+            try:
+                self._getBinaries().put(binary, _id=file_id, metadata={"sha256": sha256, "sample_ids": [sample_id], "size": len(binary)})
+                break
+            except FileExists:
+                # another submission of the same bytes stored them first (the unique index on
+                # metadata.sha256 refused this copy); GridFS leaves the chunks it had already
+                # written behind, so they go here, and the loop links to the file that won
+                self._getDb()[f"{self._BINARIES_BUCKET}.chunks"].delete_many({"files_id": file_id})
+        # a sample deleted meanwhile would otherwise leave its id on the file for good: deleteSample
+        # removes the sample before its binaries, so whichever of the two runs second cleans up
+        if not self.isSampleId(sample_id):
+            self.deleteSampleBinary(sample_id)
+            return False
+        return True
+
+    def _linkBinaryFile(self, sha256: str, sample_id: int) -> bool:
+        """Add the sample to the file already holding these bytes; False when no file holds them."""
+        return self._getBinaryFiles().update_one({"metadata.sha256": sha256}, {"$addToSet": {"metadata.sample_ids": sample_id}}).matched_count > 0
+
+    def _releaseBinaryFile(self, file_id, sample_id: int) -> bool:
+        """Take the sample off the file, and delete the file once no sample is left on it.
+
+        The file is retired first - its sha256 cleared in the same update that checks no sample is
+        left - so a submission of the same bytes arriving in between cannot link to it: it finds no
+        file under that hash and stores a fresh one instead of losing its binary to this deletion."""
+        self._getBinaryFiles().update_one({"_id": file_id}, {"$pull": {"metadata.sample_ids": sample_id}})
+        # only a file still carrying its hash is retired, so of two releasers exactly one deletes it
+        retired = self._getBinaryFiles().find_one_and_update(
+            {"_id": file_id, "metadata.sample_ids": [], "metadata.sha256": {"$type": "string"}}, {"$set": {"metadata.sha256": None}}
+        )
+        if retired is None:
+            return False
+        # through GridFS, which takes the chunks along with the file document
+        self._getBinaries().delete(file_id)
+        return True
+
+    def getSampleBinary(self, sample_id: int) -> Optional[bytes]:
+        stored = self._getBinaries().find_one({"metadata.sample_ids": sample_id})
+        return stored.read() if stored is not None else None
+
+    def hasSampleBinary(self, sample_id: int) -> bool:
+        """Whether a binary is stored, without fetching a single chunk of it. GridFS keeps the
+        file's metadata in `.files` and its bytes in `.chunks`, so this reads one small
+        document where getSampleBinary() would stream the whole file to answer the same
+        question - which is what the resubmission path in Worker.addBinarySample was doing."""
+        return self._getBinaryFiles().find_one({"metadata.sample_ids": sample_id}, {"_id": 1}) is not None
+
+    def openSampleBinary(self, sample_id: int) -> Optional[BinaryStream]:
+        """The stored binary as a GridOut, which reads chunk by chunk, so serving it never
+        holds the whole file in memory."""
+        return self._getBinaries().find_one({"metadata.sample_ids": sample_id})
+
+    def deleteSampleBinary(self, sample_id: int) -> bool:
+        """Take the sample off its binary; the binary itself is deleted only when no other sample
+        still refers to it. True when the sample had one."""
+        had_binary = False
+        for stored in self._getBinaryFiles().find({"metadata.sample_ids": sample_id}, {"_id": 1}):
+            self._releaseBinaryFile(stored["_id"], sample_id)
+            had_binary = True
+        return had_binary
+
     def recomputeFamilyStats(self, progress_reporter=None) -> Dict[str, Any]:
         """Set every family's counters from the samples and functions that exist (#151).
 
@@ -1111,7 +1204,22 @@ class MongoDbStorage(StorageInterface):
         # leaving them behind while the counters reset would collide on _id at the next insert
         # "picblockhashes" is the inverted block-hash index; leaving it behind would keep asserting
         # that hashes are held by samples that no longer exist, and getUniqueBlocks would believe it
-        collections = ["samples", "families", "functions", "matches", "candidates", "counters", "query_samples", "query_functions", "xcfg", "query_xcfg", "picblockhashes"]
+        # the "sample_binaries" GridFS bucket holds the raw submissions (#95)
+        collections = [
+            "samples",
+            "families",
+            "functions",
+            "matches",
+            "candidates",
+            "counters",
+            "query_samples",
+            "query_functions",
+            "xcfg",
+            "query_xcfg",
+            "picblockhashes",
+            "sample_binaries.files",
+            "sample_binaries.chunks",
+        ]
         for band_id in range(self._storage_config.STORAGE_NUM_BANDS):
             collections.append("band_%d" % band_id)
         for c in collections:
