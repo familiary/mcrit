@@ -42,13 +42,14 @@ dependencies = [
     "rapidfuzz",
     "requests",
     "scipy",
-    "smda>=4.2.13",
+    "smda>=4.8.0",
     "tqdm",
     "waitress",
     "werkzeug",
 ]
 
 [project.optional-dependencies]
+ida = ["smda[ida]>=4.8.0"]
 dev = [
     "build",
     "coverage",

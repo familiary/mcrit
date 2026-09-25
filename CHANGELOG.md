@@ -15,6 +15,64 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- `mcrit client submit --disassembler ida`, using IDA Pro headlessly instead of SMDA to disassemble
+  submitted files, with `--ida-sigs` applying a FLIRT signature bundle and `--ida-sig-min-matches`
+  setting how many functions a signature must name to be kept. It needs IDA Pro 9.1+, its licence
+  accepted once in the GUI, `pip install "mcrit[ida]"` and `IDADIR`; without the package the run
+  stops with that hint before any file is touched. Every file
+  is disassembled in its own subprocess because the headless IDA library holds one database per
+  process, so worker mode is forced for the `dir`/`recursive`/`malpedia` modes and a file exceeding
+  `--worker-timeout` is skipped silently apart from the timeout line - raise the timeout for large
+  samples and when signatures are applied, as probing them is the slow part. Two limits to know:
+  FLIRT results arrive as function labels attributed to the submitting user, not as a per-function
+  library flag, and base-address suffixes in filenames are ignored because IDA's loader decides the
+  base address. A file of no format IDA recognises is loaded as a raw binary rather than refused, so
+  a file in which IDA finds no functions is skipped instead of being stored as an empty sample
+  ([#83]).
+
+### Changed
+
+- Require `smda>=4.8.0` (was `>=4.2.13`). smda 4.5.0 moved `ESCAPER_DOWNWARD_COMPATIBILITY` from
+  `1.13.16` to `4.4.5`, the release whose Intel escaper changed output, so a corpus whose minhashes
+  were computed under smda 4.4.4 or older is reported stale after this upgrade and that report is
+  correct: `repair_minhashes` brings it current. Samples whose recorded `minhash_smda_version` is
+  4.4.5 or newer are unaffected; a sample with no recorded version (imported, or indexed before
+  1.9.0) counts as stale regardless, as described under 1.9.0. **.NET samples are the exception
+  nothing here repairs:** smda 4.4.5 ends CIL blocks at `throw`, `rethrow`, `endfinally` and
+  `endfilter`, which changes the `pic_hash`, block hashes and shingles of every method containing
+  one. That is a change to the stored report's structure, not to escaping, so neither
+  `repair_minhashes` nor pic-hash recalculation reaches it - such samples have to be deleted and
+  submitted again. smda 4.4.5 through 4.7.0 also move Intel and AArch64 function recovery, so
+  re-disassembling a file can yield a different function set than the stored report has.
+  The one staleness threshold still fits 4.8.0: every per-architecture pic_hash escape gate in smda
+  (AArch64 4.2.0, Intel 4.3.5, CIL 4.3.8, Dalvik 4.4.2) is at or below 4.4.5, which a test now
+  asserts, and the `MCRIT4IDA cli via SMDA <version>` string the IDA producer writes parses as
+  current. The fields `SmdaFunction.fromDict` requires did not change between 4.4.5 and 4.8.0, and
+  older releases read the same ones unconditionally, so an `xcfg` stored by an older smda still
+  loads; a test loads every function of the smda 1.5.12 and 4.2.16 reports under `tests/` to hold
+  that. *Measured:* merged with 1.11.0, 300 database-free tests and the full suite of 456 pass
+  under smda 4.8.0; no corpus was re-indexed.
+
+### Fixed
+
+- `mcrit client submit --mode recursive` submits again. An unconditional `continue` directly after
+  the "Processing file:" line made every file below it unreachable, so the mode walked the tree,
+  printed one line per sample and submitted nothing - it looked like a successful run and left the
+  corpus empty. The failure mode is silent: the only symptom was a sample count that never moved.
+
+- `mcrit client submit --worker` works together with `--server` and `--apitoken`. The spawned
+  command placed both after `submit`, where the parser does not know them, so every worker exited
+  with a usage error and nothing was submitted; the error reached the console only as the worker's
+  relayed stderr. Without the two options (server taken from the environment) it worked.
+
+- `--force_update` reaches the worker: it was not forwarded, so with `--worker` a known sample was
+  always skipped and its family, version and library flag never updated.
+
+- A worker that exceeds `--worker-timeout` is now killed. It was only reported, and kept running
+  after the parent had moved on, so a run over many slow files accumulated orphaned processes.
+
 ## [1.12.0] - 2026-09-25
 
 ### Added
@@ -586,3 +644,4 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#83]: https://github.com/danielplohmann/mcrit/issues/83

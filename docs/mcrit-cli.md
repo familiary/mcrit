@@ -8,8 +8,9 @@ The `submit` command supports 4 methods of data submission, supported by a numbe
 Here is its documentation:
 
 ```
-usage: mcrit client submit [-h] [--mode {file,dir,recursive,malpedia}] [-f FAMILY] [-v VERSION] [-l] [-x] [-o OUTPUT]
-                           [-s] [-w] [-t WORKER_TIMEOUT]
+usage: mcrit client submit [-h] [--mode {file,dir,recursive,malpedia}] [-f FAMILY] [-v VERSION] [-l] [-u] [-x]
+                           [-o OUTPUT] [-s] [--disassembler {smda,ida}] [--ida-sigs IDA_SIGS]
+                           [--ida-sig-min-matches IDA_SIG_MIN_MATCHES] [-w] [-t WORKER_TIMEOUT]
                            filepath
 
 positional arguments:
@@ -21,21 +22,28 @@ options:
                         Submit a single <file> or all files in a <dir>. Use <recursive> submission for a folder
                         structured as ./family_name/version/version/files. Synchronize <malpedia> into MCRIT. Default:
                         <file>.
-  -f FAMILY, --family FAMILY
-                        Set/Override SmdaReport with this family (only in modes: file/dir)
-  -v VERSION, --version VERSION
+  -f, --family FAMILY   Set/Override SmdaReport with this family (only in modes: file/dir)
+  -v, --version VERSION
                         Set/Override SmdaReport with this version (only in modes: file/dir)
   -l, --library         Set/Override SmdaReport with the library flag (only in modes: file/dir/recursive, default:
                         False).
+  -u, --force_update    Force update of family/version/library, even if file is already in MCRIT (only in modes:
+                        file/dir, default: False).
   -x, --executables_only
                         Only process files that are parsable PE or ELF files (default: False).
-  -o OUTPUT, --output OUTPUT
-                        Optionally store SMDA reports in folder OUTPUT.
+  -o, --output OUTPUT   Optionally store SMDA reports in folder OUTPUT, which is created if not existing.
   -s, --smda            Do not disassemble, instead only submit files that are recognized as SMDA reports (only works
                         with modes: file/dir).
+  --disassembler {smda,ida}
+                        Disassembler used to produce reports for submitted files (default: smda).
+  --ida-sigs IDA_SIGS   Root folder of an unpacked FLIRT signature bundle, probed per sample and applied where enough
+                        functions match (only with --disassembler ida).
+  --ida-sig-min-matches IDA_SIG_MIN_MATCHES
+                        Number of functions a FLIRT signature must name to be kept (only with --disassembler ida,
+                        default: 10).
   -w, --worker          Spawn workers to process the submission (only in modes: dir/recursive/malpedia, default:
                         False).
-  -t WORKER_TIMEOUT, --worker-timeout WORKER_TIMEOUT
+  -t, --worker-timeout WORKER_TIMEOUT
                         Timeout for workers to conclude the submission (default: 300 seconds).
 ```
 
@@ -83,6 +91,44 @@ Requires directory name to be called `malpedia`, sanity checks if there is a `ma
 /home/analyst/work/Repositories/malpedia/win.8t_dropper/2019-01-23/b541e0e29c34800a067b060d9ee18d8d35c75f056f4246b1ce9561a5441d5a0f_unpacked
  0.305s -> (architecture: intel.32bit, base_addr: 0x10000000): 213 functions
 [...]
+```
+
+### Using IDA Pro as the disassembler
+
+With `--disassembler ida`, files are disassembled by IDA Pro running headlessly instead of by SMDA.
+This requires:
+
+* IDA Pro 9.1 or newer, with its licence accepted once in the GUI (the headless library reuses that acceptance),
+* `pip install "mcrit[ida]"`,
+* the environment variable `IDADIR` pointing at the IDA installation directory that contains `libidalib`.
+
+IDA's auto-analysis is exported to an SMDA report exactly as the MCRIT IDA plugin does, and that report
+is then submitted through the normal path - so skipping files already present, `--force_update`,
+`--output` and the family/version derivation of the `dir`/`recursive`/`malpedia` modes all behave as
+they do with SMDA. Reports produced this way carry `smda_version` `"MCRIT4IDA cli via SMDA <version>"`.
+
+Each file is processed in its own subprocess, because the headless IDA library holds a single database
+per process and one malformed sample must not end the batch. Worker mode is therefore switched on
+automatically for the `dir`, `recursive` and `malpedia` modes; raise `--worker-timeout` for large files
+or when using `--ida-sigs`, as a timed-out file is skipped without being submitted.
+
+`--ida-sigs` points at an unpacked Hex-Rays FLIRT Signature Bundle, i.e. the folder that contains the
+top-level `windows/ linux/ golang/ rust/` directories. Candidate signatures are narrowed by the file
+format and architecture of the sample, then each candidate is applied and kept only if it names at
+least `--ida-sig-min-matches` functions, and undone otherwise.
+
+Caveats:
+
+* FLIRT results reach MCRIT only as function names, which the server stores as function labels attributed
+  to the submitting user. There is no per-function library flag - `--library` remains a per-sample property.
+* The sample is copied to a temporary directory before analysis, so no IDA database files appear next to it.
+* IDA loads a file of no format it recognises as a raw binary instead of refusing it, so a file in which
+  it finds no functions is skipped rather than stored as an empty sample.
+* If the `ida-domain` package is missing, the run stops with an install hint before touching any file.
+* Base address suffixes in filenames (`..._dump_0x00400000`) are ignored; IDA's loader decides the base address.
+
+```bash
+$ mcrit client submit ./samples --mode recursive --disassembler ida --ida-sigs /path/to/signatures-bundle -t 1800
 ```
 
 
