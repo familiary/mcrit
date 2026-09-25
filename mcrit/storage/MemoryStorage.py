@@ -913,6 +913,8 @@ class MemoryStorage(StorageInterface):
             "num_bands": len(self._bands),
             # None signals "not computed", so that consumers can distinguish it from an actual count of 0
             "num_pichashes": len(self._pichashes) if with_pichash else None,
+            # pichashes are kept as integers here, so their order is always numeric (#145)
+            "pichash_padded": True,
         }
         return stats
 

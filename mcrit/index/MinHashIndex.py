@@ -516,6 +516,9 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 "num_families": storage_stats["num_families"],
                 "num_functions": storage_stats["num_functions"],
                 "num_pichashes": storage_stats["num_pichashes"],
+                # False on an instance created before pichashes were stored zero-padded and not yet
+                # migrated (migrate_pichash_padding); range conditions and sorting by pichash need True (#145)
+                "pichash_padded": storage_stats.get("pichash_padded", True),
                 # minhashes are only comparable across functions escaped by the same smda; see
                 # mcrit/minhash/EscaperFingerprint.py for why this is worth surfacing
                 "smda_version": SMDA_VERSION,
