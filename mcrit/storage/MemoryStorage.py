@@ -332,6 +332,16 @@ class MemoryStorage(StorageInterface):
         self._updateDbState()
         return True
 
+    def deleteOrphanedQueryData(self) -> Dict[str, int]:
+        # query entries live in their own collections here, keyed like the regular ones
+        orphan_function_ids = [function_id for function_id, entry in self._query_functions.items() if entry.sample_id not in self._query_samples]
+        for function_id in orphan_function_ids:
+            del self._query_functions[function_id]
+        return {"query_functions": len(orphan_function_ids), "query_xcfg": 0}
+
+    def compactQueryCollections(self) -> Dict[str, Any]:
+        return {}
+
     def recomputeFamilyStats(self, progress_reporter=None) -> Dict[str, Any]:
         report: Dict[str, Any] = {"num_families": 0, "num_families_corrected": 0, "num_families_created": 0, "corrections": {}}
         for sample_entry in self._samples.values():

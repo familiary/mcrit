@@ -515,6 +515,16 @@ class StorageInterface:
         """
         raise NotImplementedError
 
+    def deleteOrphanedQueryData(self) -> Dict[str, int]:
+        """Delete the query functions whose query sample is gone and the query disassembly whose
+        function is gone; answers how many of each were removed (#68)."""
+        raise NotImplementedError
+
+    def compactQueryCollections(self) -> Dict[str, Any]:
+        """Hand the space freed by deleted query data back to the file system, where the backend
+        can; answers per collection what happened (#68)."""
+        raise NotImplementedError
+
     def recomputeFamilyStats(self, progress_reporter=None) -> Dict[str, Any]:
         """Set every family's sample/function counters from the samples and functions that exist,
         and report how many families were corrected (#151)."""

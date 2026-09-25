@@ -583,7 +583,8 @@ class LocalQueue:
         result = job["result"]
         file_params = json.loads(job["payload"]["file_params"])
         del self._jobs[id]
-        self._delete_grid(result)
+        if result is not None:
+            self._delete_grid(result)
         for f in file_params.values():
             meta = self._grid_to_meta(f)
             LOGGER.debug("Job meta: %s", meta)
