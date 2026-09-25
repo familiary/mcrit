@@ -3,7 +3,7 @@ import functools
 import logging
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 from smda.common.SmdaReport import SmdaReport
@@ -22,7 +22,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class JobTerminatedError(Exception):
-    pass
+    """Raised by awaitResult when the awaited job was terminated instead of finishing."""
 
 
 def isJobTerminated(job):
@@ -159,14 +159,42 @@ DEFAULT_TIMEOUT = (10, None)
 
 
 class McritClient:
-    def __init__(self, mcrit_server=None, apitoken=None, username=None, raw_responses=False, raise_client_errors=False, raise_server_errors=False, timeout=DEFAULT_TIMEOUT):
-        """
-        raw_responses: every method answers the requests.Response itself.
-        raise_client_errors: a 4xx raises a McritRequestError (McritBadRequest, McritUnauthorized, McritNotFound, McritConflict, McritGone) instead of answering None.
-        raise_server_errors: a 500, 501, unknown status or a failed 2xx raises McritServerError instead of answering None.
-        timeout: (connect, read) seconds for every request, or one number for both; see DEFAULT_TIMEOUT. A request that
-            runs out raises requests.exceptions.ConnectTimeout or ReadTimeout, like any other connection failure.
-        """
+    """Python client for the MCRIT REST API.
+
+    Every public method maps to one endpoint (see docs/api_reference.md) and answers the
+    parsed ``data`` of the server's JSON response, converted to the storage entry classes
+    where one exists; ``None`` when the server answered with a failure status, unless the
+    client was built to raise (``raise_client_errors``, ``raise_server_errors``). The return
+    annotations describe this default mode; with ``raw_responses=True`` every method answers
+    the ``requests.Response`` itself instead. Methods that
+    schedule work on the MCRIT queue answer the job id, which ``getResultForJob`` or
+    ``awaitResult`` turn into the result.
+
+    Args:
+        mcrit_server: base URL of the server, default ``http://localhost:8000``
+        apitoken: sent as the ``apitoken`` header when the server requires one
+        username: sent as the ``username`` header and recorded with the jobs this client creates
+        raw_responses: when True every method returns the ``requests.Response`` unchanged
+        raise_client_errors: a 4xx raises a :class:`McritRequestError` (``McritBadRequest``,
+            ``McritUnauthorized``, ``McritNotFound``, ``McritConflict``, ``McritGone``) instead
+            of answering None
+        raise_server_errors: a 500, 501, unknown status or a failed 2xx raises
+            :class:`McritServerError` instead of answering None
+        timeout: ``(connect, read)`` seconds for every request, or one number for both; see
+            ``DEFAULT_TIMEOUT``. A request that runs out raises
+            ``requests.exceptions.ConnectTimeout`` or ``ReadTimeout``, like any other connection failure
+    """
+
+    def __init__(
+        self,
+        mcrit_server: Optional[str] = None,
+        apitoken: Optional[str] = None,
+        username: Optional[str] = None,
+        raw_responses: bool = False,
+        raise_client_errors: bool = False,
+        raise_server_errors: bool = False,
+        timeout: Union[None, float, Tuple[Optional[float], Optional[float]]] = DEFAULT_TIMEOUT,
+    ) -> None:
         self.mcrit_server = "http://localhost:8000"
         self.headers = {}
         self.raw = True if raw_responses else False
@@ -180,15 +208,22 @@ class McritClient:
         if mcrit_server is not None:
             self.mcrit_server = mcrit_server
 
-    def setApitoken(self, apitoken):
-        self.headers.update({"apitoken": apitoken})
+    @staticmethod
+    def _passthrough(response: requests.Response) -> Any:
+        # raw_responses mode: the Response itself, whatever the method's annotation says
+        return response
 
-    def setUsername(self, username):
-        self.headers.update({"username": username})
-
-    def _handle(self, response) -> Any:
+    def _handle(self, response: requests.Response) -> Any:
         """handle_response in this client's error mode."""
         return handle_response(response, raise_client_errors=self.raise_client_errors, raise_server_errors=self.raise_server_errors)
+
+    def setApitoken(self, apitoken: str) -> None:
+        """Send ``apitoken`` as the ``apitoken`` header from now on."""
+        self.headers.update({"apitoken": apitoken})
+
+    def setUsername(self, username: str) -> None:
+        """Send ``username`` as the ``username`` header from now on; MCRIT records it with the jobs this client creates."""
+        self.headers.update({"username": username})
 
     def _getMatchingRequestParams(
         self, minhash_threshold=None, pichash_size=None, force_recalculation=None, band_matches_required=None, exclude_self_matches=False, sample_group_only=False
@@ -208,84 +243,87 @@ class McritClient:
             params["sample_group_only"] = True
         return params
 
-    def respawn(self):
+    def respawn(self) -> Optional[Dict[str, Any]]:
+        """POST /respawn: drop the whole database and set up a fresh, empty instance. Answers the server's confirmation message."""
         response = requests.post(f"{self.mcrit_server}/respawn", headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return self._passthrough(response)
         return self._handle(response)
 
-    def completeMinhashes(self):
+    def completeMinhashes(self) -> Optional[str]:
+        """GET /complete_minhashes: schedule a job that calculates every missing minhash. Answers the job id."""
         response = requests.get(f"{self.mcrit_server}/complete_minhashes", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def rebuildIndex(self):
+    def rebuildIndex(self) -> Optional[str]:
+        """GET /rebuild_index: schedule a job that drops the band index and rebuilds it from the stored minhashes. Answers the job id."""
         response = requests.get(f"{self.mcrit_server}/rebuild_index", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def rebuildPicBlockHashIndex(self):
-        """
-        Schedule a job that rebuilds the inverted picblockhash index getUniqueBlocks reads; answers the job id
-        """
+    def rebuildPicBlockHashIndex(self) -> Optional[str]:
+        """GET /rebuild_picblockhash_index: schedule a job that rebuilds the inverted picblockhash index getUniqueBlocks reads. Answers the job id."""
         response = requests.get(f"{self.mcrit_server}/rebuild_picblockhash_index", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def rebuildFunctionRangeIndex(self):
-        """
-        Schedule a job that rebuilds the function->sample range index two-stage matching needs; answers the job id
-        """
+    def rebuildFunctionRangeIndex(self) -> Optional[str]:
+        """GET /rebuild_function_range_index: schedule a job that rebuilds the function->sample range index two-stage matching needs. Answers the job id."""
         response = requests.get(f"{self.mcrit_server}/rebuild_function_range_index", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def rebuildBandDfIndex(self):
-        """
-        Schedule a job that stores and indexes each band's posting-list length, so STORAGE_BAND_DF_CUTOFF can skip from the index; answers the job id
-        """
+    def rebuildBandDfIndex(self) -> Optional[str]:
+        """GET /rebuild_band_df_index: schedule a job that stores and indexes each band's posting-list length, so STORAGE_BAND_DF_CUTOFF can skip from the index. Answers the job id."""
         response = requests.get(f"{self.mcrit_server}/rebuild_band_df_index", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def repairMinHashes(self):
-        """
-        Schedule a job that rehashes only the samples whose minhashes an older smda escaper produced (#142); answers the job id
-        """
+    def repairMinHashes(self) -> Optional[str]:
+        """POST /repair_minhashes: schedule a job that rehashes only the samples whose minhashes an older smda escaper produced (#142). Answers the job id."""
         response = requests.post(f"{self.mcrit_server}/repair_minhashes", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def recomputeFamilyStats(self):
-        """
-        Schedule a job that sets every family's sample/function counters from the collections (#151); answers the job id
-        """
+    def recomputeFamilyStats(self) -> Optional[str]:
+        """POST /recompute_family_stats: schedule a job that sets every family's sample/function counters from the collections (#151). Answers the job id."""
         response = requests.post(f"{self.mcrit_server}/recompute_family_stats", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def recalculatePicHashes(self):
+    def recalculatePicHashes(self) -> Optional[str]:
+        """GET /recalculate_pichashes: schedule a job that recalculates the pichashes of samples hashed with an older smda. Answers the job id."""
         response = requests.get(f"{self.mcrit_server}/recalculate_pichashes", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def recalculateMinHashes(self):
+    def recalculateMinHashes(self) -> Optional[str]:
+        """GET /recalculate_minhashes: schedule a job that drops every minhash and recalculates all of them. Answers the job id."""
         response = requests.get(f"{self.mcrit_server}/recalculate_minhashes", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def addReport(self, smda_report: SmdaReport) -> Any:
+    def addReport(self, smda_report: SmdaReport) -> Optional[Tuple[SampleEntry, Optional[str]]]:
+        """POST /samples: submit a disassembled SMDA report as a new sample.
+
+        Returns:
+            the SampleEntry and the id of the minhashing job (None when the sample already existed or
+            no hashing was scheduled); None when the server rejected the report
+        """
         smda_json = smda_report.toDict()
         response = requests.post(f"{self.mcrit_server}/samples", json=smda_json, headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             if "job_id" in data:
@@ -294,7 +332,28 @@ class McritClient:
                 job_id = None
             return SampleEntry.fromDict(data["sample_info"]), job_id
 
-    def addBinarySample(self, binary: bytes, filename=None, family=None, version=None, is_dump=False, base_addr=None, bitness=None) -> Tuple[SampleEntry, Optional[str]]:
+    def addBinarySample(
+        self,
+        binary: bytes,
+        filename: Optional[str] = None,
+        family: Optional[str] = None,
+        version: Optional[str] = None,
+        is_dump: bool = False,
+        base_addr: Optional[int] = None,
+        bitness: Optional[int] = None,
+    ) -> Optional[str]:
+        """POST /samples/binary: submit a raw binary for disassembly and insertion.
+
+        Args:
+            binary: file content, or a memory dump when ``is_dump`` is set
+            filename, family, version: metadata stored with the sample
+            is_dump: disassemble as a mapped image loaded at ``base_addr``
+            base_addr: image base of a dump
+            bitness: 32 or 64, for dumps
+
+        Returns:
+            the id of the disassembly job; its result carries the sample entry
+        """
         query_fields = []
         if filename is not None:
             query_fields.append(f"filename={filename}")
@@ -312,100 +371,96 @@ class McritClient:
         if len(query_fields) > 0:
             query_string = "?" + "&".join(query_fields)
         response = requests.post(f"{self.mcrit_server}/samples/binary{query_string}", data=binary, headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return self._passthrough(response)
         return self._handle(response)
 
     ###########################################
     ### Families
     ###########################################
 
-    def modifyFamily(self, family_id, family_name=None, is_library=None):
+    def modifyFamily(self, family_id: int, family_name: Optional[str] = None, is_library: Optional[bool] = None) -> Optional[Dict[str, Any]]:
+        """PUT /families/{family_id}: rename a family and/or mark it as a library. Answers the confirmation message, None when rejected."""
         update_dict = {}
         if family_name is not None:
             update_dict["family_name"] = family_name
         if is_library is not None:
             update_dict["is_library"] = is_library
         response = requests.put(f"{self.mcrit_server}/families/{family_id}", update_dict, headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return self._passthrough(response)
         return self._handle(response)
 
-    def getFamily(self, family_id: int, with_samples=True) -> Any:
-        """
-        Get a FamilyEntry by its <family_id>
-        Supported by mcritweb API pass-through
-        """
+    def getFamily(self, family_id: int, with_samples: bool = True) -> Optional[FamilyEntry]:
+        """GET /families/{family_id}: one family, with its samples unless ``with_samples`` is False. None for an unknown id."""
         query_params = "?with_samples=true" if with_samples else "?with_samples=false"
         response = requests.get(f"{self.mcrit_server}/families/{family_id}{query_params}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return FamilyEntry.fromDict(data)
         return None
 
-    def getFamiliesByIds(self, family_ids: List[int]) -> Any:
-        """
-        Get all FamilyEntry objects identified by the provided list of family_ids, in a dict with <family_id> as key.
-        Entries carry no sample lists, like getFamily(..., with_samples=False).
-        """
+    def getFamiliesByIds(self, family_ids: List[int]) -> Dict[int, FamilyEntry]:
+        """POST /families/ids: the families with these ids, keyed by family id, without their sample lists (as getFamily(..., with_samples=False)); ids that are not found are left out."""
         if not family_ids:
             return {}
         family_id_string = ",".join(["%d" % fid for fid in family_ids])
         response = requests.post(f"{self.mcrit_server}/families/ids", data=family_id_string, headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return {int(k): FamilyEntry.fromDict(v) for k, v in data.items()}
         return {}
 
-    def getFamilies(self) -> Any:
-        """
-        Get all FamilyEntry objects in a dict, with <family_id> as key
-        Supported by mcritweb API pass-through
-        """
+    def getFamilies(self) -> Optional[Dict[int, FamilyEntry]]:
+        """GET /families: every family, keyed by family id."""
         response = requests.get(f"{self.mcrit_server}/families", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return {i: FamilyEntry.fromDict(entry) for i, entry in data.items()}
         return None
 
-    def isFamilyId(self, family_id) -> Any:
-        """
-        Check if a <family_id> is valid in MCRIT
-        Supported by mcritweb API pass-through
-        """
+    def isFamilyId(self, family_id: int) -> bool:
+        """GET /families/{family_id}: whether the id names a family."""
         response = requests.get(f"{self.mcrit_server}/families/{family_id}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return True
         return False
 
-    def deleteFamily(self, family_id, keep_samples=False):
+    def deleteFamily(self, family_id: int, keep_samples: bool = False) -> Optional[bool]:
+        """DELETE /families/{family_id}: delete a family and its samples, or with ``keep_samples`` move the samples to the unknown family. Answers True on success, None for an unknown id."""
         query_params = "?keep_samples=true" if keep_samples else "?keep_samples=false"
         response = requests.delete(f"{self.mcrit_server}/families/{family_id}{query_params}", headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return self._passthrough(response)
         return self._handle(response)
 
     ###########################################
     ### Samples
     ###########################################
 
-    def isSampleId(self, sample_id):
-        """
-        Check if a <sample_id> is valid in MCRIT
-        Supported by mcritweb API pass-through
-        """
+    def isSampleId(self, sample_id: int) -> bool:
+        """GET /samples/{sample_id}: whether the id names a sample."""
         response = requests.get(f"{self.mcrit_server}/samples/{sample_id}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return True
         return False
 
-    def modifySample(self, sample_id, family_name=None, version=None, component=None, is_library=None):
+    def modifySample(
+        self, sample_id: int, family_name: Optional[str] = None, version: Optional[str] = None, component: Optional[str] = None, is_library: Optional[bool] = None
+    ) -> Optional[Dict[str, Any]]:
+        """PUT /samples/{sample_id}: change a sample's family, version, component and/or library flag. Answers the confirmation message, None when rejected."""
         update_dict = {}
         if family_name is not None:
             update_dict["family_name"] = family_name
@@ -416,56 +471,54 @@ class McritClient:
         if is_library is not None:
             update_dict["is_library"] = is_library
         response = requests.put(f"{self.mcrit_server}/samples/{sample_id}", update_dict, headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return self._passthrough(response)
         return self._handle(response)
 
-    def deleteSample(self, sample_id):
+    def deleteSample(self, sample_id: int) -> Optional[bool]:
+        """DELETE /samples/{sample_id}: delete a sample with its functions and index entries. Answers True on success."""
         response = requests.delete(f"{self.mcrit_server}/samples/{sample_id}", headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return self._passthrough(response)
         return self._handle(response)
 
-    def getSamplesByFamilyId(self, family_id: int) -> Optional[List[SampleEntry]]:
+    def getSamplesByFamilyId(self, family_id: int) -> Optional[Dict[int, SampleEntry]]:
+        """The samples of a family keyed by sample id (via GET /families/{family_id}); None for an unknown family."""
         family_data = self.getFamily(family_id)
         if family_data is not None:
             return family_data.samples
+        return None
 
-    def getSampleById(self, sample_id):
-        """
-        Get a SampleEntry by its <sample_id>
-        Supported by mcritweb API pass-through
-        """
+    def getSampleById(self, sample_id: int) -> Optional[SampleEntry]:
+        """GET /samples/{sample_id}: one sample; None for an unknown id."""
         response = requests.get(f"{self.mcrit_server}/samples/{sample_id}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return SampleEntry.fromDict(data)
 
-    def getSamplesByIds(self, sample_ids: List[int]) -> Any:
-        """
-        Get all SampleEntries identified by the provided list of sample_ids, in a dict with <sample_id> as key.
-        Negative ids are resolved against query samples, like getSampleById.
-        """
+    def getSamplesByIds(self, sample_ids: List[int]) -> Dict[int, SampleEntry]:
+        """POST /samples/ids: the samples with these ids, keyed by sample id; negative ids resolve against query samples, as in getSampleById, and ids that are not found are left out."""
         if not sample_ids:
             return {}
         sample_id_string = ",".join(["%d" % sid for sid in sample_ids])
         response = requests.post(f"{self.mcrit_server}/samples/ids", data=sample_id_string, headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return {int(k): SampleEntry.fromDict(v) for k, v in data.items()}
         return {}
 
-    def getSamples(self, start=0, limit=0):
-        """
-        Get all SampleEntries, optionally from sample_id <start> and up to <limit> many
-        Supported by mcritweb API pass-through
-        """
+    def getSamples(self, start: int = 0, limit: int = 0) -> Optional[Dict[int, SampleEntry]]:
+        """GET /samples: samples keyed by id, from sample id ``start`` on and at most ``limit`` many (0 = all)."""
         query_string = ""
         if (isinstance(start, int) and start >= 0) and (isinstance(limit, int) and limit >= 0):
             query_string = f"?start={start}&limit={limit}"
         response = requests.get(f"{self.mcrit_server}/samples{query_string}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return {int(k): SampleEntry.fromDict(v) for k, v in data.items()}
@@ -474,82 +527,64 @@ class McritClient:
     ### Functions
     ###########################################
 
-    def getFunctionsBySampleId(self, sample_id):
-        """
-        Get a all FunctionEntries for a given <sample_id>
-        Supported by mcritweb API pass-through
-        """
+    def getFunctionsBySampleId(self, sample_id: int) -> Optional[List[FunctionEntry]]:
+        """GET /samples/{sample_id}/functions: every function of a sample; None for an unknown id."""
         response = requests.get(f"{self.mcrit_server}/samples/{sample_id}/functions", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return [FunctionEntry.fromDict(function_entry_dict) for function_entry_dict in data.values()]
 
-    def getFunctions(self, start=0, limit=0):
-        """
-        Get a all FunctionEntries, optionally from sample_id <start> and up to <limit> many
-        Supported by mcritweb API pass-through
-        """
+    def getFunctions(self, start: int = 0, limit: int = 0) -> Optional[Dict[int, FunctionEntry]]:
+        """GET /functions: functions keyed by id, from function id ``start`` on and at most ``limit`` many (0 = all)."""
         query_string = ""
         if (isinstance(start, int) and start >= 0) and (isinstance(limit, int) and limit >= 0):
             query_string = f"?start={start}&limit={limit}"
         response = requests.get(f"{self.mcrit_server}/functions{query_string}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return {int(k): FunctionEntry.fromDict(v) for k, v in data.items()}
 
-    def getFunctionsByIds(self, function_ids: list, with_label_only=False):
-        """
-        Get all FunctionEntries identified by the provided list of function_ids
-        Supported by mcritweb API pass-through
-        """
+    def getFunctionsByIds(self, function_ids: List[int], with_label_only: bool = False) -> Dict[int, FunctionEntry]:
+        """POST /functions: the functions with the given ids keyed by id; with ``with_label_only`` only those carrying a label."""
         query_with_label_only = "?with_label_only=True" if with_label_only else ""
         function_id_string = ",".join(["%d" % fid for fid in function_ids])
         response = requests.post(f"{self.mcrit_server}/functions{query_with_label_only}", data=function_id_string, headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return {int(k): FunctionEntry.fromDict(v) for k, v in data.items()}
         return {}
 
-    def isFunctionId(self, function_id):
-        """
-        Check if a <function_id> is valid in MCRIT
-        Supported by mcritweb API pass-through
-        """
+    def isFunctionId(self, function_id: int) -> bool:
+        """GET /functions/{function_id}: whether the id names a function."""
         response = requests.get(f"{self.mcrit_server}/functions/{function_id}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return True
         return False
 
-    def getFunctionById(self, function_id: int, with_xcfg=False) -> Any:
-        """
-        Get a FunctionEntry by its <function_id>
-        Supported by mcritweb API pass-through
-        """
+    def getFunctionById(self, function_id: int, with_xcfg: bool = False) -> Optional[FunctionEntry]:
+        """GET /functions/{function_id}: one function, with its disassembly when ``with_xcfg`` is set; None for an unknown id."""
         query_with_xcfg = "?with_xcfg=True" if with_xcfg else ""
         response = requests.get(f"{self.mcrit_server}/functions/{function_id}{query_with_xcfg}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return FunctionEntry.fromDict(data)
 
-    def modifyFunction(self, function_id: int, function_name: str):
-        """
-        Set the name of the function <function_id>; the name is also recorded as a label by this client's username.
-        Supported by mcritweb API pass-through
-        """
+    def modifyFunction(self, function_id: int, function_name: str) -> Optional[Dict[str, Any]]:
+        """PUT /functions/{function_id}: rename a function; the name is also recorded as a label by this client's username. Answers the confirmation message, None when rejected."""
         response = requests.put(f"{self.mcrit_server}/functions/{function_id}", {"function_name": function_name}, headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
     ###########################################
@@ -559,28 +594,40 @@ class McritClient:
     def requestMatchesForSmdaReport(
         self,
         smda_report: SmdaReport,
-        minhash_threshold=None,
-        pichash_size=None,
-        band_matches_required=None,
-        force_recalculation=False,
-    ) -> Any:
+        minhash_threshold: Optional[int] = None,
+        pichash_size: Optional[int] = None,
+        band_matches_required: Optional[int] = None,
+        force_recalculation: bool = False,
+    ) -> Optional[str]:
+        """POST /query: schedule matching of an SMDA report that is not stored in MCRIT against the corpus.
+
+        Args:
+            minhash_threshold: minimum minhash score (0-100) for a function match
+            pichash_size: pichash size to match with
+            band_matches_required: bands that must agree before minhashes are compared
+            force_recalculation: ignore a cached result of the same request
+
+        Returns:
+            the job id; the result is a MatchingResult dict
+        """
         smda_json = smda_report.toDict()
         params = self._getMatchingRequestParams(minhash_threshold, pichash_size, force_recalculation, band_matches_required)
         response = requests.post(f"{self.mcrit_server}/query", json=smda_json, headers=self.headers, params=params, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
     def requestMatchesForMappedBinary(
         self,
         binary: bytes,
         base_address: int,
-        minhash_threshold=None,
-        pichash_size=None,
-        band_matches_required=None,
-        disassemble_locally=True,
-        force_recalculation=False,
-    ) -> Any:
+        minhash_threshold: Optional[int] = None,
+        pichash_size: Optional[int] = None,
+        band_matches_required: Optional[int] = None,
+        disassemble_locally: bool = True,
+        force_recalculation: bool = False,
+    ) -> Optional[str]:
+        """Match a memory dump mapped at ``base_address`` against the corpus: disassembled with the local smda and sent to POST /query, or with ``disassemble_locally=False`` sent to POST /query/binary/mapped/{base_address} for the server to disassemble. Matching parameters as for requestMatchesForSmdaReport. Answers the job id, None when local disassembly failed."""
         if disassemble_locally:
             disassembler = Disassembler()
             smda_report = disassembler.disassembleBuffer(binary, base_address)
@@ -597,18 +644,19 @@ class McritClient:
         params = self._getMatchingRequestParams(minhash_threshold, pichash_size, force_recalculation, band_matches_required)
         response = requests.post(f"{self.mcrit_server}/query/binary/mapped/{base_address}", binary, headers=self.headers, params=params, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
     def requestMatchesForUnmappedBinary(
         self,
         binary: bytes,
-        minhash_threshold=None,
-        pichash_size=None,
-        band_matches_required=None,
-        disassemble_locally=True,
-        force_recalculation=False,
-    ) -> Any:
+        minhash_threshold: Optional[int] = None,
+        pichash_size: Optional[int] = None,
+        band_matches_required: Optional[int] = None,
+        disassemble_locally: bool = True,
+        force_recalculation: bool = False,
+    ) -> Optional[str]:
+        """Match a file against the corpus: disassembled with the local smda and sent to POST /query, or with ``disassemble_locally=False`` sent to POST /query/binary for the server to disassemble. Matching parameters as for requestMatchesForSmdaReport. Answers the job id, None when local disassembly failed."""
         if disassemble_locally:
             disassembler = Disassembler()
             smda_report = disassembler.disassembleUnmappedBuffer(binary)
@@ -626,101 +674,101 @@ class McritClient:
 
         response = requests.post(f"{self.mcrit_server}/query/binary", binary, headers=self.headers, params=params, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
     def requestMatchesForSample(
         self,
-        sample_id,
-        minhash_threshold=None,
-        pichash_size=None,
-        band_matches_required=None,
-        force_recalculation=False,
-    ) -> Any:
+        sample_id: int,
+        minhash_threshold: Optional[int] = None,
+        pichash_size: Optional[int] = None,
+        band_matches_required: Optional[int] = None,
+        force_recalculation: bool = False,
+    ) -> Optional[str]:
+        """GET /matches/sample/{sample_id}: schedule matching of a stored sample against the corpus; matching parameters as for requestMatchesForSmdaReport. Answers the job id."""
         params = self._getMatchingRequestParams(minhash_threshold, pichash_size, force_recalculation, band_matches_required)
         response = requests.get(f"{self.mcrit_server}/matches/sample/{sample_id}", headers=self.headers, params=params, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
     def requestMatchesForSampleVs(
         self,
-        sample_id,
-        other_sample_id,
-        minhash_threshold=None,
-        pichash_size=None,
-        band_matches_required=None,
-        force_recalculation=False,
-    ) -> Any:
+        sample_id: int,
+        other_sample_id: int,
+        minhash_threshold: Optional[int] = None,
+        pichash_size: Optional[int] = None,
+        band_matches_required: Optional[int] = None,
+        force_recalculation: bool = False,
+    ) -> Optional[str]:
+        """GET /matches/sample/{sample_id}/{other_sample_id}: schedule matching of one stored sample against another; matching parameters as for requestMatchesForSmdaReport. Answers the job id."""
         params = self._getMatchingRequestParams(minhash_threshold, pichash_size, force_recalculation, band_matches_required)
         response = requests.get(f"{self.mcrit_server}/matches/sample/{sample_id}/{other_sample_id}", headers=self.headers, params=params, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
     def requestMatchesCross(
         self,
-        sample_ids,
-        sample_group_only=False,
-        minhash_threshold=None,
-        pichash_size=None,
-        band_matches_required=None,
-        force_recalculation=False,
-    ) -> Any:
+        sample_ids: List[int],
+        sample_group_only: bool = False,
+        minhash_threshold: Optional[int] = None,
+        pichash_size: Optional[int] = None,
+        band_matches_required: Optional[int] = None,
+        force_recalculation: bool = False,
+    ) -> Optional[str]:
+        """GET /matches/sample/cross/{sample_ids}: schedule cross matching of the samples against each other (``sample_group_only``) or against the corpus; matching parameters as for requestMatchesForSmdaReport. Answers the id of the job combining the per-sample results."""
         params = self._getMatchingRequestParams(minhash_threshold, pichash_size, force_recalculation, band_matches_required, sample_group_only=sample_group_only)
         response = requests.get(f"{self.mcrit_server}/matches/sample/cross/{','.join([str(id) for id in sample_ids])}", headers=self.headers, params=params, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def getMatchFunctionVs(self, function_id_a: int, function_id_b: int) -> Any:
+    def getMatchFunctionVs(self, function_id_a: int, function_id_b: int) -> Optional[Dict[str, Any]]:
+        """GET /matches/function/{function_id_a}/{function_id_b}: compare two stored functions directly (minhash score, pichash equality, the matched function entry). None for an unknown id."""
         response = requests.get(f"{self.mcrit_server}/matches/function/{function_id_a}/{function_id_b}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def getMatchesForSmdaFunction(self, smda_report, minhash_threshold=None, pichash_size=None, force_recalculation=None, band_matches_required=None, exclude_self_matches=False):
-        """
-        Get all matches for a SmdaReport with a single SmdaFunction
-        Supported by mcritweb API pass-through
-        """
+    def getMatchesForSmdaFunction(
+        self,
+        smda_report: SmdaReport,
+        minhash_threshold: Optional[int] = None,
+        pichash_size: Optional[int] = None,
+        force_recalculation: Optional[bool] = None,
+        band_matches_required: Optional[int] = None,
+        exclude_self_matches: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """POST /query/function: match an SMDA report holding a single function synchronously; ``exclude_self_matches`` drops matches with the same sample. Answers the MatchingResult dict."""
         # TODO add the same parameter possibilities that are used for regular full matching jobs
         params = self._getMatchingRequestParams(minhash_threshold, pichash_size, force_recalculation, band_matches_required, exclude_self_matches)
         response = requests.post(f"{self.mcrit_server}/query/function", json=smda_report.toDict(), headers=self.headers, params=params, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def getMatchesForPicHash(self, pichash, summary=False):
-        """
-        Get all matches for a given <pichash>, optionally only as <summary>
-        Supported by mcritweb API pass-through
-        """
+    def getMatchesForPicHash(self, pichash: int, summary: bool = False) -> Optional[Any]:
+        """GET /query/pichash/{pichash}[/summary]: the (family_id, sample_id, function_id) tuples of the functions with this pichash, or with ``summary`` the counts of families, samples and functions."""
         summary_string = "/summary" if summary else ""
         response = requests.get(f"{self.mcrit_server}/query/pichash/{pichash:016x}{summary_string}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def getMatchesForPicBlockHash(self, picblockhash, summary=False):
-        """
-        Get all matches for a given <picblockhash>, optionally only as <summary>
-        Supported by mcritweb API pass-through
-        """
+    def getMatchesForPicBlockHash(self, picblockhash: int, summary: bool = False) -> Optional[Any]:
+        """GET /query/picblockhash/{picblockhash}[/summary]: the (family_id, sample_id, function_id, offset) tuples of the basic blocks with this picblockhash, or with ``summary`` the counts of families, samples and functions."""
         summary_string = "/summary" if summary else ""
         response = requests.get(f"{self.mcrit_server}/query/picblockhash/{picblockhash:016x}{summary_string}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def getSampleBySha256(self, sample_sha256: str):
-        """
-        Get a SampleEntry by its <sha256>
-        Supported by mcritweb API pass-through
-        """
+    def getSampleBySha256(self, sample_sha256: str) -> Optional[SampleEntry]:
+        """GET /samples/sha256/{sha256}: one sample by its sha256; None when unknown or malformed."""
         response = requests.get(f"{self.mcrit_server}/samples/sha256/{sample_sha256}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is None:
             return None
@@ -730,33 +778,28 @@ class McritClient:
     ### Status, Results
     ###########################################
 
-    def getStatus(self, with_pichash=True):
-        """
-        Get a status report of the MCRIT server with some statistics
-        Supported by mcritweb API pass-through
-        """
+    def getStatus(self, with_pichash: bool = True) -> Optional[Dict[str, Any]]:
+        """GET /status: statistics of the instance (database state, counts of samples, families, functions and, with ``with_pichash``, unique pichashes, smda version and escaper fingerprint)."""
         query_string = ""
         if with_pichash:
             query_string = "?with_pichash=True"
         response = requests.get(f"{self.mcrit_server}/status{query_string}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def getVersion(self):
-        """
-        Get a version report of the MCRIT server
-        Supported by mcritweb API pass-through
-        """
+    def getVersion(self) -> Optional[str]:
+        """GET /version: the version of the MCRIT server."""
         response = requests.get(f"{self.mcrit_server}/version", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if isinstance(data, dict) and "version" in data:
             return data["version"]
         return None
 
-    def getJobCount(self, filter=None):
+    def getJobCount(self, filter: Optional[str] = None) -> Optional[int]:
+        """GET /jobs: how many jobs the queue holds, optionally only those whose descriptor contains ``filter``."""
         query_string = ""
         if isinstance(filter, str) and filter is not None:
             if len(query_string) == 0:
@@ -765,41 +808,42 @@ class McritClient:
                 query_string += f"&filter={filter}"
         response = requests.get(f"{self.mcrit_server}/jobs{query_string}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return len(data)
 
-    def getQueueStatistics(self, with_refresh=False):
-        """
-        Get a summary of queue statistics
-        Supported by mcritweb API pass-through
-        """
+    def getQueueStatistics(self, with_refresh: bool = False) -> Optional[Dict[str, Any]]:
+        """GET /jobs/stats: queue statistics per method and state; ``with_refresh`` recounts instead of answering the cached numbers."""
         query_string = ""
         if with_refresh:
             if len(query_string) == 0:
                 query_string = "?with_refresh=True"
         response = requests.get(f"{self.mcrit_server}/jobs/stats/{query_string}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
     @staticmethod
-    def _job_selection_query(method=None, filter=None, state=None, username=None, **more):
+    def _job_selection_query(method=None, filter=None, state=None, username=None, **more) -> str:
         """The query string of the parameters that select jobs, URL-encoded (a filter is free text)."""
         params = {"method": method, "filter": filter, "state": state, "username": username, **more}
         present = {key: value for key, value in params.items() if value is not None and value is not False and value != 0}
         return "?" + urllib.parse.urlencode(present, safe=",") if present else ""
 
-    def getQueueData(self, start=0, limit=0, method=None, filter=None, state=None, ascending=False, username=None, sample_ids=None, job_ids=None):
-        """
-        Get queue data, optionally from <start> and <limit> many, narrowed to a <method>, a
-        <state>, jobs whose parameters contain <filter> (case-insensitive) and/or jobs requested
-        by <username>. The narrowing is applied before paging, so a page is a page of the matches.
-        <sample_ids> selects jobs of <method> by their first argument (the server then requires
-        <method>); <job_ids> selects jobs by id.
-        Supported by mcritweb API pass-through
-        """
+    def getQueueData(
+        self,
+        start: int = 0,
+        limit: int = 0,
+        method: Optional[str] = None,
+        filter: Optional[str] = None,
+        state: Optional[str] = None,
+        ascending: bool = False,
+        username: Optional[str] = None,
+        sample_ids: Optional[List[int]] = None,
+        job_ids: Optional[List[str]] = None,
+    ) -> Optional[List[Job]]:
+        """GET /jobs: the queued jobs, newest first unless ``ascending``, from index ``start`` on and at most ``limit`` many (0 = all); ``method`` (job method name), ``state``, ``filter`` (substring of the job parameters, case-insensitive) and ``username`` (who requested it) narrow them down before paging, so a page is a page of the matches; ``sample_ids`` selects jobs of ``method`` by their first argument (the server then requires ``method``) and ``job_ids`` selects jobs by id."""
         query_string = self._job_selection_query(
             method=method,
             filter=filter,
@@ -813,17 +857,21 @@ class McritClient:
         )
         response = requests.get(f"{self.mcrit_server}/jobs/{query_string}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return [Job(job_data, None) for job_data in data]
 
-    def getQueueCount(self, method=None, filter=None, state=None, username=None, sample_ids=None, job_ids=None):
-        """
-        How many jobs getQueueData would list for the same selection - what a paginated listing
-        needs to size itself.
-        Supported by mcritweb API pass-through
-        """
+    def getQueueCount(
+        self,
+        method: Optional[str] = None,
+        filter: Optional[str] = None,
+        state: Optional[str] = None,
+        username: Optional[str] = None,
+        sample_ids: Optional[List[int]] = None,
+        job_ids: Optional[List[str]] = None,
+    ) -> Optional[int]:
+        """GET /jobs/count: how many jobs getQueueData would list for the same selection - what a paginated listing needs to size itself."""
         query_string = self._job_selection_query(
             method=method,
             filter=filter,
@@ -834,16 +882,15 @@ class McritClient:
         )
         response = requests.get(f"{self.mcrit_server}/jobs/count{query_string}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return data["count"]
 
-    def deleteQueueData(self, method=None, created_before=None, finished_before=None):
-        """
-        Delete Jobs that match given provided criteria
-        Supported by mcritweb API pass-through
-        """
+    def deleteQueueData(
+        self, method: Optional[str] = None, created_before: Optional[datetime.datetime] = None, finished_before: Optional[datetime.datetime] = None
+    ) -> Optional[Dict[str, int]]:
+        """DELETE /jobs: delete the jobs matching all given filters. Answers ``num_deleted``."""
         query_string = ""
         if isinstance(method, str) and method is not None:
             if len(query_string) == 0:
@@ -862,66 +909,56 @@ class McritClient:
                 query_string += f"&finished_before={finished_before.strftime('%Y-%m-%dT%H:%M:%S')}"
         response = requests.delete(f"{self.mcrit_server}/jobs/{query_string}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def deleteJob(self, job_id):
-        """
-        Delete the Job for a given <job_id>
-        Supported by mcritweb API pass-through
-        """
+    def deleteJob(self, job_id: str) -> Optional[Dict[str, int]]:
+        """DELETE /jobs/{job_id}: delete one job and its result. Answers ``num_deleted``."""
         response = requests.delete(f"{self.mcrit_server}/jobs/{job_id}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def getJobData(self, job_id):
-        """
-        Get the Job for a given <job_id>
-        Supported by mcritweb API pass-through
-        """
+    def getJobData(self, job_id: str) -> Optional[Job]:
+        """GET /jobs/{job_id}: one job; None for an unknown or malformed id."""
         response = requests.get(f"{self.mcrit_server}/jobs/{job_id}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return Job(data, None)
 
-    def getResultForJob(self, job_id, compact=False):
-        """
-        Get the Result for Job with a given <job_id>
-        Supported by mcritweb API pass-through
-        """
+    def getResultForJob(self, job_id: str, compact: bool = False) -> Optional[Any]:
+        """GET /jobs/{job_id}/result: the result of a job, None while it has not finished; ``compact`` strips the per-function matches of a matching result."""
         query_string = "?compact=True" if compact else ""
         response = requests.get(f"{self.mcrit_server}/jobs/{job_id}/result{query_string}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def getResult(self, result_id, compact=False):
-        """
-        Get the Result for a given <result_id>
-        Supported by mcritweb API pass-through
-        """
+    def getResult(self, result_id: str, compact: bool = False) -> Optional[Any]:
+        """GET /results/{result_id}: the result stored under a result id; ``compact`` strips the per-function matches of a matching result."""
         query_string = "?compact=True" if compact else ""
         response = requests.get(f"{self.mcrit_server}/results/{result_id}{query_string}", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
-    def getJobForResult(self, result_id):
-        """
-        Get the Job for the Result with a given <result_id>
-        Supported by mcritweb API pass-through
-        """
+    def getJobForResult(self, result_id: str) -> Optional[Job]:
+        """GET /results/{result_id}/job: the job that produced a result."""
         response = requests.get(f"{self.mcrit_server}/results/{result_id}/job", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is not None:
             return Job(data, None)
 
-    def awaitResult(self, job_id, sleep_time=2, compact=False):
+    def awaitResult(self, job_id: Optional[str], sleep_time: float = 2, compact: bool = False) -> Optional[Any]:
+        """Poll GET /jobs/{job_id} every ``sleep_time`` seconds until the job finished, then fetch its result.
+
+        Raises:
+            JobTerminatedError: when the job was terminated instead of finishing
+        """
         if job_id is None:
             return None
         job = self.getJobData(job_id)
@@ -930,6 +967,7 @@ class McritClient:
             job = self.getJobData(job_id)
         if isJobTerminated(job):
             raise JobTerminatedError
+        assert job is not None
         result_id = job.result
         return self.getResult(result_id, compact=compact)
 
@@ -937,25 +975,37 @@ class McritClient:
     ### Import / Export
     ###########################################
 
-    def getExportData(self, sample_ids=None, compress_data=True) -> dict:
+    def getExportData(self, sample_ids: Optional[List[int]] = None, compress_data: bool = True) -> Optional[Dict[str, Any]]:
+        """GET /export or /export/{sample_ids}: the export of the whole instance or of the given samples, for addImportData on another instance; ``compress_data`` compresses the function entries per sample.
+
+        Raises:
+            ValueError: when ``sample_ids`` is not a list of int
+        """
         compress_uri_param = "?compress=True" if compress_data else ""
         result_data = {}
         if sample_ids is not None:
             if isinstance(sample_ids, list) and all(isinstance(item, int) for item in sample_ids):
                 sample_ids_as_str = ",".join([str(sample_id) for sample_id in sample_ids])
                 response = requests.get(f"{self.mcrit_server}/export/{sample_ids_as_str}{compress_uri_param}", headers=self.headers, timeout=self.timeout)
-                result_data = self._handle(response)
+                result_data = self._passthrough(response) if self.raw else self._handle(response)
             else:
                 raise ValueError("sample_ids must be a list of int.")
         else:
             response = requests.get(f"{self.mcrit_server}/export{compress_uri_param}", headers=self.headers, timeout=self.timeout)
-            result_data = self._handle(response)
+            result_data = self._passthrough(response) if self.raw else self._handle(response)
         return result_data
 
-    def addImportData(self, import_data):
+    def addImportData(self, import_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """POST /import: import the data getExportData produced (ids are remapped, known samples skipped). Answers the import report.
+
+        Raises:
+            ValueError: when ``import_data`` is not a dict
+        """
         if not isinstance(import_data, dict):
             raise ValueError("Can only forward dictionaries with export data.")
         response = requests.post(f"{self.mcrit_server}/import", json=import_data, headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return self._passthrough(response)
         return self._handle(response)
 
     ###########################################
@@ -973,21 +1023,31 @@ class McritClient:
             params["min_instructions"] = min_instructions
         return params
 
-    def requestUniqueBlocksForSamples(self, sample_ids: List[int], covers_required=None, min_instructions=None) -> Dict:
+    def requestUniqueBlocksForSamples(self, sample_ids: List[int], covers_required: Optional[int] = None, min_instructions: Optional[int] = None) -> Optional[str]:
+        """GET /uniqueblocks/samples/{sample_ids}: schedule the search for basic blocks unique to these samples; ``covers_required`` is the k of the k-of-n block cover, ``min_instructions`` drops shorter blocks. Answers the job id.
+
+        Raises:
+            ValueError: when ``sample_ids`` is not a list of int
+        """
         if isinstance(sample_ids, list) and all(isinstance(item, int) for item in sample_ids):
             sample_ids_as_str = ",".join([str(sample_id) for sample_id in sample_ids])
             params = self._getUniqueBlocksParams(covers_required, min_instructions)
             response = requests.get(f"{self.mcrit_server}/uniqueblocks/samples/{sample_ids_as_str}", headers=self.headers, params=params, timeout=self.timeout)
-            result_data = self._handle(response)
+            result_data = self._passthrough(response) if self.raw else self._handle(response)
         else:
             raise ValueError("sample_ids must be a list of int.")
         return result_data
 
-    def requestUniqueBlocksForFamily(self, family_id: int, covers_required=None, min_instructions=None) -> Dict:
+    def requestUniqueBlocksForFamily(self, family_id: int, covers_required: Optional[int] = None, min_instructions: Optional[int] = None) -> Optional[str]:
+        """GET /uniqueblocks/family/{family_id}: schedule the search for basic blocks unique to the family's samples; parameters as for requestUniqueBlocksForSamples. Answers the job id.
+
+        Raises:
+            ValueError: when ``family_id`` is not an int
+        """
         if isinstance(family_id, int):
             params = self._getUniqueBlocksParams(covers_required, min_instructions)
             response = requests.get(f"{self.mcrit_server}/uniqueblocks/family/{family_id}", headers=self.headers, params=params, timeout=self.timeout)
-            result_data = self._handle(response)
+            result_data = self._passthrough(response) if self.raw else self._handle(response)
         else:
             raise ValueError("family_id must be an int.")
         return result_data
@@ -1032,7 +1092,10 @@ class McritClient:
         return requests.get(f"{self.mcrit_server}/search/{search_kind}?{encoded_params}", headers=self.headers, timeout=self.timeout)
 
     def _search_base(self, search_kind, search_term, cursor=None, is_ascending=True, sort_by=None, limit=None):
-        return self._handle(self._search_request(search_kind, search_term, cursor=cursor, is_ascending=is_ascending, sort_by=sort_by, limit=limit))
+        response = self._search_request(search_kind, search_term, cursor=cursor, is_ascending=is_ascending, sort_by=sort_by, limit=limit)
+        if self.raw:
+            return self._passthrough(response)
+        return self._handle(response)
 
     search_families = functools.partialmethod(_search_base, "families")
 
@@ -1048,27 +1111,33 @@ class McritClient:
         response = self._search_request(search_kind, search_term, cursor=cursor, is_ascending=is_ascending, sort_by=sort_by, limit=limit)
         if self.raw:
             # like the other camel-case accessors: the requests.Response itself
-            return response
+            return self._passthrough(response)
         data = self._handle(response)
         if data is None:
             return None
         return SearchResult.fromDict(data, entry_class)
 
-    def searchFamilies(self, search_term, cursor=None, is_ascending=True, sort_by=None, limit=None) -> Optional[SearchResult[FamilyEntry]]:
+    def searchFamilies(
+        self, search_term: str, cursor: Optional[str] = None, is_ascending: bool = True, sort_by: Optional[str] = None, limit: Optional[int] = None
+    ) -> Optional[SearchResult[FamilyEntry]]:
         """
         Search families by <search_term>, answered as FamilyEntry objects
         Supported by mcritweb API pass-through (as /search/families)
         """
         return self._typed_search("families", FamilyEntry, search_term, cursor=cursor, is_ascending=is_ascending, sort_by=sort_by, limit=limit)
 
-    def searchSamples(self, search_term, cursor=None, is_ascending=True, sort_by=None, limit=None) -> Optional[SearchResult[SampleEntry]]:
+    def searchSamples(
+        self, search_term: str, cursor: Optional[str] = None, is_ascending: bool = True, sort_by: Optional[str] = None, limit: Optional[int] = None
+    ) -> Optional[SearchResult[SampleEntry]]:
         """
         Search samples by <search_term>, answered as SampleEntry objects
         Supported by mcritweb API pass-through (as /search/samples)
         """
         return self._typed_search("samples", SampleEntry, search_term, cursor=cursor, is_ascending=is_ascending, sort_by=sort_by, limit=limit)
 
-    def searchFunctions(self, search_term, cursor=None, is_ascending=True, sort_by=None, limit=None) -> Optional[SearchResult[FunctionEntry]]:
+    def searchFunctions(
+        self, search_term: str, cursor: Optional[str] = None, is_ascending: bool = True, sort_by: Optional[str] = None, limit: Optional[int] = None
+    ) -> Optional[SearchResult[FunctionEntry]]:
         """
         Search functions by <search_term>, answered as FunctionEntry objects
         Supported by mcritweb API pass-through (as /search/functions)

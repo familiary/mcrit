@@ -359,7 +359,7 @@ class McritConsole:
                 print(f"{function_entry}")
 
     def _handle_queue(self, args):
-        result = self.client.getQueueData(filter=args.filter)
+        result = self.client.getQueueData(filter=args.filter) or []
         for entry in result:
             job_id = entry.job_id
             result_id = entry.result
@@ -486,7 +486,7 @@ class McritConsole:
             self.client.addReport(smda_report)
 
     def _handle_submit_dir(self, args):
-        mcrit_sample_entries = self.client.getSamples()
+        mcrit_sample_entries = self.client.getSamples() or {}
         mcrit_samples_by_sha256 = {}
         for sample_id, sample_entry in mcrit_sample_entries.items():
             mcrit_samples_by_sha256[sample_entry.sha256] = sample_entry
@@ -534,7 +534,7 @@ class McritConsole:
                         self.client.addReport(smda_report)
 
     def _handle_submit_recursive(self, args):
-        mcrit_samples = self.client.getSamples()
+        mcrit_samples = self.client.getSamples() or {}
         mcrit_samples_by_sha256 = {}
         for sample_id, sample in mcrit_samples.items():
             mcrit_samples_by_sha256[sample.sha256] = sample
@@ -574,7 +574,7 @@ class McritConsole:
             print("Error: 'malpedia.bib' is missing in that folder, are you sure you are poniting to a Malpedia repository?")
             return
         # get current status of all samples in MCRIT
-        mcrit_samples = self.client.getSamples()
+        mcrit_samples = self.client.getSamples() or {}
         mcrit_samples_by_filename = {}
         for sample_id, sample in mcrit_samples.items():
             # verify that filename has malpedia format (starts with sha256 and _unpacked/_dump)

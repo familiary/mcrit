@@ -10,6 +10,7 @@ class BlocksResource:
 
     @timing
     def on_get_unique_blocks_for_family(self, req, resp, family_id: int):
+        """Schedule a job that finds the basic blocks unique to the family's samples; ``covers_required`` (k of the k-of-n cover) and ``min_instructions`` (drop shorter blocks). Answers the job id."""
         db_log_msg(self.index, req, "BlocksResource.on_get_unique_blocks_for_family")
         parameters = getUniqueBlocksParams(req.params)
         blocks_result = {}
@@ -20,6 +21,7 @@ class BlocksResource:
 
     @timing
     def on_get_unique_blocks_for_samples(self, req, resp, comma_separated_sample_ids=None):
+        """Schedule a job that finds the basic blocks unique to the comma separated sample ids; parameters as for ``/uniqueblocks/family/{family_id}``. Answers the job id."""
         db_log_msg(self.index, req, "BlocksResource.on_get_unique_blocks")
         parameters = getUniqueBlocksParams(req.params)
         blocks_result = {}

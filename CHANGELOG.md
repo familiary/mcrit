@@ -15,6 +15,27 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- **`docs/api_reference.md`, a REST API reference generated from the route table**, listing
+  every route with its methods, what it does and the `McritClient` method that calls it.
+  `python -m mcrit.server.api_reference` rewrites it (`--check` exits 1 when it is stale), every
+  responder now carries the docstring it is described by, and `tests/testApiReference.py` fails
+  when the committed file no longer matches the code, when a route is undocumented, or when a
+  public client method has no docstring or return annotation. Every public `McritClient` method
+  is now typed and documented with the route it calls ([#54]).
+
+### Fixed
+
+- **`McritClient(raw_responses=True)` answered parsed data from ten request methods** - `respawn`,
+  `addBinarySample`, `modifyFamily`, `deleteFamily`, `modifySample`, `deleteSample`,
+  `getExportData`, `addImportData`, `requestUniqueBlocksForSamples` and
+  `requestUniqueBlocksForFamily` never checked the mode, so a caller relying on it got the parsed
+  data, or `None` for a failed request, instead of the response. They now answer the
+  `requests.Response` like every other method, and the dict-returning `search_*` methods do too,
+  which previously answered `None` for a failed search in raw mode. A test reads the client's source
+  and fails for a request method that ignores the mode ([#54]).
+
 ## [1.12.0] - 2026-09-25
 
 ### Added
@@ -586,3 +607,4 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#54]: https://github.com/danielplohmann/mcrit/issues/54

@@ -81,7 +81,7 @@ Regardless of your choice for installation, once running you can interact with t
 
 ### MCRIT Client
 
-We have created a Python client module that is capable of working with all available endpoints of the server.
+We have created a Python client module that is capable of working with all available endpoints of the server. The endpoints themselves are listed in the generated [API reference](docs/api_reference.md), together with the client method for each.
 Documentation for this client module is currently in development.
 
 ### MCRIT CLI

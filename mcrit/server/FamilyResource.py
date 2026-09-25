@@ -12,6 +12,7 @@ class FamilyResource:
 
     @timing
     def on_get(self, req, resp, family_id=None):
+        """One family by id, with its samples unless ``with_samples=false``. Unknown ids answer 404."""
         # parse optional request parameters
         with_samples = True
         if "with_samples" in req.params:
@@ -39,6 +40,7 @@ class FamilyResource:
 
     @timing
     def on_post_by_ids(self, req, resp):
+        """The families with the comma-separated ids in the body, keyed by family id, without their sample lists; ids that are not found are left out."""
         if not req.content_length:
             resp.data = jsonify(
                 {
@@ -64,6 +66,7 @@ class FamilyResource:
 
     @timing
     def on_put(self, req, resp, family_id=None):
+        """Modify a family; JSON body with ``family_name`` (alphanumeric, dots, dashes, underscores) and/or ``is_library``. Answers 202 on success, 400 for a malformed body."""
         resp.status = falcon.HTTP_400
         if not req.content_length or not isinstance(req.media, dict):
             resp.data = jsonify({"status": "failed", "data": {"message": "PUT request without body can't be processed."}})
@@ -94,6 +97,7 @@ class FamilyResource:
 
     @timing
     def on_delete(self, req, resp, family_id=None):
+        """Delete a family and its samples; with ``keep_samples=true`` the samples move to the unknown family instead. Unknown ids answer 404."""
         if family_id is None or self.index.getFamily(family_id) is None:
             resp.data = jsonify(
                 {
@@ -121,6 +125,7 @@ class FamilyResource:
 
     @timing
     def on_get_collection(self, req, resp):
+        """All families keyed by id; optional ``start`` (first family id) and ``limit``."""
         db_log_msg(self.index, req, "FamilyResource.on_get_collection")
         # parse optional request parameters
         start_index = 0

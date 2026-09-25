@@ -1,3 +1,4 @@
+import functools
 import logging
 from timeit import default_timer as timer
 
@@ -70,6 +71,8 @@ def jsonify(content, debug_print=False):
 
 
 def timing(func):
+    # wraps keeps the responder's name and docstring, which the API reference is generated from
+    @functools.wraps(func)
     def wrapper(*args, **kwargs):
         start = timer()
         func(*args, **kwargs)

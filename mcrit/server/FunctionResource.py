@@ -12,6 +12,7 @@ class FunctionResource:
 
     @timing
     def on_get(self, req, resp, function_id=None):
+        """One function by id, with its disassembly when ``with_xcfg=true``. Unknown ids answer 404."""
         query_with_xcfg = False
         if "with_xcfg" in req.params:
             query_with_xcfg = req.params["with_xcfg"].lower().strip() == "true"
@@ -67,6 +68,7 @@ class FunctionResource:
 
     @timing
     def on_post_collection(self, req, resp):
+        """The functions with the comma separated ids given in the request body, keyed by id; with ``with_label_only=true`` only those carrying a label."""
         if not req.content_length:
             resp.data = jsonify(
                 {
@@ -101,6 +103,7 @@ class FunctionResource:
 
     @timing
     def on_get_collection(self, req, resp):
+        """All functions keyed by id; optional ``start`` (first function id) and ``limit``."""
         # parse optional request parameters
         start_index = 0
         if "start" in req.params:
