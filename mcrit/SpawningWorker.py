@@ -3,7 +3,9 @@
 import logging
 import os
 import re
+import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -28,9 +30,62 @@ LOGGER = logging.getLogger(__name__)
 # still holds the inherited descriptors (e.g. a surviving grandchild of the job process) - in
 # which case the worker must give up on the output rather than block its poll loop forever.
 OUTPUT_READER_JOIN_TIMEOUT = 30
+# how often a job process's memory is measured against QUEUE_SPAWNINGWORKER_CHILD_MAX_MEMORY
+MEMORY_POLL_INTERVAL = 1.0
+
+
+def _canMeasureProcessMemory() -> bool:
+    return os.path.exists(f"/proc/{os.getpid()}/statm")
+
+
+def _processTree(pid: int) -> list:
+    """The pid and every process descending from it, from the parent pids in /proc."""
+    children = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as stat:
+                # the command name is in parentheses and may contain spaces; the parent pid follows it
+                parent = int(stat.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        children.setdefault(parent, []).append(int(entry))
+    tree, pending = [], [pid]
+    while pending:
+        current = pending.pop()
+        tree.append(current)
+        pending.extend(children.get(current, []))
+    return tree
+
+
+def _residentBytes(pids: list) -> int:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    total = 0
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/statm") as statm:
+                total += int(statm.read().split()[1]) * page_size
+        except (OSError, IndexError, ValueError):
+            continue
+    return total
+
+
+def _killProcessTree(console_handle) -> None:
+    """Kill a job process and what it started, e.g. a hashing pool, which would otherwise outlive it."""
+    descendants = _processTree(console_handle.pid)[1:] if _canMeasureProcessMemory() else []
+    console_handle.kill()
+    for pid in descendants:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    console_handle.wait()
 
 
 class SpawningWorker(Worker):
+    _warned_about_memory_limit = False
+
     def __init__(self, queue=None, config=None, storage: Optional["StorageInterface"] = None, profiling=False):
         self._worker_id = f"Worker-{uuid.uuid4()}"
         LOGGER.info(f"Starting as spawning worker: {self._worker_id}")
@@ -75,9 +130,47 @@ class SpawningWorker(Worker):
 
     #### NO REDIRECTION: SPAWM SINGLE JOB WORKERS INSTEAD ###
 
+    def _jobCommand(self, job):
+        # sys.executable rather than "python", which may not be on PATH or may be another interpreter
+        return [sys.executable, "-m", "mcrit", "singlejobworker", "--job_id", str(job.job_id)]
+
+    def _awaitJobProcess(self, console_handle, job):
+        """Wait for a job process, stopping it at QUEUE_SPAWNINGWORKER_CHILDREN_TIMEOUT or, when
+        QUEUE_SPAWNINGWORKER_CHILD_MAX_MEMORY is set, once its processes hold more memory than that.
+
+        The memory is the resident size of the job's whole process tree, taken from /proc once per
+        MEMORY_POLL_INTERVAL: a job hashing with a process pool spreads over several processes, and a
+        limit on any one of them would neither bound the job nor account for its shared libraries
+        the way resident memory does (#69).
+        """
+        deadline = time.monotonic() + self._queue_config.QUEUE_SPAWNINGWORKER_CHILDREN_TIMEOUT
+        memory_limit = self._queue_config.QUEUE_SPAWNINGWORKER_CHILD_MAX_MEMORY
+        if memory_limit > 0 and not _canMeasureProcessMemory():
+            if not SpawningWorker._warned_about_memory_limit:
+                LOGGER.warning("QUEUE_SPAWNINGWORKER_CHILD_MAX_MEMORY needs /proc (Linux); job processes run without a memory limit.")
+                SpawningWorker._warned_about_memory_limit = True
+            memory_limit = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            try:
+                console_handle.wait(timeout=max(0.0, min(remaining, MEMORY_POLL_INTERVAL) if memory_limit > 0 else remaining))
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            if time.monotonic() >= deadline:
+                LOGGER.error(f"Job {str(job.job_id)} running as child from SpawningWorker timed out during processing.")
+                _killProcessTree(console_handle)
+                return
+            if memory_limit > 0:
+                used = _residentBytes(_processTree(console_handle.pid))
+                if used > memory_limit:
+                    LOGGER.error(f"Job {str(job.job_id)} holds {used} bytes of memory, more than QUEUE_SPAWNINGWORKER_CHILD_MAX_MEMORY ({memory_limit}); stopping it.")
+                    _killProcessTree(console_handle)
+                    return
+
     def _executeJobPayload(self, job_payload, job):
         # instead of execution within our own context, spawn a new process as worker for this job payload
-        console_handle = subprocess.Popen(["python", "-m", "mcrit", "singlejobworker", "--job_id", str(job.job_id)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        console_handle = subprocess.Popen(self._jobCommand(job), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         # extract result_id from console_output
         result_id = None
         stdout_lines = []
@@ -102,15 +195,10 @@ class SpawningWorker(Worker):
         t1.start()
         t2.start()
 
-        try:
-            # the reader threads own the pipes; communicate() would race them for the same
-            # file descriptors (observed as OSError EBADF when a child dies mid-read), so
-            # only wait for the exit code here and let the readers drain the output
-            console_handle.wait(timeout=self._queue_config.QUEUE_SPAWNINGWORKER_CHILDREN_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            LOGGER.error(f"Job {str(job.job_id)} running as child from SpawningWorker timed out during processing.")
-            console_handle.kill()
-            console_handle.wait()
+        # the reader threads own the pipes; communicate() would race them for the same file
+        # descriptors (observed as OSError EBADF when a child dies mid-read), so only wait for the
+        # exit code here and let the readers drain the output
+        self._awaitJobProcess(console_handle, job)
 
         t1.join(timeout=OUTPUT_READER_JOIN_TIMEOUT)
         t2.join(timeout=OUTPUT_READER_JOIN_TIMEOUT)

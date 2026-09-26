@@ -800,8 +800,17 @@ class MemoryStorage(StorageInterface):
                 pichash = self._functions[function_id].pichash
                 if pichash is None:
                     continue
-                pichashes[pichash] = deepcopy(self._pichashes[pichash])
+                # a hash over MINHASH_PICHASH_MAX_MATCHES keeps its key with no holders, as in MongoDbStorage
+                pichashes[pichash] = deepcopy(self._pichashes[pichash]) if self._isPicHashWithinMatchCount(pichash) else set()
         return pichashes
+
+    def getMatchesForPicHashes(self, pichashes: List[int]) -> Dict[int, Set[Tuple[int, int, int]]]:
+        return {pichash: set(self._pichashes[pichash]) for pichash in set(pichashes) if self._pichashes.get(pichash) and self._isPicHashWithinMatchCount(pichash)}
+
+    def _isPicHashWithinMatchCount(self, pichash: int) -> bool:
+        """False for a PicHash held by more than MINHASH_PICHASH_MAX_MATCHES functions; the knob is off at 0."""
+        cutoff = getattr(self._minhash_config, "MINHASH_PICHASH_MAX_MATCHES", 0)
+        return cutoff <= 0 or len(self._pichashes.get(pichash, ())) <= cutoff
 
     def getPicHashMatchesBySampleId(self, sample_id: int) -> Optional[Dict[int, Set[Tuple[int, int, int]]]]:
         function_entries = self.getFunctionsBySampleId(sample_id)

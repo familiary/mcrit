@@ -638,6 +638,21 @@ class StorageInterface:
         """
         raise NotImplementedError
 
+    def getMatchesForPicHashes(self, pichashes: List[int]) -> Dict[int, Set[Tuple[int, int, int]]]:
+        """Get the (family_id, sample_id, function_id) tuples of the functions holding each of the given PicHashes, in one lookup.
+
+        A PicHash held by more than MINHASH_PICHASH_MAX_MATCHES functions is left out, and so is one
+        no function holds. (getPicHashMatchesByFunctionIds answers such a PicHash with an empty set
+        instead; matching treats both alike.)
+
+        Args:
+            pichashes: the pichashes to look up
+
+        Returns:
+            a dict mapping each pichash with holders to the set of their (family_id, sample_id, function_id) tuples
+        """
+        raise NotImplementedError
+
     def getMatchesForPicBlockHash(self, picblockhash: int) -> Set[Tuple[int, int, int, int]]:
         """Get the set of all (family_id, sample_id, function_id, offset) tuples for a given PicBlockHash. If no function has the given picblockhash, the empty set is returned
 

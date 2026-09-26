@@ -9,6 +9,8 @@ from typing import Iterator, List, Optional
 
 import pymongo.errors
 
+from mcrit.libs.memory import return_freed_memory
+
 # Only do basicConfig if no handlers have been configured
 if not logging.root.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)-15s %(message)s")
@@ -392,6 +394,9 @@ class QueueRemoteCallee(BaseRemoteCallerClass):
             # with its release lost - reconcile before the next claim
             self._needs_lock_reconcile = True
             LOGGER.error("Error occurred while executing job: %s", job, exc_info=True)
+        finally:
+            # this process takes the next job; a spawning worker's job process ends instead
+            return_freed_memory()
 
     def run(self):
         self._alive = True

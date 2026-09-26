@@ -653,6 +653,21 @@ class MatcherInterface:
 
         return minhash_mapping
 
+    def _getCorpusPicHashMatchesForFunctionEntries(self) -> Dict[int, Set[Tuple[int, int, int]]]:
+        """PicHash matches of functions that are not in the corpus themselves (query input), from one lookup.
+
+        Each pichash some corpus function holds maps to its holders plus the query functions with
+        it; this used to take one query per distinct pichash, uncapped by MINHASH_PICHASH_MAX_MATCHES (#69).
+        """
+        own_functions_by_pichash: Dict[int, List[Tuple[int, int, int]]] = {}
+        for function_entry in self._function_entries:
+            if function_entry.pichash:
+                own_functions_by_pichash.setdefault(function_entry.pichash, []).append((function_entry.family_id, function_entry.sample_id, function_entry.function_id))
+        pichash_matches = self._storage.getMatchesForPicHashes(list(own_functions_by_pichash))
+        for pichash, holders in pichash_matches.items():
+            holders.update(own_functions_by_pichash[pichash])
+        return pichash_matches
+
     # summarizing, formatting starts here:
 
     def _summarizeMatches(self, sample_id, matches: HarmonizedMatches, aggregation_only: bool) -> Tuple[List, Dict, Dict, float]:
@@ -704,6 +719,14 @@ class MatcherInterface:
                 if foreign_sample_id not in self._sample_to_lib_info:
                     self._sample_to_lib_info[foreign_sample_id] = self._storage.getLibraryInfoForSampleId(foreign_sample_id) is not None
                 has_libinfo = self._sample_to_lib_info[foreign_sample_id]
+                foreign_functions_matched.add(foreign_function_id)
+                own_functions_with_matches.add(own_function_id)
+                if has_libinfo:
+                    own_functions_with_library_matches.add(own_function_id)
+                if aggregation_only:
+                    # the totals are all that is asked for; building, sorting and keeping a
+                    # tuple per match is what grows with the number of matches (#69)
+                    continue
 
                 if foreign_sample_id not in self._sample_id_to_entry:
                     foreign_sample_entry = self._storage.getSampleById(foreign_sample_id)
@@ -721,18 +744,15 @@ class MatcherInterface:
                         flags,
                     )
                 )
-                foreign_functions_matched.add(foreign_function_id)
-                own_functions_with_matches.add(own_function_id)
-                if has_libinfo:
-                    own_functions_with_library_matches.add(own_function_id)
 
         # Anti-Value-Key post processing
         matches_function_list = []
-        for function_id, dict in match_function_mapping.items():
-            dict["fid"] = function_id
-            # this creates additional stability for tests and processing
-            dict["matches"] = sorted(dict["matches"])
-            matches_function_list.append(dict)
+        if not aggregation_only:
+            for function_id, dict in match_function_mapping.items():
+                dict["fid"] = function_id
+                # this creates additional stability for tests and processing
+                dict["matches"] = sorted(dict["matches"])
+                matches_function_list.append(dict)
 
         aggregation["num_self_matches"] = len(self_matched_functions)
         aggregation["num_own_functions_matched"] = len(own_functions_with_matches)
@@ -740,7 +760,7 @@ class MatcherInterface:
         aggregation["num_foreign_functions_matched"] = len(foreign_functions_matched)
         aggregation["num_own_functions_matched_as_library"] = len(own_functions_with_library_matches)
 
-        num_library_match_bytes = sum([match_function_mapping[function_id]["num_bytes"] for function_id in own_functions_with_library_matches])
+        num_library_match_bytes = sum([sample_fid_to_binweight[function_id] for function_id in own_functions_with_library_matches])
 
         return matches_function_list, match_function_mapping, aggregation, num_library_match_bytes
 
@@ -904,9 +924,9 @@ class MatcherInterface:
             else:
                 all_matches[key] = new_entry
 
-        _, _, pichash_aggregation, _ = self._summarizeMatches(self._sample_id, pichash_matches, False)
+        _, _, pichash_aggregation, _ = self._summarizeMatches(self._sample_id, pichash_matches, True)
         # Assume that every pichash is also a min hash:
-        _, _, minhash_aggregation, _ = self._summarizeMatches(self._sample_id, minhash_matches, False)
+        _, _, minhash_aggregation, _ = self._summarizeMatches(self._sample_id, minhash_matches, True)
 
         (all_functions_summary, all_functions_list, all_aggregation, num_library_bytes) = self._summarizeMatches(self._sample_id, all_matches, False)
         sample_summary = self._aggregateMatchSampleSummary(all_functions_list, self._sample_info, num_library_bytes)

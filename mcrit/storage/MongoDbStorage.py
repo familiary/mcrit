@@ -2332,6 +2332,20 @@ class MongoDbStorage(StorageInterface):
             )
         )
 
+    def getMatchesForPicHashes(self, pichashes: List[int]) -> Dict[int, Set[Tuple[int, int, int]]]:
+        encoded_to_decoded = {}
+        for pichash in set(pichashes):
+            query = {"pichash": pichash}
+            self._encodePichash(query)
+            encoded_to_decoded[query["_pichash"]] = pichash
+        matches: Dict[int, Set[Tuple[int, int, int]]] = {}
+        if encoded_to_decoded:
+            wanted = self._filterPicHashesByMatchCount(list(encoded_to_decoded))
+            fields_to_fetch = {"_pichash": 1, "family_id": 1, "sample_id": 1, "function_id": 1, "_id": 0}
+            for hit in self._getDb().functions.find({"_pichash": {"$in": wanted}}, fields_to_fetch):
+                matches.setdefault(encoded_to_decoded[hit["_pichash"]], set()).add((hit["family_id"], hit["sample_id"], hit["function_id"]))
+        return matches
+
     def getMatchesForPicBlockHash(self, picblockhash: int) -> Set[Tuple[int, int, int, int]]:
         query = {"_picblockhashes.hash": hex(picblockhash)}
         result = self._getDb().functions.aggregate(

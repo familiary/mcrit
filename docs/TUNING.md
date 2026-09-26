@@ -43,6 +43,26 @@ Always keep `WiredTiger cache + Σ worker peaks + 2 GiB` inside physical RAM, an
 `mem_limit` on the worker service in `docker-compose.yml` — an unlimited container leaves any
 overcommit to the host OOM killer, which may choose mongod.
 
+A container limit is shared by every job the worker runs. To bound each job instead, set
+`QUEUE_SPAWNINGWORKER_CHILD_MAX_MEMORY` (bytes, `0` = off, the default) on a spawning worker. Once
+a second it adds up the resident memory of each job process and everything that process started,
+such as its hashing pool; a job over the limit is killed and is retried or marked failed like any
+other failing job, while the worker and the jobs beside it carry on. It needs `/proc`, so Linux
+only; elsewhere it is ignored with a warning. Resident memory counts shared pages once per
+process, so a pool of forked workers reads higher than it costs - size it against a measured peak,
+and keep it below the container limit so the job is the one stopped rather than the worker.
+Measuring reads the parent of every process on the host from `/proc` once a second per running job,
+which costs little on a worker host but adds up where thousands of processes run beside it.
+
+A worker that runs jobs in its own process (`mcrit worker`, as opposed to `spawningworker`) keeps
+what a job allocated in glibc's arenas after the job ends, so its resident size stays at its
+largest job's peak. It hands the freed memory back to the operating system after every job
+(`malloc_trim`, glibc only). Measured on a 7,244-sample corpus, a worker idle after sample matching
+jobs held 1.0-2.3 GiB without that and 0.45-0.58 GiB with it, at 30-120 ms per job and identical
+reports. `MALLOC_ARENA_MAX=2` in the worker's environment limits the arenas that fragmentation
+builds up in during a job as well; a spawning worker's job process ends with its job, so only the
+job's peak matters there.
+
 These settings are strictly better and involve no trade-off. **As of MCRIT 1.6.1 they are the
 defaults**, so on 1.6.1 or later there is nothing to set — they are listed here for what they
 buy, and because the value is what you would restore to on 1.6.0:
@@ -89,7 +109,7 @@ stage of a 1-vs-N query - and the result set itself - otherwise grows with the c
 |---|---|---|
 | `MINHASH_MATCHING_SHORTLIST_SIZE` | `0` (off) | how many corpus samples the exact matching stage may look at. A cheap stage ranks candidate samples first; only the best N are matched exactly |
 | `STORAGE_BAND_DF_CUTOFF` | `0` (off) | skip band hashes whose posting list is longer than this. A band hash held by much of the corpus is a stopword: expensive to read, uninformative about *which* samples match |
-| `MINHASH_PICHASH_MAX_MATCHES` | `0` (off) | skip PicHashes held by more than this many corpus functions. Same argument for the exact-match path, which the shortlist does not bound: a hash covering a common library function returns one tuple per holder |
+| `MINHASH_PICHASH_MAX_MATCHES` | `0` (off) | skip PicHashes held by more than this many corpus functions, in sample and query matching alike. Same argument for the exact-match path, which the shortlist does not bound: a hash covering a common library function returns one tuple per holder |
 
 **Both default to off, so an upgrade changes nothing until you opt in.** Two indexes need one
 build each before they take effect, and neither is read until a completeness flag vouches for

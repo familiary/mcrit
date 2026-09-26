@@ -37,18 +37,7 @@ class MatcherQuery(MatcherInterface):
         return match_report
 
     def _getPicHashMatches(self) -> Dict[int, Set[Tuple[int, int, int]]]:
-        pichash_matches = {}
-        checked_pichashes = set()
-        for function_entry in self._function_entries:
-            if function_entry.pichash:
-                if function_entry.pichash not in checked_pichashes:
-                    checked_pichashes.add(function_entry.pichash)
-                    matches = self._storage.getMatchesForPicHash(function_entry.pichash)
-                    if len(matches) > 0:
-                        pichash_matches[function_entry.pichash] = matches
-                if function_entry.pichash in pichash_matches:
-                    pichash_matches[function_entry.pichash].add((function_entry.family_id, function_entry.sample_id, function_entry.function_id))
-        return pichash_matches
+        return self._getCorpusPicHashMatchesForFunctionEntries()
 
     def _createMatchingCache(self, candidate_groups):
         function_ids_from_storage = set()

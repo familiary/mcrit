@@ -24,3 +24,9 @@ class QueueConfig(ConfigInterface):
     QUEUE_CLEAN_INTERVAL: int = 20 * 60  # Clean every 20 minutes
     # timeout in seconds for child processes spawned by SpawningWorker
     QUEUE_SPAWNINGWORKER_CHILDREN_TIMEOUT: int = 60 * 60
+    # Memory, in bytes, a job run by a SpawningWorker may hold before it is stopped; 0 is no limit.
+    # Measured as the resident size of the job's process and everything it started, such as its
+    # hashing pool, once a second. A job over it is killed and fails like any failing job instead
+    # of taking the host's memory from the other workers (#69). Needs /proc (Linux); ignored with
+    # a warning elsewhere.
+    QUEUE_SPAWNINGWORKER_CHILD_MAX_MEMORY: int = 0
