@@ -1045,6 +1045,17 @@ class MemoryStorage(StorageInterface):
     def isBandDfIndexComplete(self) -> bool:
         return True
 
+    def _countBandDf(self, band_number: int, thresholds: List[int]) -> Dict[str, Any]:
+        # df is the length of the in-memory posting list; an empty list holds no posting, and the
+        # MongoDB count skips its empty documents the same way
+        lengths = [len(function_ids) for function_ids in self._bands[band_number].values() if function_ids]
+        return {
+            "band_hashes": len(lengths),
+            "postings": sum(lengths),
+            "max_df": max(lengths, default=0),
+            "over": {threshold: [sum(1 for df in lengths if df > threshold), sum(df for df in lengths if df > threshold)] for threshold in thresholds},
+        }
+
     def rebuildMinhashBandIndex(self, progress_reporter=None):
         # TODO while minhashes are considerably small, there is a still chance that the
         # sum of all minhashes will eventually exceed available memory on a given system.

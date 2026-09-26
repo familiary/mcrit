@@ -147,6 +147,50 @@ Tuning the cutoff at 12,500 samples, shortlist held at 100: cutoff 1000 gives a 
 200 gives 0.374 s, 100 gives 0.332 s — all three at top-10 and top-25 recall of 1.000. 200 is
 where the traversal stops scaling; below that there is little left to win.
 
+### Watching what the cutoff skips as the corpus grows
+
+`STORAGE_BAND_DF_CUTOFF` is a fixed number, and the posting lists it is compared against are not.
+Vocabulary grows sublinearly with the corpus (Heaps' law, V(n) = 1412.8 · n^0.7247 as fitted by
+`benchmarks/measure_growth.py`) while postings grow with the number of functions, so posting lists
+lengthen and the same cutoff skips a growing share of the index. Nothing on the query path says so:
+counting skipped postings per lookup would roughly double the index work of every band lookup. The
+measurement is a job instead:
+
+    curl http://localhost:8000/band_df_cutoff_coverage                      # the configured cutoff
+    curl 'http://localhost:8000/band_df_cutoff_coverage?band_df_cutoff=500' # any other one
+
+Both answer a job id (`McritClient.requestBandDfCutoffCoverage()` does the same); the report is the
+job's result under `/jobs/<job_id>/result`, and the worker logs its headline at INFO. Per band and
+in total it gives `band_hashes`, `postings` (the sum of their df), `band_hashes_over_cutoff`,
+`postings_over_cutoff` and both fractions, plus `max_df`. `at_reference_cutoffs` repeats the totals
+at 50, 100, 200, 500 and 1000 whatever cutoff was asked about, so two reports taken months apart
+compare directly, and a cutoff of `0` (off, skipping nothing) still shows what one would skip. A
+`band_df_cutoff` that is not an integer from 0 to 2^63 - 1 (the largest a BSON integer holds) is
+refused with a 400.
+
+Measured on the 7,244-sample corpus at a cutoff of 200: **46.4 % of all band postings (51.8 M of
+111.8 M) sit in the 0.97 % of band hashes (83,235 of 8,538,312) whose df exceeds it.** A large
+share is what the cutoff is for - stopword hashes are few and hold many postings - so the number
+to watch is how `postings_over_cutoff_fraction` moves between runs at the same cutoff. A rising
+share is the cutoff starting to bite; it is not a recall measurement, so when it moves, re-measure
+recall against the uncapped result with `benchmarks/compare_quality.py` before changing the cutoff.
+
+Each band is counted by one `$group` over the `(band_hash, df)` index alone, a covered scan that
+never fetches a band document and keeps one running total per band, so its memory does not grow
+with the number of band hashes and it needs no `allowDiskUse`. On that 7,244-sample corpus
+(MongoDB 7.0) a single index-only `$group` of exactly this shape took 39.3 s for all 20 bands, about
+1.1 to 2 s per band. Under `STORAGE_BAND_BUCKET_SIZE` only bucket 0 carries df, as the total across
+the hash's buckets, so a spilled hash counts once with its whole posting-list length. On a database
+whose df is not yet trusted - one that predates df, until `rebuild_band_df_index` has run - the
+report comes back with `available: false` and says so, rather than counting df-less posting lists
+as empty. The postings of a bucketed hash whose bucket 0 is missing carry no df: the report does
+not count them, and with the cutoff on they are never served. `rebuild_band_df_index` repairs such
+a hash by recreating its bucket 0 from the buckets that remain.
+
+There is no dynamic pruning (WAND/MaxScore) behind the cutoff: it would need posting lists sorted
+by function id, which the fill-order buckets of `STORAGE_BAND_BUCKET_SIZE` are not. Until that
+changes, this report is how to tell whether the fixed cutoff still fits the corpus.
+
 ## Growing past ~270,000 samples: `STORAGE_BAND_BUCKET_SIZE`
 
 Separate from latency, and a hard stop rather than a slowdown. A band posting list is a

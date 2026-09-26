@@ -5,6 +5,7 @@ import falcon
 
 from mcrit.index.MinHashIndex import MinHashIndex
 from mcrit.server.utils import db_log_msg, get_username, jsonify, timing
+from mcrit.storage.StorageInterface import BAND_DF_CUTOFF_MAX
 
 
 class StatusResource:
@@ -116,6 +117,28 @@ class StatusResource:
         index_report = self.index.rebuildBandDfIndex(force_recalculation=True)
         resp.data = jsonify({"status": "successful", "data": index_report})
         db_log_msg(self.index, req, "StatusResource.on_get_rebuild_band_df_index - success.")
+        return
+
+    @timing
+    def on_get_band_df_cutoff_coverage(self, req, resp):
+        """Schedule a job that measures what STORAGE_BAND_DF_CUTOFF skips - band hashes and postings over the cutoff, per band and in total (#201). ``band_df_cutoff`` evaluates another cutoff than the configured one. Answers the job id."""
+        band_df_cutoff = None
+        if "band_df_cutoff" in req.params:
+            # refused rather than ignored like a malformed matching parameter: silently measuring the
+            # configured cutoff instead would answer a question that was not asked. The upper bound
+            # is what a BSON integer holds; past it the job would fail on encoding the cutoff.
+            try:
+                band_df_cutoff = int(req.params["band_df_cutoff"])
+            except (TypeError, ValueError):
+                band_df_cutoff = -1
+            if not 0 <= band_df_cutoff <= BAND_DF_CUTOFF_MAX:
+                resp.status = falcon.HTTP_400
+                resp.data = jsonify({"status": "failed", "data": {"message": f"band_df_cutoff must be an integer from 0 to {BAND_DF_CUTOFF_MAX}."}})
+                db_log_msg(self.index, req, "StatusResource.on_get_band_df_cutoff_coverage - failed - invalid band_df_cutoff.")
+                return
+        job_id = self.index.getBandDfCutoffCoverage(band_df_cutoff=band_df_cutoff, force_recalculation=True, username=get_username(req))
+        resp.data = jsonify({"status": "successful", "data": job_id})
+        db_log_msg(self.index, req, "StatusResource.on_get_band_df_cutoff_coverage - success.")
         return
 
     def on_post_recompute_family_stats(self, req, resp):

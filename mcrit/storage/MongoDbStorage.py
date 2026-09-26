@@ -1621,7 +1621,11 @@ class MongoDbStorage(StorageInterface):
         # whose bucket 0 is missing (e.g. removed before this was fixed) would otherwise stay
         # invisible to the cutoff and restart placement at bucket 0 on the next push
         updates = [
-            UpdateOne({"band_hash": band_hash, "bucket": 0}, {"$set": {"df": df, "tail": tail, "tail_n": tail_n}}, upsert=df > 0)
+            UpdateOne(
+                {"band_hash": band_hash, "bucket": 0},
+                {"$set": {"df": df, "tail": tail, "tail_n": tail_n}, "$setOnInsert": {"function_ids": []}},
+                upsert=df > 0,
+            )
             for band_hash, (df, tail, tail_n) in totals.items()
         ]
         collection.bulk_write(updates, ordered=False)
@@ -1959,6 +1963,85 @@ class MongoDbStorage(StorageInterface):
     def _setBandDfIndexComplete(self, is_complete: bool) -> None:
         self._getDb().settings.update_one({}, {"$set": {self._BAND_DF_SETTING: bool(is_complete)}})
 
+    # _bandLookupPipeline filters on df, so this backend's candidate lookup does skip what the
+    # coverage report counts
+    APPLIES_BAND_DF_CUTOFF = True
+
+    def _bandDfIndexName(self, band_number: int) -> Optional[str]:
+        """The name of the (band_hash, df) index on one band collection, or None if it has none."""
+        for name, info in self._getDb()["band_%d" % band_number].index_information().items():
+            if [tuple(key) for key in info.get("key", [])] == [("band_hash", 1), ("df", 1)]:
+                return name
+        return None
+
+    def _bandDfUnavailableReason(self) -> Optional[str]:
+        # Refused rather than measured by $size: without a trusted df the only way to count is to
+        # read every band document in full - on a 7,244-sample corpus that is 111.8M postings - which
+        # is the very read the (band_hash, df) index exists to avoid, and the rebuild that fixes it
+        # is the one the cutoff needs anyway to skip from the index.
+        reason = super()._bandDfUnavailableReason()
+        if reason is not None:
+            return reason
+        missing = [band_number for band_number in range(self._storage_config.STORAGE_NUM_BANDS) if self._bandDfIndexName(band_number) is None]
+        if missing:
+            return (
+                f"Band collections {missing} have no (band_hash, df) index, so what STORAGE_BAND_DF_CUTOFF skips cannot be "
+                "counted from the index alone. Run the band df rebuild (GET /rebuild_band_df_index), which creates it, "
+                "then request the coverage again."
+            )
+        return None
+
+    @staticmethod
+    def _bandDfCountPipeline(thresholds: List[int]) -> List[Dict[str, Any]]:
+        """The aggregation _countBandDf runs per band: one $group over df and nothing else.
+
+        Only bucket 0 of a hash carries df (the total across its buckets; the buckets above it carry
+        none), so a document with df > 0 is exactly one band hash and its df is that hash's whole
+        posting-list length. Counting those documents and summing their df therefore needs no
+        grouping by band_hash: one running total per band, whose memory does not grow with the
+        number of hashes and so never needs allowDiskUse. A document without df (a bucket above 0)
+        or with df 0 (an empty one) adds nothing to any of the counts.
+        """
+        with_df = {"$gt": ["$df", 0]}
+        over_accumulators: Dict[str, Any] = {}
+        for threshold in thresholds:
+            over = {"$gt": ["$df", threshold]}
+            over_accumulators["hashes_over_%d" % threshold] = {"$sum": {"$cond": [over, 1, 0]}}
+            over_accumulators["postings_over_%d" % threshold] = {"$sum": {"$cond": [over, "$df", 0]}}
+        return [
+            {
+                "$group": {
+                    "_id": None,
+                    "band_hashes": {"$sum": {"$cond": [with_df, 1, 0]}},
+                    "postings": {"$sum": {"$cond": [with_df, "$df", 0]}},
+                    "max_df": {"$max": "$df"},
+                    **over_accumulators,
+                }
+            },
+        ]
+
+    def _countBandDf(self, band_number: int, thresholds: List[int]) -> Dict[str, Any]:
+        """Count one band's posting lists from the (band_hash, df) index alone.
+
+        The pipeline only reads df, which the hinted index carries, so the plan is a covered index
+        scan: no band document - and no posting list - is fetched. On a 7,244-sample corpus
+        (MongoDB 7.0) a single $group of this shape took 39.3 s for all 20 bands, 1.1 to 2 s per
+        band.
+
+        Postings in buckets above 0 of a hash whose bucket 0 is missing carry no df and are not
+        counted; with the cutoff on they are never served either. rebuild_band_df_index recreates
+        the missing bucket 0 from the buckets that remain.
+        """
+        collection = self._getDb()["band_%d" % band_number]
+        rows = list(collection.aggregate(self._bandDfCountPipeline(thresholds), hint=self._bandDfIndexName(band_number)))
+        row = rows[0] if rows else {}
+        return {
+            "band_hashes": int(row.get("band_hashes") or 0),
+            "postings": int(row.get("postings") or 0),
+            "max_df": int(row.get("max_df") or 0),
+            "over": {threshold: [int(row.get("hashes_over_%d" % threshold) or 0), int(row.get("postings_over_%d" % threshold) or 0)] for threshold in thresholds},
+        }
+
     def rebuildBandDfIndex(self, progress_reporter=None) -> int:
         """Set df on every band document and index (band_hash, df); returns documents updated.
 
@@ -1990,7 +2073,8 @@ class MongoDbStorage(StorageInterface):
         upsert filter `{band_hash, bucket: 0}` would not match - it would insert a *second*
         document for the hash and split the posting list invisibly. Stamping `bucket: 0` here is
         what makes those documents addressable, so this has to run after enabling the knob and
-        before the next write.
+        before the next write. It also recreates a hash's bucket 0 where that is missing while
+        buckets above it survive, since bucket 0 holds the hash's only df.
 
         Writes in batches rather than one bulk_write over the whole collection, because the
         rebuild is the one operation whose cost does follow corpus size and a single batch of
@@ -2011,7 +2095,18 @@ class MongoDbStorage(StorageInterface):
                 if int(entry["bucket"] or 0) == tail:
                     tail_n = int(entry["n"])
                     break
-            pending.append(UpdateOne({"band_hash": row["_id"], "bucket": {"$in": [0, None]}}, {"$set": {"bucket": 0, "df": int(row["df"]), "tail": tail, "tail_n": tail_n}}))
+            # upsert while postings survive, as _recomputeBandBookkeeping does: a hash whose bucket 0
+            # is missing carries no df anywhere, so without it the cutoff never serves its postings
+            # and the coverage report does not count them. A recreated bucket 0 gets an empty posting
+            # list, since every lookup reads function_ids off each document it returns
+            df = int(row["df"])
+            pending.append(
+                UpdateOne(
+                    {"band_hash": row["_id"], "bucket": {"$in": [0, None]}},
+                    {"$set": {"bucket": 0, "df": df, "tail": tail, "tail_n": tail_n}, "$setOnInsert": {"function_ids": []}},
+                    upsert=df > 0,
+                )
+            )
             if len(pending) >= 5000:
                 collection.bulk_write(pending, ordered=False)
                 num_hashes += len(pending)

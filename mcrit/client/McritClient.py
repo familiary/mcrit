@@ -251,6 +251,18 @@ class McritClient:
             return response
         return self._handle(response)
 
+    def requestBandDfCutoffCoverage(self, band_df_cutoff=None):
+        """
+        Schedule a job that measures what STORAGE_BAND_DF_CUTOFF skips - band hashes and postings over
+        the cutoff, per band and in total (#201); band_df_cutoff evaluates another cutoff than the
+        configured one. Answers the job id; the job's result is the coverage report
+        """
+        params = {} if band_df_cutoff is None else {"band_df_cutoff": band_df_cutoff}
+        response = requests.get(f"{self.mcrit_server}/band_df_cutoff_coverage", headers=self.headers, params=params, timeout=self.timeout)
+        if self.raw:
+            return response
+        return self._handle(response)
+
     def repairMinHashes(self):
         """
         Schedule a job that rehashes only the samples whose minhashes an older smda escaper produced (#142); answers the job id

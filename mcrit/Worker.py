@@ -279,6 +279,18 @@ class Worker(QueueRemoteCallee):
 
     # Reports PROGRESS
     @Remote(progress=True)
+    def getBandDfCutoffCoverage(self, band_df_cutoff=None, progress_reporter=NoProgressReporter()):
+        """What STORAGE_BAND_DF_CUTOFF (or band_df_cutoff) skips, per band and in total (#201).
+
+        A job rather than a request because it scans the (band_hash, df) index of every band: on a
+        7,244-sample corpus (MongoDB 7.0) a single index-only $group of exactly this shape took
+        39.3 s for all 20 bands, about 1.1 to 2 s per band. It is kept off the query path because a
+        per-lookup count would roughly double each band lookup's index work.
+        """
+        return self._storage.getBandDfCutoffCoverage(band_df_cutoff=band_df_cutoff, progress_reporter=progress_reporter)
+
+    # Reports PROGRESS
+    @Remote(progress=True)
     def recalculatePicHashes(self, progress_reporter=NoProgressReporter()):
         return self._storage.recalculateAllPicHashes(progress_reporter=progress_reporter)
 

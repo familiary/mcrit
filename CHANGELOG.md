@@ -15,6 +15,47 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- **What `STORAGE_BAND_DF_CUTOFF` skips is measurable** ([#201]), as a job:
+  `GET /band_df_cutoff_coverage` (optionally `?band_df_cutoff=N`, refused with a 400 unless an
+  integer from 0 to 2^63 - 1, the largest a BSON integer holds) answers a job id, and
+  `McritClient.requestBandDfCutoffCoverage()` does the same. Its result gives per band and in total
+  the band hashes, the postings (sum of df), how many of each are over the cutoff and the
+  fractions, plus the same totals at the reference cutoffs 50, 100, 200, 500 and 1000 - so a cutoff
+  of `0` still shows what one would skip, and two reports compare whatever cutoff each asked about.
+  The worker logs the headline at INFO.
+
+  The cutoff is a fixed number while posting lists lengthen with the corpus (band-hash vocabulary
+  follows Heaps' law, V(n) = 1412.8 · n^0.7247), so the share it skips grows silently. On a
+  7,244-sample real corpus, at 200, **46.4 % of band postings (51.8 M of 111.8 M) sit
+  in 0.97 % of band hashes (83,235 of 8,538,312)**. The count runs off the query path on purpose:
+  a per-lookup count would roughly double each band lookup's index work. On MongoDB each band is
+  one `$group` over a covered scan of the `(band_hash, df)` index (hinted, no band document
+  fetched, constant memory, no `allowDiskUse`); on that corpus (MongoDB 7.0) a single index-only
+  `$group` of exactly this shape took 39.3 s for all 20 bands, about 1.1 to 2 s per band.
+
+  **Caveats**: the share is a leading indicator, not recall - re-measure recall with
+  `benchmarks/compare_quality.py` when it moves. A database whose df is not trusted yet (built
+  before df, until `rebuild_band_df_index` has run) gets `available: false` and a message saying
+  so instead of numbers; df-less documents are never counted as empty posting lists. Under
+  `STORAGE_BAND_BUCKET_SIZE` a spilled hash counts once with its bucket-0 total; a hash whose
+  bucket 0 is missing is not counted (nor served under the cutoff) until `rebuild_band_df_index`
+  repairs it (see Fixed). MemoryStorage
+  counts the same numbers but does not apply the cutoff when matching, and the report says so.
+  WAND/MaxScore pruning was not built: it needs posting lists sorted by function id, which the
+  fill-order buckets of `STORAGE_BAND_BUCKET_SIZE` are not.
+
+### Fixed
+
+- **`rebuild_band_df_index` recreates a missing bucket 0** under `STORAGE_BAND_BUCKET_SIZE`. It
+  only updated an existing bucket 0, so a hash whose bucket 0 was gone while higher buckets
+  survived kept no df anywhere: the cutoff never served its postings and the coverage report
+  ([#201]) could not count them, with no error either way. The rebuild now upserts bucket 0 while
+  postings survive, as the recompute after a deletion already did. Both now create it with an
+  empty posting list: the recompute's upsert left `function_ids` out, so the next candidate lookup
+  that returned the recreated document raised `KeyError: 'function_ids'` and failed the job.
+
 ## [1.12.0] - 2026-09-25
 
 ### Added
@@ -586,3 +627,4 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#201]: https://github.com/danielplohmann/mcrit/issues/201
