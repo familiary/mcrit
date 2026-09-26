@@ -139,6 +139,11 @@ Sample 2 (intel, 32 bit) - 3e6de9e2baacf930949647c399818e7a2caea2626df6a46840785
 ********************
 ```
 
+A plain term is matched as a substring of a family's name, of a sample's filename, family, component, version or sha256 (from three characters on), and of a function's name.
+A `field:value` condition searches one field instead, with the operators `<`, `<=`, `>`, `>=`, `!=`, `?` (substring) and `!?`, e.g. `num_functions:>100`.
+Tags are searched this way only: `tags:packed` (or `tag:packed`) finds entities that carry the tag `packed`, `tags:!=packed` those that do not, and `tags:?pack` those with a tag containing `pack`.
+Tags are added and removed through `POST` / `DELETE` on `/{families|samples|functions}/{id}/tags` with a JSON body `{"tags": [...]}`, or `McritClient.addTags` / `removeTags`, at most 100 tags a request and 256 an entity; `GET /tags?entity=family|sample|function` lists the tags in use, with the number of entities carrying each.
+
 ## Queue
 
 This command can be used to get a view on all queued jobs and their processing status, e.g.:

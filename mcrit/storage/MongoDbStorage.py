@@ -15,7 +15,7 @@ import numpy as np
 from bson import encode as bson_encode
 from packaging import version
 from picblocks.blockhasher import BlockHasher
-from pymongo import MongoClient, UpdateMany, UpdateOne
+from pymongo import MongoClient, ReturnDocument, UpdateMany, UpdateOne
 from pymongo.errors import BulkWriteError, DocumentTooLarge
 from smda.common.BinaryInfo import BinaryInfo
 from smda.common.SmdaFunction import SmdaFunction
@@ -33,6 +33,7 @@ from mcrit.index.SearchQueryTree import (
     SearchConditionNode,
     SearchFieldResolver,
 )
+from mcrit.libs.tags import MAX_TAGS_PER_ENTITY, TagLimitError, checkTagEntity, normalizeTags, tagLimitMessage
 from mcrit.libs.utility import decode_two_complement, encode_two_complement
 from mcrit.minhash.MinHash import MinHash
 from mcrit.storage.FamilyEntry import FamilyEntry
@@ -332,6 +333,14 @@ class MongoDbStorage(StorageInterface):
         self._getDb()["functions"].create_index("function_name")
         self._getDb()["functions"].create_index("_pichash")
         self._getDb()["functions"].create_index("_picblockhashes.hash")
+        # tags (#53): multikey, so that tags:x in a search is an index lookup. The functions index
+        # is sparse and function documents leave the field out while it is empty (see
+        # _encodeFunction), so it holds the tagged functions only instead of one entry per function
+        # of the corpus. Its first build on an existing corpus still reads every function once, but
+        # adds nothing, since no document carries the field yet.
+        self._getDb()["families"].create_index("tags")
+        self._getDb()["samples"].create_index("tags")
+        self._getDb()["functions"].create_index("tags", sparse=True)
         # Searches sorted by a field other than the id (fkie-cad/mcritweb#59): the search cursor sorts by that
         # field and breaks ties by the id, in the same direction, so one compound index per
         # sortable field serves both directions by being walked backwards. Without it the
@@ -736,6 +745,11 @@ class MongoDbStorage(StorageInterface):
     def _encodeFunction(function_dict: Dict, delete_old: bool = True) -> None:
         MongoDbStorage._encodePichash(function_dict, delete_old=delete_old)
         MongoDbStorage._encodeXcfg(function_dict, delete_old=delete_old)
+        # an untagged function stores no tags field, which keeps it out of the sparse tags index;
+        # FunctionEntry.toDict leaves an empty list out already, this covers a dict built otherwise.
+        # FunctionEntry.fromDict reads the missing field as no tags (#53)
+        if "tags" in function_dict and not function_dict["tags"]:
+            del function_dict["tags"]
 
     @staticmethod
     def _decodeFunction(function_dict: Dict, delete_old: bool = True) -> None:
@@ -955,6 +969,8 @@ class MongoDbStorage(StorageInterface):
             return False
         old_family_info = self.getFamily(family_id)
         assert old_family_info is not None
+        if "actors" in update_information:
+            self._getDb().families.update_one({"family_id": family_id}, {"$set": {"actors": FamilyEntry.normalizeActors(update_information["actors"])}})
         if "is_library" in update_information:
             self._getDb().samples.update_many({"family_id": family_id}, {"$set": {"is_library": update_information["is_library"]}})
             updated_count = old_family_info.num_samples if update_information["is_library"] else 0
@@ -978,14 +994,77 @@ class MongoDbStorage(StorageInterface):
                 self._getDb().families.update_one({"family_id": 0}, {"$set": {"num_samples": 0, "num_functions": 0, "num_library_samples": 0}})
             else:
                 self._getDb().families.delete_one({"family_id": family_id})
-            self._getDb().families.update_one(
-                {"family_id": new_family_id}, {"$set": {"num_samples": new_num_samples, "num_functions": new_num_functions, "num_library_samples": new_num_lib_samples}}
-            )
+            # the attribution moves with the samples: a rename onto an existing family merges
+            # both actor lists (a review of #57 caught the rename dropping them)
+            merged_actors = FamilyEntry.normalizeActors(list(new_family_info.actors or []) + list(old_family_info.actors or []))
+            family_update: Dict[str, Any] = {
+                "$set": {"num_samples": new_num_samples, "num_functions": new_num_functions, "num_library_samples": new_num_lib_samples, "actors": merged_actors}
+            }
+            # and so do its tags (#53), added to the target's rather than replacing them, so that
+            # a tag added to the target meanwhile is not lost. Not capped at MAX_TAGS_PER_ENTITY
+            # (see mcrit.libs.tags)
+            if old_family_info.tags:
+                family_update["$addToSet"] = {"tags": {"$each": list(old_family_info.tags)}}
+            self._getDb().families.update_one({"family_id": new_family_id}, family_update)
             # update sample_entry and function_entries with new family information
             self._getDb().samples.update_many({"family_id": family_id}, {"$set": {"family_id": new_family_id, "family": family_name}})
             self._getDb().functions.update_many({"family_id": family_id}, {"$set": {"family_id": new_family_id}})
             self._updateDbState()
         return True
+
+    # the collection and id field that hold each kind of taggable entity (#53)
+    _TAG_COLLECTIONS = {"family": ("families", "family_id"), "sample": ("samples", "sample_id"), "function": ("functions", "function_id")}
+
+    def _updateTags(self, entity: str, entity_id: int, update: Dict[str, Any], condition: Optional[Dict[str, Any]] = None) -> Optional[List[str]]:
+        collection, id_field = self._TAG_COLLECTIONS[checkTagEntity(entity)]
+        # query samples and functions (negative ids) live in collections of their own and carry no tags
+        if entity != "family" and entity_id < 0:
+            return None
+        document = self._getDb()[collection].find_one_and_update(
+            {id_field: entity_id, **(condition or {})}, update, projection={"_id": 0, "tags": 1}, return_document=ReturnDocument.AFTER
+        )
+        if document is None:
+            if condition is None:
+                return None
+            # no such entity, or one the condition refused
+            existing = self._getDb()[collection].find_one({id_field: entity_id}, projection={"_id": 0, "tags": 1})
+            if existing is None:
+                return None
+            raise TagLimitError(tagLimitMessage(entity, entity_id, len(existing.get("tags") or [])))
+        tags = list(document.get("tags") or [])
+        if entity == "function" and "tags" in document and not tags:
+            # the last tag is gone: drop the field again, to keep the function out of the sparse index.
+            # Conditional on the array still being empty, so that a concurrent addTags is not undone
+            self._getDb()[collection].update_one({id_field: entity_id, "tags": {"$size": 0}}, {"$unset": {"tags": ""}})
+        return tags
+
+    def addTags(self, entity: str, entity_id: int, tags: List[str]) -> Optional[List[str]]:
+        tags = normalizeTags(tags)
+        # The cap is part of the filter, so that checking it and adding the tags are one atomic
+        # write: a concurrent addTags cannot slip in between and take the entity past it. The
+        # filter counts the union of the stored and the new tags, exactly what $addToSet leaves,
+        # so re-adding tags an entity at the cap carries already is not refused. $literal keeps a
+        # tag from being read as an expression; the tag rule already refuses a leading "$".
+        within_cap = {"$expr": {"$lte": [{"$size": {"$setUnion": [{"$ifNull": ["$tags", []]}, {"$literal": tags}]}}, MAX_TAGS_PER_ENTITY]}}
+        return self._updateTags(entity, entity_id, {"$addToSet": {"tags": {"$each": tags}}}, condition=within_cap)
+
+    def removeTags(self, entity: str, entity_id: int, tags: List[str]) -> Optional[List[str]]:
+        tags = normalizeTags(tags)
+        return self._updateTags(entity, entity_id, {"$pull": {"tags": {"$in": tags}}})
+
+    def getTagCounts(self, entity: str) -> Dict[str, int]:
+        collection, _ = self._TAG_COLLECTIONS[checkTagEntity(entity)]
+        # for functions the $exists filter is answered from the sparse tags index, which holds the
+        # tagged functions only, so the count does not read the whole collection
+        pipeline = [
+            {"$match": {"tags": {"$exists": True}}},
+            {"$unwind": "$tags"},
+            {"$group": {"_id": "$tags", "count": {"$sum": 1}}},
+            {"$sort": {"_id": 1}},
+        ]
+        # the $group holds one entry per distinct tag; allowDiskUse lets a large vocabulary spill past
+        # MongoDB's 100 MB stage limit, which before 6.0 is an error by default
+        return {document["_id"]: document["count"] for document in self._getDb()[collection].aggregate(pipeline, allowDiskUse=True)}
 
     def recomputeFamilyStats(self, progress_reporter=None) -> Dict[str, Any]:
         """Set every family's counters from the samples and functions that exist (#151).

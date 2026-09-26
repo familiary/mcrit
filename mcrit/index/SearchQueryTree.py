@@ -1,5 +1,7 @@
 from typing import List, Literal, Union
 
+from mcrit.libs.tags import normalizeTag
+
 
 ##### Defining all Node types #####
 class Node:
@@ -134,6 +136,22 @@ class SearchFieldResolver(BaseVisitor):
         if conditional_search_fields is None:
             conditional_search_fields = []
         self.conditional_search_fields = conditional_search_fields
+
+    # field names the query language accepts for another: "tag:packed" reads as naturally as
+    # "tags:packed" and means the same (#53)
+    FIELD_ALIASES = {"tag": "tags"}
+    # fields whose stored values are normalised, and whose search values are normalised alike, so
+    # that tags:Packed finds the tag stored as "packed" (see mcrit.libs.tags)
+    NORMALISED_FIELDS = {"tags": normalizeTag}
+
+    def visitSearchConditionNode(self, node: SearchConditionNode):
+        field = self.FIELD_ALIASES.get(node.field, node.field)
+        value = node.value
+        if field in self.NORMALISED_FIELDS and isinstance(value, str):
+            value = self.NORMALISED_FIELDS[field](value)
+        if field == node.field and value == node.value:
+            return node
+        return SearchConditionNode(field, node.operator, value)
 
     def visitSearchTermNode(self, node: SearchTermNode):
         children = []

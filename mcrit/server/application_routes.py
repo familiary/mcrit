@@ -16,6 +16,7 @@ from .MatchResource import MatchResource
 from .QueryResource import QueryResource
 from .SampleResource import SampleResource
 from .StatusResource import StatusResource
+from .TagResource import TagResource
 
 # Only do basicConfig if no handlers have been configured
 if not logging.root.handlers:
@@ -86,6 +87,7 @@ def get_app():
     block_resource = BlocksResource(index)
     query_resource = QueryResource(index)
     job_resource = JobResource(index)
+    tag_resource = TagResource(index)
 
     _app = falcon.App(middleware=[AuthMiddleware()])
     _app.req_options.strip_url_path_trailing_slash = True
@@ -148,6 +150,13 @@ def get_app():
 
     _app.add_route("/functions", function_resource, suffix="collection")
     _app.add_route("/functions/{function_id:int}", function_resource)
+
+    # tags (#53): POST adds, DELETE removes the tags named in a JSON body {"tags": [...]}
+    _app.add_route("/families/{family_id:int}/tags", TagResource(index, "family"))
+    _app.add_route("/samples/{sample_id:int}/tags", TagResource(index, "sample"))
+    _app.add_route("/functions/{function_id:int}/tags", TagResource(index, "function"))
+    # GET with ?entity=family|sample|function: the distinct tags and how many entities carry each
+    _app.add_route("/tags", tag_resource, suffix="collection")
 
     _app.add_route("/matches/sample/{sample_id:int}", match_resource, suffix="sample")
     _app.add_route("/matches/sample/cross/{sample_ids}", match_resource, suffix="sample_cross")

@@ -14,6 +14,7 @@ from picblocks.blockhasher import BlockHasher
 
 from mcrit.index.SearchCursor import FullSearchCursor
 from mcrit.index.SearchQueryTree import AndNode, BaseVisitor, FilterSingleElementLists, NodeType, OrNode, PropagateNot, SearchConditionNode, SearchFieldResolver
+from mcrit.libs.tags import MAX_TAGS_PER_ENTITY, TagLimitError, checkTagEntity, mergeTags, normalizeTags, tagLimitMessage
 from mcrit.minhash.MinHash import MinHash
 from mcrit.storage.FamilyEntry import FamilyEntry
 from mcrit.storage.FunctionEntry import FunctionEntry
@@ -93,6 +94,9 @@ class MemorySearchTranspiler(BaseVisitor):
         }
         # NOTE: the substring operators "?" / "!?" are handled by the early return below
         # and deliberately have no entry here.
+        # A list field (tags, #53) is compared element-wise, the way MongoDB treats an array: a
+        # condition holds when some element satisfies it, and the negated operators "!=" / "!?"
+        # hold when no element matches the positive one - so an empty list satisfies only those.
         value = node.value
         if node.operator.endswith("?"):
             regex = re.compile(re.escape(node.value), re.IGNORECASE)
@@ -100,6 +104,8 @@ class MemorySearchTranspiler(BaseVisitor):
 
             def check_regex(entry):
                 value = _get_field(entry, node.field)
+                if isinstance(value, list):
+                    return any(isinstance(element, str) and regex.search(element) is not None for element in value) ^ inverse
                 if not isinstance(value, str):
                     return False
                 return (regex.search(value) is not None) ^ inverse
@@ -115,7 +121,13 @@ class MemorySearchTranspiler(BaseVisitor):
         chosen_operator = string_to_operator[node.operator]
 
         def compare(entry):
-            return chosen_operator(_get_field(entry, node.field), value)
+            field_value = _get_field(entry, node.field)
+            if isinstance(field_value, list):
+                if node.operator == "!=":
+                    return not any(element == value for element in field_value)
+                # like MongoDB, a range only compares elements of the same type as the value
+                return any(type(element) is type(value) and chosen_operator(element, value) for element in field_value)
+            return chosen_operator(field_value, value)
 
         return compare
 
@@ -292,6 +304,8 @@ class MemoryStorage(StorageInterface):
             return False
         old_family_info = self.getFamily(family_id)
         assert old_family_info is not None
+        if "actors" in update_information:
+            self._families[family_id].actors = FamilyEntry.normalizeActors(update_information["actors"])
         if "is_library" in update_information:
             for sample_id, sample_entry in self._samples.items():
                 if family_id == sample_entry.family_id:
@@ -309,6 +323,13 @@ class MemoryStorage(StorageInterface):
             new_num_samples = new_family_info.num_samples + old_family_info.num_samples
             new_num_functions = new_family_info.num_functions + old_family_info.num_functions
             new_num_lib_samples = new_family_info.num_library_samples + old_family_info.num_library_samples
+            # the attribution moves with the samples: a rename onto an existing family merges
+            # both actor lists (a review of #57 caught the rename dropping them)
+            merged_actors = FamilyEntry.normalizeActors(list(new_family_info.actors or []) + list(old_family_info.actors or []))
+            self._families[new_family_id].actors = merged_actors
+            # and so do its tags (#53), as a union with those the target carries already, which is
+            # not capped at MAX_TAGS_PER_ENTITY (see mcrit.libs.tags)
+            self._families[new_family_id].tags = mergeTags(new_family_info.tags, old_family_info.tags)
             # update family_entry
             if family_id == 0:
                 self._families[0].num_samples = 0
@@ -331,6 +352,45 @@ class MemoryStorage(StorageInterface):
                     self._pichashes[function_entry.pichash].add((new_family_id, function_entry.sample_id, function_id))
         self._updateDbState()
         return True
+
+    def _getTaggableEntry(self, entity: str, entity_id: int) -> Optional[Union[FamilyEntry, SampleEntry, FunctionEntry]]:
+        # the stored object itself, not a copy: getSampleById and getFunctionById hand out copies
+        if checkTagEntity(entity) == "family":
+            return self._families.get(entity_id)
+        if entity_id < 0:
+            return None
+        if entity == "sample":
+            return self._samples.get(entity_id)
+        return self._functions.get(entity_id)
+
+    def addTags(self, entity: str, entity_id: int, tags: List[str]) -> Optional[List[str]]:
+        tags = normalizeTags(tags)
+        entry = self._getTaggableEntry(entity, entity_id)
+        if entry is None:
+            return None
+        merged = mergeTags(entry.tags, tags)
+        # a union past the cap is refused as a whole, as MongoDbStorage refuses it
+        if len(merged) > MAX_TAGS_PER_ENTITY:
+            raise TagLimitError(tagLimitMessage(entity, entity_id, len(entry.tags)))
+        entry.tags = merged
+        return list(entry.tags)
+
+    def removeTags(self, entity: str, entity_id: int, tags: List[str]) -> Optional[List[str]]:
+        tags = normalizeTags(tags)
+        entry = self._getTaggableEntry(entity, entity_id)
+        if entry is None:
+            return None
+        removed = set(tags)
+        entry.tags = [tag for tag in entry.tags if tag not in removed]
+        return list(entry.tags)
+
+    def getTagCounts(self, entity: str) -> Dict[str, int]:
+        entries = {"family": self._families, "sample": self._samples, "function": self._functions}[checkTagEntity(entity)]
+        counts: Dict[str, int] = defaultdict(int)
+        for entry in entries.values():
+            for tag in entry.tags:
+                counts[tag] += 1
+        return dict(sorted(counts.items()))
 
     def recomputeFamilyStats(self, progress_reporter=None) -> Dict[str, Any]:
         report: Dict[str, Any] = {"num_families": 0, "num_families_corrected": 0, "num_families_created": 0, "corrections": {}}

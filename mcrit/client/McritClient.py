@@ -3,12 +3,13 @@ import functools
 import logging
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import requests
 from smda.common.SmdaReport import SmdaReport
 from smda.Disassembler import Disassembler
 
+from mcrit.libs.tags import checkTagEntity
 from mcrit.queue.LocalQueue import Job
 from mcrit.storage.FamilyEntry import FamilyEntry
 from mcrit.storage.FunctionEntry import FunctionEntry
@@ -318,13 +319,22 @@ class McritClient:
     ### Families
     ###########################################
 
-    def modifyFamily(self, family_id, family_name=None, is_library=None):
+    def modifyFamily(self, family_id, family_name=None, is_library=None, actors=None):
+        """
+        Modify a family: rename it, mark it as library, or set the actors it is attributed to (#57)
+        <actors> is a list of names; an empty list clears them
+        """
         update_dict = {}
         if family_name is not None:
             update_dict["family_name"] = family_name
         if is_library is not None:
             update_dict["is_library"] = is_library
-        response = requests.put(f"{self.mcrit_server}/families/{family_id}", update_dict, headers=self.headers, timeout=self.timeout)
+        if actors is not None:
+            update_dict["actors"] = list(actors)
+        # JSON, since a list of actors does not survive form encoding
+        response = requests.put(f"{self.mcrit_server}/families/{family_id}", json=update_dict, headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return response
         return self._handle(response)
 
     def getFamily(self, family_id: int, with_samples=True) -> Any:
@@ -551,6 +561,56 @@ class McritClient:
         if self.raw:
             return response
         return self._handle(response)
+
+    ###########################################
+    ### Tags
+    ###########################################
+
+    _TAG_ROUTES = {"family": "families", "sample": "samples", "function": "functions"}
+
+    def _tagsRequest(self, entity: str, entity_id: int, tags: Union[str, Iterable[str]]) -> Tuple[str, Dict[str, List[str]]]:
+        """The URL and JSON body of a tag change; a single string is one tag, not its characters."""
+        checkTagEntity(entity)
+        tags = [tags] if isinstance(tags, str) else list(tags)
+        return f"{self.mcrit_server}/{self._TAG_ROUTES[entity]}/{int(entity_id)}/tags", {"tags": tags}
+
+    def addTags(self, entity: str, entity_id: int, tags: Union[str, Iterable[str]]):
+        """
+        Add <tags> to the family, sample or function (<entity>) <entity_id>; tags it carries already are kept once (#53)
+        Answers the entity's tags after the change
+        """
+        url, body = self._tagsRequest(entity, entity_id, tags)
+        response = requests.post(url, json=body, headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return response
+        data = self._handle(response)
+        if data is not None:
+            return data["tags"]
+
+    def removeTags(self, entity: str, entity_id: int, tags: Union[str, Iterable[str]]):
+        """
+        Remove <tags> from the family, sample or function (<entity>) <entity_id>; tags it does not carry are ignored (#53)
+        Answers the entity's tags after the change
+        """
+        url, body = self._tagsRequest(entity, entity_id, tags)
+        response = requests.delete(url, json=body, headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return response
+        data = self._handle(response)
+        if data is not None:
+            return data["tags"]
+
+    def getTags(self, entity: str):
+        """
+        The distinct tags on families, samples or functions (<entity>), each with the number of entities carrying it (#53)
+        """
+        checkTagEntity(entity)
+        response = requests.get(f"{self.mcrit_server}/tags", params={"entity": entity}, headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return response
+        data = self._handle(response)
+        if data is not None:
+            return data["tags"]
 
     ###########################################
     ### Matching

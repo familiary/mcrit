@@ -155,6 +155,26 @@ class MemoryStorageTest(TestCase):
         # family deletion
         self.storage.deleteFamily(4)
         self.assertEqual(None, self.storage.getFamilyId("family_1a"))
+        # actors (#57): set, normalised, kept through a rename, cleared
+        self.assertEqual([], self.storage.getFamily(2).actors)
+        self.assertTrue(self.storage.modifyFamily(2, {"actors": [" Actor A", "Actor B", "Actor A"]}))
+        self.assertEqual(["Actor A", "Actor B"], self.storage.getFamily(2).actors)
+        self.storage.modifyFamily(2, {"family_name": "family_2b", "actors": ["Actor C"]})
+        family_2b = self.storage.getFamilyId("family_2b")
+        self.assertIsNotNone(family_2b)
+        self.assertTrue(self.storage.modifyFamily(family_2b, {"actors": []}))
+        self.assertEqual([], self.storage.getFamily(family_2b).actors)
+        self.assertFalse(self.storage.modifyFamily(4242, {"actors": ["x"]}))
+        # a rename keeps the actors, and a rename onto an existing family merges both lists
+        self.storage.modifyFamily(family_2b, {"actors": ["Actor D"]})
+        self.storage.modifyFamily(family_2b, {"family_name": "family_2c"})
+        family_2c = self.storage.getFamilyId("family_2c")
+        self.assertEqual(["Actor D"], self.storage.getFamily(family_2c).actors)
+        self.assertEqual(None, self.storage.getFamilyId("family_2b"))
+        other = self.storage.addFamily("family_2d")
+        self.storage.modifyFamily(other, {"actors": ["Actor E", "Actor D"]})
+        self.storage.modifyFamily(family_2c, {"family_name": "family_2d"})
+        self.assertEqual(["Actor E", "Actor D"], self.storage.getFamily(other).actors)
 
     def _twoReports(self, family="family_1"):
         with open(self.example_file_path) as fjson:

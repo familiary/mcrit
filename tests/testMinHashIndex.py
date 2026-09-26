@@ -286,6 +286,41 @@ class EscaperProvenanceTestSuite(unittest.TestCase):
         export_data["config"].update(config_overrides)
         return export_data
 
+    def testExportCarriesFamilyActorsAndImportMergesThem(self):
+        # #57
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_report.smda")) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        report.family = "actors_family"
+        source = MinHashIndex(config)
+        sample_entry = source.getStorage().addSmdaReport(report)
+        assert sample_entry is not None
+        source.getStorage().modifyFamily(sample_entry.family_id, {"actors": ["Actor A"]})
+        export_data = source.getExportData()
+        self.assertEqual({sample_entry.family_id: ["Actor A"]}, export_data["family_actors"])
+        target = MinHashIndex(config)
+        target_family_id = target.getStorage().addFamily("actors_family")
+        target.getStorage().modifyFamily(target_family_id, {"actors": ["Actor B"]})
+        # through JSON, as an export file travels: the family ids become strings
+        target.addImportData(json.loads(json.dumps(export_data)))
+        self.assertEqual(["Actor B", "Actor A"], target.getStorage().getFamily(target_family_id).actors)
+
+    def testImportedActorsAreHeldToWhatTheApiAccepts(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_report.smda")) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        report.family = "actors_family"
+        source = MinHashIndex(config)
+        sample_entry = source.getStorage().addSmdaReport(report)
+        assert sample_entry is not None
+        export_data = json.loads(json.dumps(source.getExportData()))
+        # an export edited, or written by something else: names PUT /families would refuse
+        export_data["family_actors"] = {str(sample_entry.family_id): ["Actor A", "<script>", "x" * 65, 7, " Actor A "]}
+        target = MinHashIndex(config)
+        target_family_id = target.getStorage().addFamily("actors_family")
+        target.addImportData(export_data)
+        self.assertEqual(["Actor A"], target.getStorage().getFamily(target_family_id).actors)
+
     def testImportOfMatchingEscaperIsNotFlagged(self):
         index = MinHashIndex(config)
         report = index.addImportData(self._minimalExport(index))

@@ -215,7 +215,8 @@ class StorageInterface:
 
         Args:
             family_id: the id of the sample to modify
-            update_information: a dictionary with update information for fields (family_name, is_library)
+            update_information: a dictionary with update information for fields (family_name, is_library, actors);
+                a rename onto an existing family merges this family's actors and tags into it
 
         Returns:
             True if family_id was contained in the storage and updated successfully, False otherwise
@@ -244,6 +245,54 @@ class StorageInterface:
 
         Returns:
             True if function_id was contained in the storage and updated successfully, False otherwise
+        """
+        raise NotImplementedError
+
+    def addTags(self, entity: str, entity_id: int, tags: List[str]) -> Optional[List[str]]:
+        """Add tags to a family, sample or function (#53); tags it already carries are kept once
+
+        Args:
+            entity: "family", "sample" or "function"
+            entity_id: the id of the entity; query samples and functions (negative ids) carry no tags
+            tags: the tags to add, normalised through mcrit.libs.tags.normalizeTags
+
+        Returns:
+            the entity's tags after the change, or None if there is no such entity
+
+        Raises:
+            ValueError: for an unknown entity or a list that holds an invalid tag, before anything is written
+            TagLimitError: (a ValueError) when the entity would carry more than mcrit.libs.tags.MAX_TAGS_PER_ENTITY
+                tags afterwards; nothing is added, and the check and the write are one atomic step
+        """
+        raise NotImplementedError
+
+    def removeTags(self, entity: str, entity_id: int, tags: List[str]) -> Optional[List[str]]:
+        """Remove tags from a family, sample or function (#53); tags it does not carry are ignored
+
+        Args:
+            entity: "family", "sample" or "function"
+            entity_id: the id of the entity; query samples and functions (negative ids) carry no tags
+            tags: the tags to remove, normalised through mcrit.libs.tags.normalizeTags
+
+        Returns:
+            the entity's tags after the change, or None if there is no such entity
+
+        Raises:
+            ValueError: for an unknown entity or a list that holds an invalid tag, before anything is written
+        """
+        raise NotImplementedError
+
+    def getTagCounts(self, entity: str) -> Dict[str, int]:
+        """The distinct tags on one kind of entity (#53)
+
+        Args:
+            entity: "family", "sample" or "function"
+
+        Returns:
+            each tag mapped to the number of entities that carry it, ordered by tag
+
+        Raises:
+            ValueError: for an unknown entity
         """
         raise NotImplementedError
 

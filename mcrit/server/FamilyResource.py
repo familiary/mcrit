@@ -4,6 +4,7 @@ import falcon
 
 from mcrit.index.MinHashIndex import MinHashIndex
 from mcrit.server.utils import db_log_msg, get_username, jsonify, timing
+from mcrit.storage.FamilyEntry import FamilyEntry
 
 
 class FamilyResource:
@@ -83,6 +84,17 @@ class FamilyResource:
                 information_update["is_library"] = True
             elif information_update["is_library"] in ["False", "false", "0", 0]:
                 information_update["is_library"] = False
+        if "actors" in information_update:
+            actors = information_update["actors"]
+            if isinstance(actors, str):
+                actors = [actor for actor in actors.split(",")]
+            if not isinstance(actors, list) or not all(FamilyEntry.isValidActor(actor) for actor in actors):
+                resp.data = jsonify(
+                    {"status": "failed", "data": {"message": "actors must be a list of 1-64 character names (letters, digits, spaces, dots, dashes, underscores)."}}
+                )
+                db_log_msg(self.index, req, "FamilyResource.on_put - failed - actors malformed.")
+                return
+            information_update["actors"] = actors
         successful = self.index.modifyFamily(family_id, information_update, force_recalculation=True, username=get_username(req))
         if successful:
             resp.data = jsonify({"status": "successful", "data": {"message": "Family modified."}})
