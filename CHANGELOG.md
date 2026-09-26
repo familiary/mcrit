@@ -15,6 +15,28 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **A query parameter given twice answered 500, or quietly matched nothing.** falcon hands a
+  repeated parameter over as a list, and the responders read single values. On `/jobs` and
+  `/jobs/count` a repeated `sample_ids` or `job_ids` ([#210]) failed in the comma-list parsers, a
+  repeated `start`, `limit`, `ascending`, `state` or `filter` failed converting or matching it,
+  and a repeated `method` or `username` reached the queue as a list and matched no job; the same
+  `.lower()` and `int()` calls failed on a repeated `compact` of the result routes, `with_refresh`
+  of `/jobs/stats`, and the flags and paging of the family, sample, function and status routes,
+  while the matching routes dropped a repeated `minhash_score` and friends for the configured
+  value. A middleware now refuses any repeated parameter with a 400 naming it, after routing (an
+  unknown route still answers 404) and before a responder runs - which of two values was meant is
+  unknowable - and logs it. `sample_ids` and `job_ids` are the exception: a repeat reads as its
+  comma-joined form.
+
+- **`McritClient.getJobCount` and `deleteQueueData` spliced their values into the URL unencoded**,
+  so a `filter` or `method` holding `&` or `#` became a second parameter or cut off the ones after
+  it. They are passed as request parameters now, which encodes them. `addBinarySample` keeps
+  splicing `filename`, `family` and `version` as given, since its caller encodes them (MCRITweb
+  does, and would otherwise see every name with a space or bracket encoded twice); its docstring
+  now says so.
+
 ## [1.12.0] - 2026-09-25
 
 ### Added

@@ -10,11 +10,18 @@ from mcrit.server.utils import db_log_msg, jsonify, timing
 # TODO these should also return status and data in their json response
 
 
+def _csv_items(value):
+    """The comma-separated items of a query parameter, which falcon hands over as a list when the
+    parameter is repeated (``?job_ids=a&job_ids=b``; see REPEATABLE_PARAMETERS); a repeat reads as
+    its comma-joined form."""
+    parts = value if isinstance(value, list) else [value]
+    return [item.strip() for part in parts for item in part.split(",")]
+
+
 def _parse_int_csv(value):
     """Comma-separated ints; entries that do not parse are ignored, like start/limit."""
     ids = []
-    for item in value.split(","):
-        item = item.strip()
+    for item in _csv_items(value):
         if not item:
             continue
         try:
@@ -26,7 +33,7 @@ def _parse_int_csv(value):
 
 def _parse_str_csv(value):
     """Comma-separated ids; blank entries are ignored."""
-    return [item.strip() for item in value.split(",") if item.strip()]
+    return [item for item in _csv_items(value) if item]
 
 
 class JobResource:

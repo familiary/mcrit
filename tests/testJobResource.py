@@ -156,6 +156,21 @@ class JobCollectionSelectorsTest(unittest.TestCase):
         self.assertIsNone(kwargs["sample_ids"])
         self.assertIsNone(kwargs["job_ids"])
 
+    def test_a_repeated_selector_reads_like_its_comma_joined_form(self):
+        """falcon hands a repeated parameter over as a list, which the parsers used to call .split on: a 500."""
+        for route in ("collection", "count"):
+            with self.subTest(route=route):
+                index, resource = self._resource()
+                index.getQueueCount.return_value = 0
+                responder = getattr(resource, f"on_get_{route}")
+                getter = index.getQueueData if route == "collection" else index.getQueueCount
+                resp = falcon.Response()
+                responder(self._request("method=getMatchesForSample&sample_ids=7,8&sample_ids=9&job_ids=0123456789abcdef01234567&job_ids=abcdefabcdefabcdefabcdef"), resp)
+                self.assertNotEqual(falcon.HTTP_400, resp.status)
+                kwargs = getter.call_args.kwargs
+                self.assertEqual([7, 8, 9], kwargs["sample_ids"])
+                self.assertEqual(["0123456789abcdef01234567", "abcdefabcdefabcdefabcdef"], kwargs["job_ids"])
+
     def test_both_selectors_together_with_state_and_filter(self):
         index, resource = self._resource()
         resp = falcon.Response()

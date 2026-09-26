@@ -295,6 +295,12 @@ class McritClient:
             return SampleEntry.fromDict(data["sample_info"]), job_id
 
     def addBinarySample(self, binary: bytes, filename=None, family=None, version=None, is_dump=False, base_addr=None, bitness=None) -> Tuple[SampleEntry, Optional[str]]:
+        """Submit a binary for disassembly and indexing.
+
+        filename, family and version are spliced into the query string as given, so a caller passes
+        them percent-encoded (urllib.parse.quote(value, safe="")); MCRITweb does exactly that. They
+        are deliberately not handed to requests as params, which would encode them a second time.
+        """
         query_fields = []
         if filename is not None:
             query_fields.append(f"filename={filename}")
@@ -757,13 +763,8 @@ class McritClient:
         return None
 
     def getJobCount(self, filter=None):
-        query_string = ""
-        if isinstance(filter, str) and filter is not None:
-            if len(query_string) == 0:
-                query_string = f"?filter={filter}"
-            else:
-                query_string += f"&filter={filter}"
-        response = requests.get(f"{self.mcrit_server}/jobs{query_string}", headers=self.headers, timeout=self.timeout)
+        params = {"filter": filter} if isinstance(filter, str) else {}
+        response = requests.get(f"{self.mcrit_server}/jobs", params=params, headers=self.headers, timeout=self.timeout)
         if self.raw:
             return response
         data = self._handle(response)
@@ -844,23 +845,14 @@ class McritClient:
         Delete Jobs that match given provided criteria
         Supported by mcritweb API pass-through
         """
-        query_string = ""
-        if isinstance(method, str) and method is not None:
-            if len(query_string) == 0:
-                query_string = f"?method={method}"
-            else:
-                query_string += f"&method={method}"
-        if isinstance(created_before, datetime.datetime) and created_before is not None:
-            if len(query_string) == 0:
-                query_string = f"?created_before={created_before.strftime('%Y-%m-%dT%H:%M:%S')}"
-            else:
-                query_string += f"&created_before={created_before.strftime('%Y-%m-%dT%H:%M:%S')}"
-        if isinstance(finished_before, datetime.datetime) and finished_before is not None:
-            if len(query_string) == 0:
-                query_string = f"?finished_before={finished_before.strftime('%Y-%m-%dT%H:%M:%S')}"
-            else:
-                query_string += f"&finished_before={finished_before.strftime('%Y-%m-%dT%H:%M:%S')}"
-        response = requests.delete(f"{self.mcrit_server}/jobs/{query_string}", headers=self.headers, timeout=self.timeout)
+        params = {}
+        if isinstance(method, str):
+            params["method"] = method
+        if isinstance(created_before, datetime.datetime):
+            params["created_before"] = created_before.strftime("%Y-%m-%dT%H:%M:%S")
+        if isinstance(finished_before, datetime.datetime):
+            params["finished_before"] = finished_before.strftime("%Y-%m-%dT%H:%M:%S")
+        response = requests.delete(f"{self.mcrit_server}/jobs/", params=params, headers=self.headers, timeout=self.timeout)
         if self.raw:
             return response
         return self._handle(response)

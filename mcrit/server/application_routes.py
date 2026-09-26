@@ -16,6 +16,7 @@ from .MatchResource import MatchResource
 from .QueryResource import QueryResource
 from .SampleResource import SampleResource
 from .StatusResource import StatusResource
+from .utils import jsonify
 
 # Only do basicConfig if no handlers have been configured
 if not logging.root.handlers:
@@ -61,6 +62,31 @@ class AuthMiddleware:
         return secrets.compare_digest(token.encode("utf-8", "surrogateescape"), McritConfig.AUTH_TOKEN.encode("utf-8", "surrogateescape"))
 
 
+# comma-list selectors (GET /jobs, #210): a repeat reads as the comma-joined list
+REPEATABLE_PARAMETERS = frozenset({"sample_ids", "job_ids"})
+
+
+class RepeatedParameterMiddleware:
+    """Refuse a query parameter given more than once, before any responder runs.
+
+    falcon hands a repeated parameter over as a list, and the responders read single values: they
+    called str and int methods on it (a 500) or passed it on to storage and queue as a list. Which of
+    two values was meant is unknowable, so the request gets a 400 naming the parameters. The
+    comma-list selectors in REPEATABLE_PARAMETERS are the exception: a repeat of one of them reads
+    as its comma-joined form.
+    """
+
+    def process_resource(self, req, resp, resource, params):
+        # after routing, so an unknown route still answers 404 (a route without the method answers 400 here, not 405)
+        repeated = sorted(name for name, value in req.params.items() if isinstance(value, list) and name not in REPEATABLE_PARAMETERS)
+        if not repeated:
+            return
+        LOGGER.info("Refused %s %s: parameters given more than once: %s", req.method, req.path, ", ".join(repeated))
+        resp.status = falcon.HTTP_400
+        resp.data = jsonify({"status": "failed", "data": {"message": f"Given more than once: {', '.join(repeated)}."}})
+        resp.complete = True
+
+
 def create_index():
     # TODO we will want to load config values and everyting from the database instead of initializing everytime here
     index = MinHashIndex()
@@ -87,7 +113,7 @@ def get_app():
     query_resource = QueryResource(index)
     job_resource = JobResource(index)
 
-    _app = falcon.App(middleware=[AuthMiddleware()])
+    _app = falcon.App(middleware=[AuthMiddleware(), RepeatedParameterMiddleware()])
     _app.req_options.strip_url_path_trailing_slash = True
     _app.add_route("/", status_resource)
     _app.add_route("/status", status_resource, suffix="status")
