@@ -13,6 +13,15 @@ from mcrit.server.StatusResource import StatusResource
 from mcrit.server.utils import get_username
 
 
+def _index():
+    """A stand-in index with a real configuration: the matching routes resolve their knobs from it (#217)."""
+    from .context import config
+
+    index = MagicMock()
+    index.config = config
+    return index
+
+
 def _request(path, headers=None, query_string="", body=None, method="GET"):
     environ = falcon.testing.create_environ(path=path, headers=headers or {}, query_string=query_string, body=body or "", method=method)
     return falcon.Request(environ)
@@ -32,7 +41,7 @@ class JobOwnerTest(unittest.TestCase):
     def test_match_routes_forward_the_user(self):
         for expected, headers in (("alice", {"username": "alice"}), (None, {})):
             with self.subTest(user=expected):
-                index = MagicMock()
+                index = _index()
                 index.isSampleId.return_value = True
                 resource = MatchResource(index)
                 resource.on_get_sample(_request("/matches/sample/1", headers), falcon.Response(), sample_id=1)
@@ -44,7 +53,7 @@ class JobOwnerTest(unittest.TestCase):
 
     def test_query_and_blocks_routes_forward_the_user(self):
         headers = {"username": "alice"}
-        index = MagicMock()
+        index = _index()
         QueryResource(index).on_post_query_binary(_request("/query/binary", headers, body="MZ", method="POST"), falcon.Response())
         self._assert_called_with_username(index, "getMatchesForUnmappedBinary", "alice")
         QueryResource(index).on_post_query_binary_mapped(_request("/query/binary/mapped/4096", headers, body="MZ", method="POST"), falcon.Response(), base_address="4096")

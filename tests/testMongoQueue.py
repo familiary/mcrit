@@ -215,6 +215,19 @@ class MongoQueueTest(TestCase):
         queued_id = self.queue.put(dict(payload))
         self.assertEqual(queued_id, self.queue.get_cached_job_id(payload))
 
+    def test_cached_job_ignores_one_marked_uncacheable(self):
+        """A result that depended on state outside its arguments (UncacheableResult, #217) answers no later request."""
+        payload = {"method": "test_method", "descriptor": "same-request"}
+        cached_id = self.queue.put(dict(payload))
+        self.queue.next().complete("result-1")
+        uncacheable_id = self.queue.put(dict(payload))
+        job = self.queue.next()
+        job.mark_uncacheable()
+        job.complete("result-2")
+        # the newer finished job would win, were it not marked
+        self.assertEqual(cached_id, self.queue.get_cached_job_id(payload))
+        self.assertIs(False, self.queue._getCollection().find_one({"_id": uncacheable_id})["cacheable"])
+
     def test_put_records_username(self):
         with_user = self.queue.put({"method": "test_method"}, username="alice")
         without_user = self.queue.put({"method": "test_method"})

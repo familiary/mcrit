@@ -1651,7 +1651,20 @@ class MongoDbStorage(StorageInterface):
                 band_hash_to_function_ids[band_number][band_hash].add(function_id)
         return target_band_hashes_per_band, band_hash_to_function_ids
 
-    def _bandLookupPipeline(self, band_hashes: List[int]) -> List[Dict[str, Any]]:
+    def _bandDfCutoff(self, band_df_cutoff: Optional[int]) -> int:
+        """The df cutoff a lookup applies: the one its job asked for, else STORAGE_BAND_DF_CUTOFF (#217).
+
+        A job's cutoff is held to what __init__ holds the configured one to: only bucket 0 carries
+        df, so a cutoff above the bucket size would serve a spilled hash as bucket 0 alone.
+        """
+        if band_df_cutoff is None:
+            return getattr(self._storage_config, "STORAGE_BAND_DF_CUTOFF", 0)
+        bucket_size = self._bandBucketSize()
+        if bucket_size and band_df_cutoff > bucket_size:
+            raise ValueError(f"band_df_cutoff ({band_df_cutoff}) must not exceed STORAGE_BAND_BUCKET_SIZE ({bucket_size}).")
+        return band_df_cutoff
+
+    def _bandLookupPipeline(self, band_hashes: List[int], band_df_cutoff: Optional[int] = None) -> List[Dict[str, Any]]:
         """Aggregation returning the wanted band documents, dropping over-long posting lists.
 
         The cutoff is applied server-side rather than after the fetch on purpose: the cost of a
@@ -1659,7 +1672,7 @@ class MongoDbStorage(StorageInterface):
         millions of entries, so a client-side check would pay almost the whole price before
         discarding it.
         """
-        cutoff = getattr(self._storage_config, "STORAGE_BAND_DF_CUTOFF", 0)
+        cutoff = self._bandDfCutoff(band_df_cutoff)
         if cutoff <= 0:
             return [{"$match": {"band_hash": {"$in": band_hashes}}}]
         if self.isBandDfIndexComplete():
@@ -1676,11 +1689,14 @@ class MongoDbStorage(StorageInterface):
         # full (one bucket's worth, far above any sane cutoff), so testing it alone is correct,
         # and a hash that never spilled has all of its postings there anyway.
         return [
-            {"$match": {"band_hash": {"$in": band_hashes}, "bucket": {"$in": [0, None]}}},
+            # a hash that has spilled (its bucket 0 names a tail above 0) holds more than bucket 0,
+            # which is full or, after pulls, not the whole list: never served from bucket 0 alone,
+            # even when the cutoff equals the bucket size and that one document would pass $size
+            {"$match": {"band_hash": {"$in": band_hashes}, "bucket": {"$in": [0, None]}, "tail": {"$not": {"$gt": 0}}}},
             {"$match": {"$expr": {"$lte": [{"$size": {"$ifNull": ["$function_ids", []]}}, cutoff]}}},
         ]
 
-    def _getCandidatesForMinHashesNumpy(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, as_arrays=False):
+    def _getCandidatesForMinHashesNumpy(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, as_arrays=False, band_df_cutoff=None):
         """Variant C: accumulate band hits as int64 arrays instead of dict[qid][cid] -> count.
 
         Semantically identical to the dict version (np.unique(..., return_counts=True) counts
@@ -1692,7 +1708,7 @@ class MongoDbStorage(StorageInterface):
         target_band_hashes_per_band, band_hash_to_function_ids = self._collectBandHashTargets(function_id_to_minhash)
         hit_chunks = {}
         for band_number, band_hashes in target_band_hashes_per_band.items():
-            cursor = self._getDb()["band_%d" % band_number].aggregate(self._bandLookupPipeline(list(band_hashes)))
+            cursor = self._getDb()["band_%d" % band_number].aggregate(self._bandLookupPipeline(list(band_hashes), band_df_cutoff))
             for hit in cursor:
                 reference_function_ids = band_hash_to_function_ids[band_number][hit["band_hash"]]
                 # int64, not int32: function ids come from a counter that never reuses an id, so they
@@ -1719,7 +1735,7 @@ class MongoDbStorage(StorageInterface):
                 valid_candidates[function_id] = surviving.astype(np.int64, copy=False) if as_arrays else set(surviving.tolist())
         return valid_candidates
 
-    def getCandidateArraysForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1) -> Dict[int, "np.ndarray"]:
+    def getCandidateArraysForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None) -> Dict[int, "np.ndarray"]:
         """Candidates as sorted int64 arrays rather than sets.
 
         The accumulation already produces arrays and then boxes them into Python sets; a caller
@@ -1727,15 +1743,15 @@ class MongoDbStorage(StorageInterface):
         them again. Measured on a 361k-pair query against 10k samples, that round trip alone was
         most of a second.
         """
-        return self._getCandidatesForMinHashesNumpy(function_id_to_minhash, band_matches_required=band_matches_required, as_arrays=True)
+        return self._getCandidatesForMinHashesNumpy(function_id_to_minhash, band_matches_required=band_matches_required, as_arrays=True, band_df_cutoff=band_df_cutoff)
 
-    def getCandidatesForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1) -> Dict[int, Set[int]]:
+    def getCandidatesForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None) -> Dict[int, Set[int]]:
         if getattr(self._storage_config, "STORAGE_CANDIDATE_ACCUMULATION", "dict") == "numpy":
-            return self._getCandidatesForMinHashesNumpy(function_id_to_minhash, band_matches_required=band_matches_required)
+            return self._getCandidatesForMinHashesNumpy(function_id_to_minhash, band_matches_required=band_matches_required, band_df_cutoff=band_df_cutoff)
         candidates = {}
         target_band_hashes_per_band, band_hash_to_function_ids = self._collectBandHashTargets(function_id_to_minhash)
         for band_number, band_hashes in target_band_hashes_per_band.items():
-            cursor = self._getDb()["band_%d" % band_number].aggregate(self._bandLookupPipeline(list(band_hashes)))
+            cursor = self._getDb()["band_%d" % band_number].aggregate(self._bandLookupPipeline(list(band_hashes), band_df_cutoff))
             for hit in cursor:
                 reference_function_ids = band_hash_to_function_ids[band_number][hit["band_hash"]]
                 for function_id in reference_function_ids:
@@ -1755,13 +1771,13 @@ class MongoDbStorage(StorageInterface):
                     valid_candidates[function_id].add(other_id)
         return valid_candidates
 
-    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1) -> Set[int]:
+    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None) -> Set[int]:
         if not minhash.hasMinHash():
             return set()
         candidates = {}
         band_hashes = self.getBandHashesForMinHash(minhash)
         for band_number, band_hash in sorted(band_hashes.items()):
-            band_documents = list(self._getDb()["band_%d" % band_number].aggregate(self._bandLookupPipeline([band_hash])))
+            band_documents = list(self._getDb()["band_%d" % band_number].aggregate(self._bandLookupPipeline([band_hash], band_df_cutoff)))
             band_document = band_documents[0] if band_documents else None
             if band_document:
                 for function_id in band_document["function_ids"]:

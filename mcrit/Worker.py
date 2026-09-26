@@ -30,7 +30,7 @@ from mcrit.matchers.MatcherVsGroup import MatcherVsGroup
 from mcrit.minhash.MinHasher import MinHasher
 from mcrit.queue.LocalQueue import Job
 from mcrit.queue.QueueFactory import QueueFactory
-from mcrit.queue.QueueRemoteCalls import NoProgressReporter, QueueRemoteCallee, Remote
+from mcrit.queue.QueueRemoteCalls import NoProgressReporter, QueueRemoteCallee, Remote, UncacheableResult
 from mcrit.storage.SampleEntry import SampleEntry
 from mcrit.storage.StorageFactory import StorageFactory
 
@@ -499,50 +499,132 @@ class Worker(QueueRemoteCallee):
         progress_reporter.step()
         return blocks_result_dict
 
-    # Reports PROGRESS
-    @Remote(progress=True, json_locations=[0])
-    def getMatchesForSmdaReport(self, report_json, minhash_threshold=None, pichash_size=None, band_matches_required=None, progress_reporter=NoProgressReporter()):
-        matcher = MatcherQuery(
-            self, minhash_threshold=minhash_threshold, pichash_size=pichash_size, band_matches_required=band_matches_required, progress_reporter=progress_reporter
-        )
-        smda_report = SmdaReport.fromDict(report_json)
-        match_report = matcher.getMatchesForSmdaReport(smda_report)
+    @staticmethod
+    def _asJobResult(matcher, match_report):
+        """The report as the job's result, kept from answering later requests when it fell back unforeseen.
+
+        A shortlist the server found unavailable is part of the job's arguments, so its fallback
+        result has a cache key of its own. One that became unavailable only after submission (a
+        rebuild of the function range index started in between) is not, and would otherwise be
+        served to every later identical request, shortlist or not (#217).
+        """
+        if matcher.fellBackUnforeseen():
+            return UncacheableResult(match_report)
         return match_report
 
     # Reports PROGRESS
+    @Remote(progress=True, json_locations=[0])
+    def getMatchesForSmdaReport(
+        self,
+        report_json,
+        minhash_threshold=None,
+        pichash_size=None,
+        band_matches_required=None,
+        shortlist_size=None,
+        band_df_cutoff=None,
+        shortlist_unavailable=None,
+        progress_reporter=NoProgressReporter(),
+    ):
+        matcher = MatcherQuery(
+            self,
+            minhash_threshold=minhash_threshold,
+            pichash_size=pichash_size,
+            band_matches_required=band_matches_required,
+            progress_reporter=progress_reporter,
+            shortlist_size=shortlist_size,
+            band_df_cutoff=band_df_cutoff,
+            shortlist_unavailable=shortlist_unavailable,
+        )
+        smda_report = SmdaReport.fromDict(report_json)
+        match_report = matcher.getMatchesForSmdaReport(smda_report)
+        return self._asJobResult(matcher, match_report)
+
+    # Reports PROGRESS
     @Remote(progress=True, file_locations=[0])
-    def getMatchesForMappedBinary(self, binary, base_address, minhash_threshold=None, pichash_size=None, band_matches_required=None, progress_reporter=NoProgressReporter()):
+    def getMatchesForMappedBinary(
+        self,
+        binary,
+        base_address,
+        minhash_threshold=None,
+        pichash_size=None,
+        band_matches_required=None,
+        shortlist_size=None,
+        band_df_cutoff=None,
+        shortlist_unavailable=None,
+        progress_reporter=NoProgressReporter(),
+    ):
         config = SmdaConfig()
         SMDA_REPORT = None
         DISASSEMBLER = Disassembler(config)
         SMDA_REPORT = DISASSEMBLER.disassembleBuffer(binary, base_address)
         matcher = MatcherQuery(
-            self, minhash_threshold=minhash_threshold, pichash_size=pichash_size, band_matches_required=band_matches_required, progress_reporter=progress_reporter
+            self,
+            minhash_threshold=minhash_threshold,
+            pichash_size=pichash_size,
+            band_matches_required=band_matches_required,
+            progress_reporter=progress_reporter,
+            shortlist_size=shortlist_size,
+            band_df_cutoff=band_df_cutoff,
+            shortlist_unavailable=shortlist_unavailable,
         )
         match_report = matcher.getMatchesForSmdaReport(SMDA_REPORT)
-        return match_report
+        return self._asJobResult(matcher, match_report)
 
     # Reports PROGRESS
     @Remote(progress=True, file_locations=[0])
-    def getMatchesForUnmappedBinary(self, binary, minhash_threshold=None, pichash_size=None, band_matches_required=None, progress_reporter=NoProgressReporter()):
+    def getMatchesForUnmappedBinary(
+        self,
+        binary,
+        minhash_threshold=None,
+        pichash_size=None,
+        band_matches_required=None,
+        shortlist_size=None,
+        band_df_cutoff=None,
+        shortlist_unavailable=None,
+        progress_reporter=NoProgressReporter(),
+    ):
         config = SmdaConfig()
         SMDA_REPORT = None
         DISASSEMBLER = Disassembler(config)
         SMDA_REPORT = DISASSEMBLER.disassembleUnmappedBuffer(binary)
         matcher = MatcherQuery(
-            self, minhash_threshold=minhash_threshold, pichash_size=pichash_size, band_matches_required=band_matches_required, progress_reporter=progress_reporter
+            self,
+            minhash_threshold=minhash_threshold,
+            pichash_size=pichash_size,
+            band_matches_required=band_matches_required,
+            progress_reporter=progress_reporter,
+            shortlist_size=shortlist_size,
+            band_df_cutoff=band_df_cutoff,
+            shortlist_unavailable=shortlist_unavailable,
         )
         match_report = matcher.getMatchesForSmdaReport(SMDA_REPORT)
-        return match_report
+        return self._asJobResult(matcher, match_report)
 
     # Reports PROGRESS
     @Remote(progress=True)
-    def getMatchesForSample(self, sample_id, minhash_threshold=None, pichash_size=None, band_matches_required=None, progress_reporter=NoProgressReporter()):
+    def getMatchesForSample(
+        self,
+        sample_id,
+        minhash_threshold=None,
+        pichash_size=None,
+        band_matches_required=None,
+        shortlist_size=None,
+        band_df_cutoff=None,
+        shortlist_unavailable=None,
+        progress_reporter=NoProgressReporter(),
+    ):
         matcher = MatcherSample(
-            self, minhash_threshold=minhash_threshold, pichash_size=pichash_size, band_matches_required=band_matches_required, progress_reporter=progress_reporter
+            self,
+            minhash_threshold=minhash_threshold,
+            pichash_size=pichash_size,
+            band_matches_required=band_matches_required,
+            progress_reporter=progress_reporter,
+            shortlist_size=shortlist_size,
+            band_df_cutoff=band_df_cutoff,
+            shortlist_unavailable=shortlist_unavailable,
         )
         match_report = matcher.getMatchesForSample(sample_id)
-        return match_report
+        return self._asJobResult(matcher, match_report)
 
     # Reports PROGRESS
     @Remote(progress=True)
@@ -553,19 +635,39 @@ class Worker(QueueRemoteCallee):
         minhash_threshold=None,
         pichash_size=None,
         band_matches_required=None,
+        band_df_cutoff=None,
         progress_reporter=NoProgressReporter(),
     ):
-        matcher = MatcherVs(self, minhash_threshold=minhash_threshold, pichash_size=pichash_size, band_matches_required=band_matches_required, progress_reporter=progress_reporter)
+        matcher = MatcherVs(
+            self,
+            minhash_threshold=minhash_threshold,
+            pichash_size=pichash_size,
+            band_matches_required=band_matches_required,
+            progress_reporter=progress_reporter,
+            band_df_cutoff=band_df_cutoff,
+        )
         match_report = matcher.getMatchesForSample(sample_id, other_sample_id)
         return match_report
 
     # Reports PROGRESS
     @Remote(progress=True)
     def getMatchesForSampleVsGroup(
-        self, sample_id, other_sample_ids: List[int], minhash_threshold=None, pichash_size=None, band_matches_required=None, progress_reporter=NoProgressReporter()
+        self,
+        sample_id,
+        other_sample_ids: List[int],
+        minhash_threshold=None,
+        pichash_size=None,
+        band_matches_required=None,
+        band_df_cutoff=None,
+        progress_reporter=NoProgressReporter(),
     ):
         matcher = MatcherVsGroup(
-            self, minhash_threshold=minhash_threshold, pichash_size=pichash_size, band_matches_required=band_matches_required, progress_reporter=progress_reporter
+            self,
+            minhash_threshold=minhash_threshold,
+            pichash_size=pichash_size,
+            band_matches_required=band_matches_required,
+            progress_reporter=progress_reporter,
+            band_df_cutoff=band_df_cutoff,
         )
         match_report = matcher.getMatchesForSample(sample_id, other_sample_ids)
         return match_report

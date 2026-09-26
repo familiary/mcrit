@@ -15,6 +15,111 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- **`shortlist_size` and `band_df_cutoff` can be set per matching request** ([#217]), overriding
+  `MINHASH_MATCHING_SHORTLIST_SIZE` and `STORAGE_BAND_DF_CUTOFF` for that job alone: as query
+  parameters of the `/matches/sample/...` and `/query/...` endpoints, and as keyword arguments of
+  `McritClient.requestMatchesForSample`, `getMatchesForSmdaFunction` and the three
+  `requestMatchesFor...` query methods (`requestMatchesForSampleVs` and `requestMatchesCross` take
+  `band_df_cutoff` only). Both change which matches are reported, so they are a choice per request
+  rather than per deployment. `0` switches either off. A value that is not an integer from 0 to
+  2^63 - 1 (the largest integer a MongoDB query takes; the df cutoff goes into one) is refused with
+  a 400 - a repeated parameter as well - as is, with band bucketing on, a `band_df_cutoff` above
+  `STORAGE_BAND_BUCKET_SIZE` - the check the storage makes for a configured cutoff at startup
+  ([#196]) - and a `shortlist_size` on a match restricted to the samples it names: one sample
+  against another, within a group (`sample_group_only`) or across several (a cross compare).
+  Refused rather than replaced or dropped, unlike the older options, because a changed value
+  answers a question the caller did not ask and nothing in the response would say so.
+
+- **Matching presets, `hunt` and `identification`** ([#217]), per request as `preset=` on the
+  `/matches/sample/...` and `/query/...` endpoints, and as `preset` on `McritClient`'s matching
+  methods and `MinHashIndex`'s matching jobs. Both use `band_matches_required=1`, below the default
+  of 2: in the measurements on [#217] turning the shortlist on never moved top-10 or top-25 recall,
+  while every higher value did. `hunt` turns the shortlist off - the most exhaustive and slowest of
+  the measured configurations, the baseline the others were compared with. `identification` turns
+  it on, at the configured `MINHASH_MATCHING_SHORTLIST_SIZE` or else 100, the size measured on
+  [#195]; k=1 with the shortlist on was the only non-baseline combination that held recall at 1.000
+  on both queries measured, at about 3x the speed of k=1 without it. A preset only fills in the
+  knobs a request leaves out (the df cutoff keeps its configured value unless the request sets one)
+  and is expanded into their values before the job is submitted, so the job is keyed on what it
+  runs with, shares its result with the equivalent explicit request, and its report shows the
+  values rather than the preset's name. On a match restricted to the samples it names it applies
+  all but the shortlist. An unknown or repeated preset is refused with a 400. The "fast" preset the
+  issue floated is left out until a measurement defines it. `docs/TUNING.md` has the table.
+
+- **Every match report records its knobs under `info.matching`** ([#217]): `requested` (the values
+  the job was submitted with; the server and `MinHashIndex` fill in the configured value of every
+  knob a caller leaves out, so `null` appears for a knob the job does not take - the shortlist of a
+  match restricted to named samples - for a job handed to a `Worker` directly, and for every knob of
+  a job queued before this version), `applied`
+  (what it ran with; `null` for a knob with nothing to act on - the shortlist of a match restricted to
+  named samples, and both shortlist and df cutoff when `band_matches_required` is 0) and `fallbacks`
+  (knob to reason, for any that could not be applied). The one fallback so far is a shortlist while
+  the function range index is incomplete or unsupported (`function_range_index_incomplete` /
+  `function_range_index_unsupported`): the job matches against the whole corpus, as before, and now
+  says so instead of only logging it. `MatchingResult` keeps the block as `matching_info` through
+  `fromDict`/`toDict`.
+
+### Fixed
+
+- **A matching job's cached result could be served for different settings** ([#217]). A job is reused
+  for any later request with the same arguments, and a request that left an option out was keyed
+  on its absence, not on the value the worker then filled in from its configuration. So after a
+  change to `MINHASH_MATCHING_THRESHOLD`, `PICHASH_SIZE`, `BAND_MATCHES_REQUIRED`,
+  `MINHASH_MATCHING_SHORTLIST_SIZE` or `STORAGE_BAND_DF_CUTOFF`, every request relying on the default
+  was served the result computed under the old value. `MinHashIndex` - behind the server, and for
+  any direct caller - now puts the value of all five into each matching job's arguments, the
+  configured one where the caller names none (`mcrit.index.MatchingParameters`), in a fixed order so
+  a job listing shows each knob in the same position. Jobs from before the upgrade were keyed
+  without them, so the first repeat of each matching request after the upgrade computes a fresh
+  result instead of reusing the old one - a one-off recompute, not a correctness change.
+  **Upgrade server and workers together:** the server's configuration now decides these defaults for
+  the jobs it submits (it used to be each worker's), and a worker from before this change fails
+  every matching job on the `shortlist_size` and `band_df_cutoff` arguments it does not know.
+  A job submitted while the shortlist cannot be applied is marked so in its arguments
+  (`shortlist_unavailable`), so its whole-corpus result has a cache key of its own and is not served
+  for the same request once the index is complete again. A job whose shortlist became unavailable
+  only after submission - a rebuild of the function range index started in between, or during the
+  run - is marked `cacheable: false` on the job document before it completes, on every worker
+  (`mcrit worker` and each job `mcrit spawningworker` runs), and a request made after that is not
+  handed its result: a job method can return its result as a `QueueRemoteCalls.UncacheableResult`,
+  and both queues' cache lookups skip such jobs. A request that attached to the job while it was
+  still queued or running does receive that result, with the fallback named in
+  `info.matching.fallbacks`. Knob values are normalised in the key (`50.0` and `50`, `True` and `1`
+  are one job).
+
+- **A matching request's `minhash_score` had no effect on the result** ([#217]). The matchers filtered
+  candidate pairs on the configured `MINHASH_MATCHING_THRESHOLD` alone; the requested threshold was
+  handed to the scoring call only together with `ignore_threshold=True`. It now decides which
+  MinHash matches are reported, on both the vectorized and the pairwise path. Requests that do not
+  set it, or set the configured value, get the same result as before; the others get what they
+  asked for. The same holds on the process-pool path. `/query/function` also passed the requested
+  `minhash_score` and `pichash_size` on as `None`, hard-coded `exclude_self_matches` to `False`
+  although `McritClient.getMatchesForSmdaFunction` sends it, and failed on `force_recalculation`;
+  it applies all three now and accepts the last.
+
+- **`MemoryStorage` ignored `STORAGE_BAND_DF_CUTOFF`** ([#217]); it applies it now, and a job's own
+  `band_df_cutoff`.
+
+- **A match between named samples could leave some of them out** ([#217]). Matching one sample
+  against another (`/matches/sample/{a}/{b}`), within a group
+  (`sample_group_only`) or across several (`/matches/sample/cross/...`) with
+  `MINHASH_MATCHING_SHORTLIST_SIZE` set could leave out the very samples it was asked about: the
+  shortlist is ranked over the whole corpus, and a named sample outside its top entries was not
+  matched - in a cross compare its pair read as 0 %. None of them takes a shortlist any more: one
+  asked for is refused, with a 400 on the routes and a `TypeError` for a direct `MinHashIndex`
+  caller, and a cross compare asks its 1-vs-corpus jobs for `shortlist_size=0` explicitly, since a
+  job left without one would take the configured shortlist.
+
+- **The df-cutoff fallback served a spilled band hash as bucket 0 alone** ([#196]). With band
+  bucketing on and the df index not yet trusted (before `rebuild_band_df_index` has run), the
+  fallback measures bucket 0's list, and a full bucket 0 is exactly `STORAGE_BAND_BUCKET_SIZE`
+  long, so at a cutoff equal to the bucket size a spilled hash passed and a truncated posting list
+  was served. The fallback no longer serves a hash whose bucket 0 names a tail above 0; one that
+  pulls shrank below the cutoff is therefore left out by it rather than served truncated. (The
+  df-indexed lookup reads such a shrunk hash's upper buckets only with the separate fix for it.)
+
 ## [1.12.0] - 2026-09-25
 
 ### Added
@@ -586,3 +691,6 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#196]: https://github.com/danielplohmann/mcrit/pull/196
+[#217]: https://github.com/danielplohmann/mcrit/issues/217
+[#195]: https://github.com/danielplohmann/mcrit/pull/195

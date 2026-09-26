@@ -1,7 +1,10 @@
 import logging
 from timeit import default_timer as timer
 
+import falcon
 from bson import json_util
+
+from mcrit.index.MatchingParameters import MatchingParameterError, applyMatchingPreset, resolveMatchingParams
 
 LOGGER = logging.getLogger(__name__)
 
@@ -19,9 +22,49 @@ def db_log_msg(index, req, message, level=None):
     return
 
 
-def getMatchingParams(req_params):
+# band_df_cutoff ends up in a MongoDB query ({"df": {"$lte": cutoff}}), whose integers end here;
+# shortlist_size shares the bound so the two knobs accept the same range
+_MATCHING_KNOB_MAX = 2**63 - 1
+
+
+def _parseJobKnob(key, value):
+    """shortlist_size or band_df_cutoff as an int, refusing what no job could apply (#217).
+
+    Refused rather than ignored, unlike the older options: an ignored value is replaced by the
+    configured one, so the caller would get a result computed under a setting they did not ask for,
+    with nothing in the response to say so.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise MatchingParameterError(f"{key} must be an integer, not {value!r}.") from None
+    if number < 0 or number > _MATCHING_KNOB_MAX:
+        raise MatchingParameterError(f"{key} must be an integer from 0 (off) to {_MATCHING_KNOB_MAX}.")
+    return number
+
+
+def getMatchingParams(req_params, config=None, with_shortlist=True):
+    """The matching options of a request, as keyword arguments for the matching jobs.
+
+    Given the server's config, every matching knob the request leaves out is filled in with the
+    value the job will run with (see mcrit.index.MatchingParameters, which MinHashIndex applies to
+    direct callers as well). `with_shortlist=False` is for matches restricted to the samples they
+    name, which take no shortlist. `preset` names a bundle of knobs (MATCHING_PRESETS) that fills in
+    the ones the request leaves out.
+
+    Raises MatchingParameterError for an unusable shortlist_size or band_df_cutoff, for a
+    shortlist_size on a match that takes none, and for an unknown preset.
+    """
     parameters = {}
+    preset = None
     for key, value in req_params.items():
+        if key in ("shortlist_size", "band_df_cutoff"):
+            parameters[key] = _parseJobKnob(key, value)
+            continue
+        if key == "preset":
+            # refused when unknown, like the two knobs above, rather than ignored
+            preset = value
+            continue
         try:
             if key == "pichash_size":
                 pichash_size = int(value)
@@ -44,7 +87,29 @@ def getMatchingParams(req_params):
                 parameters["band_matches_required"] = band_matches_required
         except (AttributeError, TypeError, ValueError):
             LOGGER.warning(f"Failed to handle request parameter: {key}: {value}")
+    with_shortlist = with_shortlist and not parameters.get("sample_group_only")
+    if not with_shortlist and "shortlist_size" in parameters:
+        # refused, not dropped, for the reason an unusable value is: the caller asked for something
+        # this match does not do, and a silently different answer would not say so
+        raise MatchingParameterError("shortlist_size does not apply to a match restricted to the samples it names (one against another, a group or a cross compare).")
+    if preset is not None:
+        # expanded into knob values here, so the job is keyed on the values it runs with and a preset
+        # request shares its job with the equivalent explicit one
+        parameters = applyMatchingPreset(parameters, preset, with_shortlist=with_shortlist, config=config)
+    if config is not None:
+        parameters = resolveMatchingParams(parameters, config, with_shortlist=with_shortlist)
     return parameters
+
+
+def readMatchingParams(index, req, resp, handler, with_shortlist=True):
+    """getMatchingParams for a resource: the parameters, or None after answering a 400 for them."""
+    try:
+        return getMatchingParams(req.params, index.config, with_shortlist=with_shortlist)
+    except MatchingParameterError as error:
+        resp.status = falcon.HTTP_400
+        resp.data = jsonify({"status": "failed", "data": {"message": str(error)}})
+        db_log_msg(index, req, f"{handler} - failed - {error}")
+        return None
 
 
 def getUniqueBlocksParams(req_params):

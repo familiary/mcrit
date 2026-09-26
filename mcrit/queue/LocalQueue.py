@@ -331,6 +331,10 @@ class Job:
         self._data["progress"] = 1
         return self
 
+    def mark_uncacheable(self):
+        """keep this job from being served to later requests with the same descriptor."""
+        self._data["cacheable"] = False
+
     def error(self, message=None):
         """note an error processing a job, and return it to the queue."""
         self._data["locked_by"] = None
@@ -468,7 +472,7 @@ class LocalQueue:
         candidates = [
             job_data
             for job_data in self._jobs.values()
-            if job_data["payload"]["descriptor"] == payload["descriptor"] and job_data["attempts_left"] > 0 and not job_data["terminated"]
+            if job_data["payload"]["descriptor"] == payload["descriptor"] and job_data["attempts_left"] > 0 and not job_data["terminated"] and job_data.get("cacheable", True)
         ]
         if not candidates:
             return None

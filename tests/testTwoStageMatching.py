@@ -20,6 +20,7 @@ from mcrit.queue.QueueFactory import QueueFactory
 from mcrit.storage.StorageFactory import StorageFactory
 
 from .context import getTestMongoServerAndPort
+from .testPerJobMatchingKnobs import assertCutoffKeepsListsOfItsLength
 
 LOG = logging.getLogger(__name__)
 logging.disable(logging.CRITICAL)
@@ -139,6 +140,90 @@ class TwoStageMatchingTest(TestCase):
         for key, score in shortlisted.items():
             self.assertIn(key, reference)
             self.assertEqual(score, reference[key], "score changed for %s" % (key,))
+
+    def testShortlistSizeCanBeSetPerJob(self):
+        """A job's own shortlist_size wins over the configured one, in both directions (#217)."""
+        storage = MinHashIndex(config=buildConfig())._storage
+        storage.rebuildFunctionRangeIndex()
+        reference = self._sampleIds(self._match())
+        configured_index = MinHashIndex(config=buildConfig(shortlist_size=1))
+        # configured on, switched off for this job: the unrestricted result
+        unrestricted = MatcherSample(configured_index.queue._worker, shortlist_size=0).getMatchesForSample(self.query_sample_id)
+        self.assertEqual(reference, self._sampleIds(unrestricted))
+        # configured off, switched on for this job
+        default_index = MinHashIndex(config=buildConfig())
+        shortlisted = MatcherSample(default_index.queue._worker, shortlist_size=1).getMatchesForSample(self.query_sample_id)
+        self.assertLessEqual(len(self._sampleIds(shortlisted)), 2)
+        self.assertLess(len(self._sampleIds(shortlisted)), len(reference))
+
+    def testBandDfCutoffCanBeSetPerJob(self):
+        """A job's band_df_cutoff reaches the band lookup, and overrides the configured one (#217)."""
+        index = MinHashIndex(config=buildConfig())
+        storage = index._storage
+        function_entries = storage.getFunctionsBySampleId(self.query_sample_id)
+        bits = index.config.MINHASH_CONFIG.MINHASH_SIGNATURE_BITS
+        minhashes = {entry.function_id: entry.getMinHash(minhash_bits=bits) for entry in function_entries if entry.minhash}
+        unrestricted = storage.getCandidatesForMinHashes(minhashes, band_matches_required=1)
+        restricted = storage.getCandidatesForMinHashes(minhashes, band_matches_required=1, band_df_cutoff=1)
+        self.assertLess(sum(map(len, restricted.values())), sum(map(len, unrestricted.values())))
+        configured = MinHashIndex(config=buildConfig(band_df_cutoff=1))._storage
+        self.assertEqual(restricted, configured.getCandidatesForMinHashes(minhashes, band_matches_required=1))
+        self.assertEqual(unrestricted, configured.getCandidatesForMinHashes(minhashes, band_matches_required=1, band_df_cutoff=0))
+
+    def testMatcherHandsItsBandDfCutoffToTheLookup(self):
+        index = MinHashIndex(config=buildConfig())
+        worker = index.queue._worker
+        unrestricted = self._functionMatches(MatcherSample(worker).getMatchesForSample(self.query_sample_id))
+        restricted = self._functionMatches(MatcherSample(worker, band_df_cutoff=1).getMatchesForSample(self.query_sample_id))
+        self.assertLess(len(restricted), len(unrestricted))
+
+    def testStageOneAppliesTheCutoffToo(self):
+        """Stage 2 matches the candidates stage 1 fetched, so stage 1 has to fetch them under the cutoff:
+        a shortlist that keeps every sample must then give exactly the one-stage result."""
+        index = MinHashIndex(config=buildConfig())
+        index._storage.rebuildFunctionRangeIndex()
+        worker = index.queue._worker
+        # per job, so that a lookup falling back to the configured cutoff (none) shows
+        one_stage = self._functionMatches(MatcherSample(worker, band_df_cutoff=1).getMatchesForSample(self.query_sample_id))
+        self.assertLess(len(one_stage), len(self._functionMatches(self._match())))
+        two_stage = MatcherSample(worker, shortlist_size=10**6, band_df_cutoff=1).getMatchesForSample(self.query_sample_id)
+        self.assertEqual(one_stage, self._functionMatches(two_stage))
+
+    def testAPostingListAsLongAsTheCutoffIsKept(self):
+        """On both lookup paths: the df index, and measuring the list while that index is incomplete."""
+        index = MinHashIndex(config=buildConfig())
+        storage = index._storage
+        bits = index.config.MINHASH_CONFIG.MINHASH_SIGNATURE_BITS
+        minhashes = {entry.function_id: entry.getMinHash(minhash_bits=bits) for entry in storage.getFunctionsBySampleId(self.query_sample_id) if entry.minhash}
+
+        def posting_lengths(minhash):
+            targets, _ = storage._collectBandHashTargets({-1: minhash})
+            return [
+                len(document.get("function_ids", []))
+                for band_number, band_hashes in targets.items()
+                for document in storage._getDb()["band_%d" % band_number].find({"band_hash": {"$in": list(band_hashes)}}, {"function_ids": 1})
+            ]
+
+        self.assertTrue(storage.isBandDfIndexComplete())
+        assertCutoffKeepsListsOfItsLength(self, storage, minhashes, posting_lengths)
+        storage._setBandDfIndexComplete(False)
+        try:
+            assertCutoffKeepsListsOfItsLength(self, storage, minhashes, posting_lengths)
+        finally:
+            storage._setBandDfIndexComplete(True)
+
+    def testMatchingJobsApplyTheirOwnKnobs(self):
+        """Through the queue, as the server submits them: the job runs with what it was given."""
+        index = MinHashIndex(config=buildConfig())
+        index._storage.rebuildFunctionRangeIndex()
+
+        def report(**knobs):
+            return index.getResultForJob(index.getMatchesForSample(self.query_sample_id, force_recalculation=True, **knobs))
+
+        plain = report(shortlist_size=0, band_df_cutoff=0)
+        self.assertLessEqual(len(self._sampleIds(report(shortlist_size=1, band_df_cutoff=0))), 2)
+        self.assertLess(len(self._sampleIds(report(shortlist_size=1, band_df_cutoff=0))), len(self._sampleIds(plain)))
+        self.assertLess(len(self._functionMatches(report(shortlist_size=0, band_df_cutoff=1))), len(self._functionMatches(plain)))
 
     def testShortlistFallsBackWhenRangeIndexIsIncomplete(self):
         """Without a trustworthy range index the matcher must match the whole corpus, not guess."""

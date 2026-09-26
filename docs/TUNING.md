@@ -102,6 +102,62 @@ storage.rebuildBandDfIndex()  # makes the df cutoff skip from the index, not aft
 
 Measured at 12,500 samples / ~10.2M functions: 145 s and 147 s respectively.
 
+`MINHASH_MATCHING_SHORTLIST_SIZE` and `STORAGE_BAND_DF_CUTOFF` can also be chosen per request, as
+the parameters `shortlist_size` and `band_df_cutoff` of the matching and query endpoints (and the
+same keyword arguments of `McritClient`'s matching methods); the configured value is the default for
+a request that names neither. Both change which matches a report holds - hunting for tail samples
+wants the shortlist off, identifying a sample wants it on - so each job records the values it was
+run with, and a result is only reused for a request with the same values. The same holds for the
+older per-request options (`minhash_score`, `pichash_size`, `band_matches_required`): the server
+fills in the configured value of every option a request leaves out, so changing any of these
+defaults takes effect for the next request instead of being masked by results cached under the old
+one. It is the server's configuration that supplies those defaults (it used to be each worker's), so
+keep server and workers on the same configuration and upgrade them together. Upgrading to a version
+with this (#217) computes each matching request once more, since earlier results were stored
+without these values. Matching one sample against another, within a group (`sample_group_only`) or
+across several (a cross compare) takes no shortlist: it is restricted to the samples it names
+already, and a shortlist ranked over the corpus could only drop some of them; a `shortlist_size` sent
+to one of them is refused with a 400. So is a request's `band_df_cutoff` above
+`STORAGE_BAND_BUCKET_SIZE` (with band bucketing on), for the reason such a configured cutoff is
+refused at startup.
+
+Two presets name the combinations that matter, per request as `preset=` (and `preset` on
+`McritClient`'s matching methods and on a `MinHashIndex` matching job):
+
+| preset | sets | when |
+|---|---|---|
+| `hunt` | `band_matches_required=1`, `shortlist_size=0` | looking for every related sample, the tail included; the slowest |
+| `identification` | `band_matches_required=1`, shortlist on | finding out what a sample is |
+
+`identification` uses the configured `MINHASH_MATCHING_SHORTLIST_SIZE` if one is set, and 100 (the
+size measured on #195) if not. A preset only fills in what the request leaves out:
+`preset=identification&shortlist_size=25` runs with a shortlist of 25. Everything a preset does not
+name keeps its configured value, `STORAGE_BAND_DF_CUTOFF` included; add `band_df_cutoff=0` to a hunt
+that must not skip any posting list. The values come from the 48 runs measured on #217 (two queries,
+`band_matches_required` crossed with the shortlist): turning the shortlist on never moved top-10 or
+top-25 recall at any `band_matches_required`, while every value of 2 or more did - so both presets
+use 1, below the default of 2 - and `identification` was the only non-baseline configuration that
+held 1.000 on both queries, at about 3x the speed of `band_matches_required=1` without a shortlist.
+Hunting wants exactly the tail a shortlist cuts off. A third, "fast", has no measured definition
+yet, so there is none. The preset is expanded into knob values before the job is submitted, so a
+preset request and the equivalent explicit one share one job; the report's `info.matching` shows the
+values, not the preset's name. On a match restricted to the samples it names, a preset applies all
+but the shortlist. An unknown preset is refused with a 400.
+
+A shortlist needs the function range index to be complete. A database created empty on a version
+that maintains it is; **one that already held samples is not until `rebuildFunctionRangeIndex` has
+run once** (MCRIT only vouches for an index it built from the first sample), and it is incomplete
+again while that rebuild runs. Until then a requested shortlist is not applied: the job matches
+against the whole corpus and its report names the fallback under `info.matching.fallbacks`. Such a
+result is kept apart from the shortlisted one, so a request made once the index is complete gets
+the shortlisted result; only a request that attached to the job while it was still queued or
+running receives the whole-corpus one, with the fallback named in its report.
+
+`MINHASH_PICHASH_MAX_MATCHES` and `PICHASH_IMPLIES_MINHASH_MATCH` change reported matches as well but
+remain deployment settings, and they are not part of a job's cache key: after changing either, a
+repeated request is still served the result cached under the old value until it is asked for with
+`force_recalculation`.
+
 ### Suggested starting point
 
 ```

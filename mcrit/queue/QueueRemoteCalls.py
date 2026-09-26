@@ -145,6 +145,16 @@ def QueueRemoteCaller(clsCallee):
 ########### END Class Metaprogramming
 
 
+class UncacheableResult(dict):
+    """A job result that is right for the run that produced it but must not answer a later request.
+
+    A job is reused for any later request with the same descriptor. A method returns its result
+    wrapped in this when the result depends on state its arguments do not capture - a matching job
+    whose shortlist fell back because the function range index went incomplete after the job was
+    submitted (#217) - and the worker then marks the job so the queue's cache lookup skips it.
+    """
+
+
 # Wrapper that creates a remote call proxy for a given method
 def RemotifyFunctionWrapper(function):
     def submitPayloadQueue(self, payload, await_jobs, username):
@@ -369,6 +379,16 @@ class QueueRemoteCallee(BaseRemoteCallerClass):
             return self._executeJobProfiled(job)
         return self._executeJobImpl(job)
 
+    def _storeJobResult(self, job, result):
+        """Store a finished job's result and answer its id; every execution path goes through here.
+
+        A result returned as an UncacheableResult marks its job first, so that no identical request
+        is handed it between the job completing and being marked.
+        """
+        if isinstance(result, UncacheableResult):
+            job.mark_uncacheable()
+        return self.queue._dicts_to_grid(result, metadata={"result": True, "job": job.job_id})
+
     def _executeJobImpl(self, job):
         if time.time() - self.t_last_cleanup >= self.queue.clean_interval:
             try:
@@ -384,7 +404,7 @@ class QueueRemoteCallee(BaseRemoteCallerClass):
                 result = self._executeJobPayload(j["payload"], job)
                 LOGGER.debug("Remote Job Result: %s", result)
                 # ensure we always have a job_id for finished job payloads
-                job.result = self.queue._dicts_to_grid(result, metadata={"result": True, "job": job.job_id})
+                job.result = self._storeJobResult(job, result)
                 LOGGER.info("Finished Remote Job: %s", job)
         except Exception:
             # the failure may include the Job.__exit__ error() write itself (e.g. the

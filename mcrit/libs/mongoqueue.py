@@ -664,6 +664,8 @@ class MongoQueue:
                     "attempts_left": {"$gt": 0},
                     "payload.descriptor": payload["descriptor"],
                     "terminated": False,
+                    # a result that depended on state outside its arguments (UncacheableResult)
+                    "cacheable": {"$ne": False},
                     "$or": [
                         {"finished_at": {"$ne": None}},
                         {"locked_by": None},
@@ -899,6 +901,11 @@ class Job:
         self._queue.updateQueueCounters([(self.method, "in_progress", -1), (self.method, "finished", 1)])
         self._queue._notify_dependent_jobs(str(self.job_id))
         return job
+
+    def mark_uncacheable(self):
+        """keep this job from being served to later requests with the same descriptor."""
+        self._data["cacheable"] = False
+        self._queue.collection.update_one({"_id": self.job_id}, {"$set": {"cacheable": False}})
 
     def error(self, message=None):
         """note an error processing a job, and return it to the queue."""

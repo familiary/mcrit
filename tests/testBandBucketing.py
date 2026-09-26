@@ -252,6 +252,17 @@ class BandBucketingTest(unittest.TestCase):
         storage._updateBands({0: {4242: [1]}}, method="pull")
         self.assertEqual(self._bandState(storage), [])
 
+    def testASpilledHashIsNotServedAsBucketZeroWithoutTheDfIndex(self):
+        """With the cutoff equal to the bucket size, a full bucket 0 passes a $size test on its own."""
+        storage = self._rawStorage(2, "cutoff_equal", df_cutoff=2)
+        storage._updateBands({0: {4242: [1, 2, 3], 4343: [4, 5]}}, method="push")
+        storage._setBandDfIndexComplete(False)
+        served = {document["band_hash"] for document in storage._getDb()["band_0"].aggregate(storage._bandLookupPipeline([4242, 4343]))}
+        self.assertEqual({4343}, served)
+        storage._setBandDfIndexComplete(True)
+        served = {document["band_hash"] for document in storage._getDb()["band_0"].aggregate(storage._bandLookupPipeline([4242, 4343]))}
+        self.assertEqual({4343}, served)
+
     def testCutoffAboveBucketSizeIsRejected(self):
         """Only bucket 0 carries df, so a cutoff a spilled hash could fit under would return bucket 0 alone."""
         with self.assertRaises(ValueError):

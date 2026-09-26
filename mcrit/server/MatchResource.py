@@ -1,7 +1,7 @@
 import falcon
 
 from mcrit.index.MinHashIndex import MinHashIndex
-from mcrit.server.utils import db_log_msg, get_username, getMatchingParams, jsonify, timing
+from mcrit.server.utils import db_log_msg, get_username, jsonify, readMatchingParams, timing
 
 
 class MatchResource:
@@ -10,7 +10,9 @@ class MatchResource:
 
     @timing
     def on_get_sample(self, req, resp, sample_id=None):
-        parameters = getMatchingParams(req.params)
+        parameters = readMatchingParams(self.index, req, resp, "MatchResource.on_get_sample")
+        if parameters is None:
+            return
         if not self.index.isSampleId(sample_id):
             resp.data = jsonify(
                 {
@@ -31,7 +33,10 @@ class MatchResource:
 
     @timing
     def on_get_sample_cross(self, req, resp, sample_ids=None):
-        parameters = getMatchingParams(req.params)
+        # a cross compare takes no shortlist: it could only drop the samples it names
+        parameters = readMatchingParams(self.index, req, resp, "MatchResource.on_get_sample_cross", with_shortlist=False)
+        if parameters is None:
+            return
         if sample_ids is None:
             resp.status = falcon.HTTP_400
             resp.data = jsonify({"status": "failed", "data": {"message": "No sample_ids provided."}})
@@ -45,7 +50,9 @@ class MatchResource:
     @timing
     def on_get_sample_vs(self, req, resp, sample_id=None, sample_id_b=None):
         # NOTE: We don't need to check if the kw parameters are None. The routing ensures that they are always set.
-        parameters = getMatchingParams(req.params)
+        parameters = readMatchingParams(self.index, req, resp, "MatchResource.on_get_sample_vs", with_shortlist=False)
+        if parameters is None:
+            return
         if not self.index.isSampleId(sample_id) or not self.index.isSampleId(sample_id_b):
             resp.data = jsonify(
                 {

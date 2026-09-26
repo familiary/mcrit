@@ -82,12 +82,13 @@ class StorageInterface:
         raise NotImplementedError
 
     # -> Set[function_id]
-    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1) -> Set[int]:
+    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None) -> Set[int]:
         """Given a MinHash, return all candidates from all matching bands.
 
         Args:
             minhash: a MinHash
             band_matches_required: the number of bands a minhash needs to match before being considered a candidate
+            band_df_cutoff: skip band hashes held by more functions than this; None uses STORAGE_BAND_DF_CUTOFF, 0 means no cutoff
 
         Returns:
             candidates: a set of function_ids
@@ -95,12 +96,13 @@ class StorageInterface:
         raise NotImplementedError
 
     # -> Dict[function_id, Set[function_id]]
-    def getCandidatesForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1) -> Dict[int, Set[int]]:
+    def getCandidatesForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None) -> Dict[int, Set[int]]:
         """Given MinHashes by function_id, return all candidates from all matching bands.
 
         Args:
             function_id_to_minhash: a dict mapping a function_id to a MinHash.
             band_matches_required: the number of bands a minhash needs to match before being considered a candidate
+            band_df_cutoff: skip band hashes held by more functions than this; None uses STORAGE_BAND_DF_CUTOFF, 0 means no cutoff
 
         Returns:
             candidates: a dict mapping a function_id to a set of candidate function_ids.

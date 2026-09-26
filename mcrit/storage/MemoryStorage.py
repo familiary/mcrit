@@ -821,20 +821,23 @@ class MemoryStorage(StorageInterface):
 
     # -> Dict[function_id, Set[function_id]]
     # TODO optimize or move to interface
-    def getCandidatesForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1) -> Dict[int, Set[int]]:
+    def getCandidatesForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None) -> Dict[int, Set[int]]:
         candidates = {}
         for function_id, minhash in function_id_to_minhash.items():
-            candidates[function_id] = self.getCandidatesForMinHash(minhash, band_matches_required=band_matches_required)
+            candidates[function_id] = self.getCandidatesForMinHash(minhash, band_matches_required=band_matches_required, band_df_cutoff=band_df_cutoff)
         return candidates
 
     # -> Set[function_id]
-    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1) -> Set[int]:
+    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None) -> Set[int]:
         if not minhash.hasMinHash():
             return set()
+        # as in MongoDbStorage: the job's cutoff, else STORAGE_BAND_DF_CUTOFF, and a posting list
+        # longer than it is skipped; this storage used to ignore the cutoff altogether
+        cutoff = getattr(self._storage_config, "STORAGE_BAND_DF_CUTOFF", 0) if band_df_cutoff is None else band_df_cutoff
         candidates = {}
         band_hashes = self.getBandHashesForMinHash(minhash)
         for band_number, band_hash in sorted(band_hashes.items()):
-            if band_hash in self._bands[band_number]:
+            if band_hash in self._bands[band_number] and (cutoff <= 0 or len(self._bands[band_number][band_hash]) <= cutoff):
                 for function_id in self._bands[band_number][band_hash]:
                     if function_id not in candidates:
                         candidates[function_id] = 0

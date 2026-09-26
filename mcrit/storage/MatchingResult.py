@@ -42,6 +42,9 @@ class MatchingResult:
     is_pic_filtered: bool
     is_query: bool
     filter_values: Dict
+    # the knobs the job was asked for and applied, and why they differ (#217); None for reports
+    # made before the matchers recorded them
+    matching_info: Optional[Dict]
 
     def __init__(self, sample_entry: "SampleEntry") -> None:
         self.reference_sample_entry = sample_entry
@@ -49,6 +52,7 @@ class MatchingResult:
         self.family_id_to_name_map = None
         self.is_query = False
         self.filter_values = {}
+        self.matching_info = None
         self.function_id_to_family_ids_matched = {}
         self._filtered_sample_matches = None
         self._filtered_function_matches = None
@@ -639,6 +643,8 @@ class MatchingResult:
             "info": {"sample": self.reference_sample_entry.toDict()},
             "matches": {"aggregation": self.match_aggregation, "functions": summaries, "samples": [match.toDict() for match in self.sample_matches]},
         }
+        if self.matching_info is not None:
+            matching_entry["info"]["matching"] = self.matching_info
         if self.other_sample_entry is not None:
             matching_entry["other_sample_info"] = self.other_sample_entry.toDict()
         return matching_entry
@@ -647,6 +653,7 @@ class MatchingResult:
     def fromDict(cls, entry_dict):
         matching_entry = cls(SampleEntry(None))
         matching_entry.reference_sample_entry = SampleEntry.fromDict(entry_dict["info"]["sample"])
+        matching_entry.matching_info = entry_dict["info"].get("matching")
         if "other_sample_info" in entry_dict:
             matching_entry.other_sample_entry = SampleEntry.fromDict(entry_dict["other_sample_info"])
         else:

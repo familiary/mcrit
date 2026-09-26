@@ -80,7 +80,7 @@ class SingleJobWorker(Worker):
                 result = self._executeJobPayload(j["payload"], job)
                 # LOGGER.debug("Remote Job Result: %s", result)
                 # ensure we always have a job_id for finished job payloads
-                result_id = self.queue._dicts_to_grid(result, metadata={"result": True, "job": job.job_id})
+                result_id = self._storeJobResult(job, result)
                 # update result directly from single job to ensure we don't loose it
                 LOGGER.info("Updating job %s with result %s", job.job_id, result_id)
                 updated_job = self.queue.collection.find_one_and_update(
