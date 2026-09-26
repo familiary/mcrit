@@ -62,11 +62,12 @@ INTEL_REPORT = _report_path("crossarch_intel_a.smda")
 #   * pichash matches (score == 100.0) against report B of the same architecture
 # AArch64: flexibleferret (A) vs frostyferret (B).
 AARCH64_MINHASH_ONLY_OFFSETS = [
-    0x100003438,  # score 70.3125 (confirmed validation offset)
-    0x100003684,  # score 60.9375
+    0x100003438,  # score 67.1875 (confirmed validation offset; 70.3125 before AArch64 frame sizes, #238)
+    0x100003684,  # score 62.5 (60.9375 before)
     0x100003A74,  # score 54.6875
     0x100004CC8,  # score 75.0
-    0x100004DC4,  # score 57.8125
+    # 0x100004DC4 scored 57.8125 before; with its frame size it scores 56.25 but shares one band with its
+    # partner instead of two, below BAND_MATCHES_REQUIRED, so it is no longer a candidate (#238)
 ]
 AARCH64_PICHASH_OFFSETS = [
     0x1000039A8,  # score 100.0, flags = MINHASH + PICHASH

@@ -35,6 +35,7 @@ from mcrit.index.SearchQueryTree import (
 )
 from mcrit.libs.utility import decode_two_complement, encode_two_complement
 from mcrit.minhash.MinHash import MinHash
+from mcrit.minhash.MinHasher import MINHASH_SHINGLER_REVISION, SHINGLER_REVISION_SINCE
 from mcrit.storage.FamilyEntry import FamilyEntry
 from mcrit.storage.FunctionEntry import FunctionEntry
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
@@ -324,6 +325,8 @@ class MongoDbStorage(StorageInterface):
         self._getDb()["samples"].create_index("family_id")
         # the stale-minhash count on /status is a distinct plus a count over this field (#142)
         self._getDb()["samples"].create_index("minhash_smda_version")
+        # and over these two for its shingler revision clause (#238)
+        self._getDb()["samples"].create_index([("architecture", 1), ("minhash_shingler_revision", 1)])
         self._getDb()["families"].create_index("family_id")
         self._getDb()["families"].create_index("family_name")
         self._getDb()["functions"].create_index("function_id")
@@ -861,19 +864,23 @@ class MongoDbStorage(StorageInterface):
         function_minhashes = self._getFunctionMinHashesBySampleId(sample_id)
         num_hashed = self._pullBandEntries(function_minhashes)
         self._getDb().functions.update_many({"sample_id": sample_id, "minhash": {"$ne": ""}}, {"$set": {"minhash": "", "minhash_shingle_composition": {}}})
-        self._getDb().samples.update_one({"sample_id": sample_id}, {"$unset": {"minhash_smda_version": ""}})
+        self._getDb().samples.update_one({"sample_id": sample_id}, {"$unset": {"minhash_smda_version": "", "minhash_shingler_revision": ""}})
         return num_hashed
 
     def setMinHashVersionForSamples(self, smda_version: str, sample_ids: Optional[List[int]] = None) -> None:
         query = {} if sample_ids is None else {"sample_id": {"$in": list(sample_ids)}}
-        self._getDb().samples.update_many(query, {"$set": {"minhash_smda_version": smda_version}})
+        self._getDb().samples.update_many(query, {"$set": {"minhash_smda_version": smda_version, "minhash_shingler_revision": MINHASH_SHINGLER_REVISION}})
 
     def _staleMinHashVersionQuery(self, threshold_version: str) -> Dict[str, Any]:
         """Samples carry few distinct recorded versions, so compare those instead of every document."""
         threshold = version.parse(threshold_version)
         recorded = self._getDb().samples.distinct("minhash_smda_version")
         stale_values = [value for value in recorded if self._isStaleMinHashVersion(value, threshold)]
-        return {"$or": [{"minhash_smda_version": {"$exists": False}}, {"minhash_smda_version": {"$in": stale_values}}]}
+        stale_revisions = [
+            {"architecture": architecture, "$or": [{"minhash_shingler_revision": {"$exists": False}}, {"minhash_shingler_revision": {"$lt": since}}]}
+            for architecture, since in SHINGLER_REVISION_SINCE.items()
+        ]
+        return {"$or": [{"minhash_smda_version": {"$exists": False}}, {"minhash_smda_version": {"$in": stale_values}}, *stale_revisions]}
 
     def getSamplesWithStaleMinHashes(self, threshold_version: str) -> List[int]:
         query = self._staleMinHashVersionQuery(threshold_version)

@@ -1,5 +1,6 @@
 #!/usr/bin/python
 
+import json
 import logging
 import os
 import unittest
@@ -71,12 +72,49 @@ class ShinglerEscaperAwarenessTestSuite(unittest.TestCase):
         self.assertTrue(shingler.process(aarch64_function, 0))
         self.assertTrue(shingler.process(cil_function, 0))
 
-    def test_fuzzy_stat_pair_stack_size_is_intel_only(self):
+    def test_fuzzy_stat_pair_stack_size_follows_the_architecture(self):
         intel_function = self._load_intel_function()
-        aarch64_function = self._rearchitect(intel_function, "aarch64")
         shingler = FuzzyStatPairShingler(config.SHINGLER_CONFIG)
-        # stack size heuristic is x86-specific; non-Intel must yield 0
-        self.assertEqual(shingler._getStackSize(aarch64_function), 0)
+        # Intel code read as another architecture's has no frame that architecture recognises
+        self.assertEqual(shingler._getStackSize(self._rearchitect(intel_function, "aarch64")), 0)
+        self.assertEqual(shingler._getStackSize(self._rearchitect(intel_function, "cil")), 0)
+
+    def _aarch64_function(self, report_name, offset, first_operands=None, replace=None):
+        """A fixture function, optionally with its first instruction's operands or whole entry-block
+        instructions ({index: (mnemonic, operands)}) replaced."""
+        report_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", report_name)
+        with open(report_path) as handle:
+            function_dict = json.load(handle)["xcfg"][str(offset)]
+        if first_operands is not None:
+            function_dict["blocks"][str(offset)][0][3] = first_operands
+        for index, (mnemonic, operands) in (replace or {}).items():
+            function_dict["blocks"][str(offset)][index][2:4] = [mnemonic, operands]
+        binary_info = BinaryInfo(b"")
+        binary_info.architecture = "aarch64"
+        return SmdaFunction.fromDict(function_dict, binary_info=binary_info)
+
+    def test_fuzzy_stat_pair_stack_size_reads_aarch64_prologues(self):
+        """#238: sub sp, sp, #imm and pre-indexed pushes onto sp make up an AArch64 frame"""
+        shingler = FuzzyStatPairShingler(config.SHINGLER_CONFIG)
+        # sub sp, sp, #0x70 followed by stores into the frame it reserved
+        self.assertEqual(0x70, shingler._getStackSize(self._aarch64_function("crossarch_aarch64_a.smda", 0x100002AB0)))
+        # stp x20, x19, [sp, #-0x20]! followed by a store into that frame
+        self.assertEqual(0x20, shingler._getStackSize(self._aarch64_function("crossarch_aarch64_b.smda", 0x10000496C)))
+        # a reservation of 0x1000 is written with a shifted immediate
+        shifted = self._aarch64_function("crossarch_aarch64_a.smda", 0x100002AB0, first_operands="sp, sp, #0x1, lsl #12")
+        self.assertEqual(0x1000, shingler._getStackSize(shifted))
+        # a single register pushed with a pre-indexed str, as Go sets up its frames
+        pushed = self._aarch64_function("crossarch_aarch64_b.smda", 0x10000496C, replace={0: ("str", "x30, [sp, #-0x40]!")})
+        self.assertEqual(0x40, shingler._getStackSize(pushed))
+        # a push followed by a reservation adds up
+        both = self._aarch64_function("crossarch_aarch64_b.smda", 0x10000496C, replace={1: ("sub", "sp, sp, #0x30")})
+        self.assertEqual(0x20 + 0x30, shingler._getStackSize(both))
+        # in either order
+        reserved_first = self._aarch64_function("crossarch_aarch64_a.smda", 0x100002AB0, replace={1: ("stp", "x29, x30, [sp, #-0x10]!")})
+        self.assertEqual(0x70 + 0x10, shingler._getStackSize(reserved_first))
+        # and one beyond the log buckets counts as none, as for Intel
+        huge = self._aarch64_function("crossarch_aarch64_a.smda", 0x100002AB0, first_operands="sp, sp, #0xfff, lsl #12")
+        self.assertEqual(0, shingler._getStackSize(huge))
 
 
 if __name__ == "__main__":

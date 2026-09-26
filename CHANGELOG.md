@@ -15,6 +15,27 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Changed
+
+- **`FuzzyStatPairShingler` reads the frame size of AArch64 functions**, from `sub sp, sp, #imm`
+  and pre-indexed pushes such as `stp x29, x30, [sp, #-0x20]!` in the first ten instructions of the
+  entry block, as it reads `sub esp/rsp` for Intel, where it took 0 for every non-Intel function
+  before ([#238]). Matched through MCRIT's own banding on smda's AArch64 Mach-O corpus (12
+  families, one sample each) plus the FlexibleFerret/FrostyFerret test fixtures, MinHash-only
+  matches across families fell from 384 to 289, and those within the ferret family went from 109 to
+  111; one of the five confirmed ferret matches (score 56.25 now) shares one band with its partner
+  instead of two and is no longer found. CIL and Dalvik have no frame to read and keep 0.
+
+  NOTE that this changes the MinHashes of every AArch64 function. Samples now record the shingler
+  revision their MinHashes were computed at (`minhash_shingler_revision`), AArch64 samples hashed
+  before count in `num_samples_with_stale_minhashes` on `/status`, and `repairMinHashes` rehashes
+  them. A sample with no function large enough to hash is recorded as current instead of being
+  skipped; one whose disassembly was dropped with `STORAGE_DROP_DISASSEMBLY` still is, and has to be
+  deleted and submitted again. Until the repair has run, AArch64 samples indexed before and after
+  the upgrade match each other less well, and AArch64 match reports cached in that window keep
+  their results until requested with `force_recalculation`. Upgrade the workers before running the
+  repair: an older worker rehashes with the old shingler.
+
 ## [1.12.0] - 2026-09-25
 
 ### Added
@@ -586,3 +607,4 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#238]: https://github.com/danielplohmann/mcrit/issues/238

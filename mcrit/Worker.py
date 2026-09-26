@@ -27,7 +27,7 @@ from mcrit.matchers.MatcherQuery import MatcherQuery
 from mcrit.matchers.MatcherSample import MatcherSample
 from mcrit.matchers.MatcherVs import MatcherVs
 from mcrit.matchers.MatcherVsGroup import MatcherVsGroup
-from mcrit.minhash.MinHasher import MinHasher
+from mcrit.minhash.MinHasher import MINHASH_SHINGLER_REVISION, MinHasher
 from mcrit.queue.LocalQueue import Job
 from mcrit.queue.QueueFactory import QueueFactory
 from mcrit.queue.QueueRemoteCalls import NoProgressReporter, QueueRemoteCallee, Remote
@@ -299,20 +299,26 @@ class Worker(QueueRemoteCallee):
     # Reports PROGRESS
     @Remote(progress=True)
     def repairMinHashes(self, progress_reporter=NoProgressReporter()):
-        """Rehash only the samples whose minhashes an older smda escaper produced (#142).
+        """Rehash only the samples whose minhashes an older smda escaper produced (#142), or that
+        were computed before a shingler changed for their architecture (#238).
 
         recalculateMinHashes drops every band collection and rehashes everything; this walks
         the samples whose recorded minhash smda version is older than the escaper compatibility
-        threshold (or unrecorded), pulls their band entries, rehashes them and records the
-        running version, so the index stays serving throughout and a killed run costs one sample.
+        threshold (or unrecorded), or whose shingler revision is older than
+        SHINGLER_REVISION_SINCE names for their architecture, pulls their band entries, rehashes
+        them and records the running version, so the index stays serving throughout and a killed
+        run costs one sample.
         """
         threshold = self.getMinHashCompatibilityThreshold()
         stale_sample_ids = self._storage.getSamplesWithStaleMinHashes(threshold)
-        LOGGER.info("Repairing MinHashes: %d samples are stale against escaper compatibility %s.", len(stale_sample_ids), threshold)
+        LOGGER.info(
+            "Repairing MinHashes: %d samples are stale against escaper compatibility %s or shingler revision %d.", len(stale_sample_ids), threshold, MINHASH_SHINGLER_REVISION
+        )
         progress_reporter.set_total(len(stale_sample_ids))
         report = {
             "compatibility_threshold": threshold,
             "smda_version": SmdaConfig().VERSION,
+            "shingler_revision": MINHASH_SHINGLER_REVISION,
             "num_samples_stale": len(stale_sample_ids),
             "num_samples_repaired": 0,
             "num_functions_dropped": 0,
@@ -324,14 +330,17 @@ class Worker(QueueRemoteCallee):
             # cannot be rehashed, and its old minhashes are still better than none
             function_entries = self._storage.getFunctionsBySampleId(sample_id) or []
             hashable = [function_entry for function_entry in function_entries if function_entry.xcfg]
-            minhashes = self.calculateMinHashes(hashable) if hashable else []
-            if not minhashes:
+            if function_entries and not hashable:
                 LOGGER.warning("Repairing MinHashes: sample %d has no disassembly to rehash from, keeping its minhashes.", sample_id)
                 report["num_samples_skipped"] += 1
                 progress_reporter.step()
                 continue
+            # a sample without functions large enough to hash is repaired too: it simply holds no
+            # minhashes afterwards, and is recorded as current like any other (#238)
+            minhashes = self.calculateMinHashes(hashable) if hashable else []
             report["num_functions_dropped"] += self._storage.deleteMinHashesForSample(sample_id)
-            self._storage.addMinHashes(minhashes)
+            if minhashes:
+                self._storage.addMinHashes(minhashes)
             self._storage.setMinHashVersionForSamples(SmdaConfig().VERSION, [sample_id])
             report["num_functions_rehashed"] += len(minhashes)
             report["num_samples_repaired"] += 1

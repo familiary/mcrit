@@ -15,6 +15,7 @@ from picblocks.blockhasher import BlockHasher
 from mcrit.index.SearchCursor import FullSearchCursor
 from mcrit.index.SearchQueryTree import AndNode, BaseVisitor, FilterSingleElementLists, NodeType, OrNode, PropagateNot, SearchConditionNode, SearchFieldResolver
 from mcrit.minhash.MinHash import MinHash
+from mcrit.minhash.MinHasher import MINHASH_SHINGLER_REVISION
 from mcrit.storage.FamilyEntry import FamilyEntry
 from mcrit.storage.FunctionEntry import FunctionEntry
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
@@ -153,6 +154,7 @@ class MemoryStorage(StorageInterface):
         self._pichashes = {}
         self._bands = {band_number: {} for band_number in range(self._storage_config.STORAGE_NUM_BANDS)}
         self._minhash_versions: Dict[int, str] = {}
+        self._minhash_shingler_revisions: Dict[int, int] = {}
         self._counters = defaultdict(lambda: 0)
         # initialize query sample/function ids
         if self._counters["query_samples"] == 0:
@@ -371,6 +373,7 @@ class MemoryStorage(StorageInterface):
             function_entry.minhash = b""
             function_entry.shingler_composition = {}
         self._minhash_versions.pop(sample_id, None)
+        self._minhash_shingler_revisions.pop(sample_id, None)
         return num_hashed
 
     def deleteAllMinHashes(self, progress_reporter=None) -> int:
@@ -384,10 +387,16 @@ class MemoryStorage(StorageInterface):
         for sample_id in list(self._samples) if sample_ids is None else sample_ids:
             if sample_id in self._samples:
                 self._minhash_versions[sample_id] = smda_version
+                self._minhash_shingler_revisions[sample_id] = MINHASH_SHINGLER_REVISION
 
     def getSamplesWithStaleMinHashes(self, threshold_version: str) -> List[int]:
         threshold = packaging_version.parse(threshold_version)
-        return sorted(sample_id for sample_id in self._samples if self._isStaleMinHashVersion(self._minhash_versions.get(sample_id), threshold))
+        return sorted(
+            sample_id
+            for sample_id, sample_entry in self._samples.items()
+            if self._isStaleMinHashVersion(self._minhash_versions.get(sample_id), threshold)
+            or self._isStaleShinglerRevision(sample_entry.architecture, self._minhash_shingler_revisions.get(sample_id))
+        )
 
     def deleteFamily(self, family_id: int, keep_samples: bool = False) -> bool:
         if family_id not in self._families:

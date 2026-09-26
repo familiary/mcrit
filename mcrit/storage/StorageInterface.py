@@ -828,18 +828,29 @@ class StorageInterface:
         except Exception:
             return True
 
+    @staticmethod
+    def _isStaleShinglerRevision(architecture: Optional[str], recorded_revision: Optional[int]) -> bool:
+        """A sample's minhashes are also stale when a shingler changed for its architecture after
+        they were computed (#238)."""
+        from mcrit.minhash.MinHasher import SHINGLER_REVISION_SINCE
+
+        since = SHINGLER_REVISION_SINCE.get(architecture or "")
+        return since is not None and (recorded_revision is None or recorded_revision < since)
+
     def deleteMinHashesForSample(self, sample_id: int) -> int:
         """Drop the minhashes of one sample's functions and their band entries, without touching
         the rest of the index; how many functions had one (#142)."""
         raise NotImplementedError
 
     def setMinHashVersionForSamples(self, smda_version: str, sample_ids: Optional[List[int]] = None) -> None:
-        """Record which smda escaped the minhashes of the samples (all when None) (#142)."""
+        """Record which smda escaped the minhashes of the samples (all when None) (#142), and at
+        which shingler revision they were computed (#238)."""
         raise NotImplementedError
 
     def getSamplesWithStaleMinHashes(self, threshold_version: str) -> List[int]:
         """The samples whose minhashes were escaped by an smda older than the threshold, or
-        by an unrecorded one (#142)."""
+        by an unrecorded one (#142), or computed before a shingler changed for their
+        architecture (#238)."""
         raise NotImplementedError
 
     def countSamplesWithStaleMinHashes(self, threshold_version: str) -> int:

@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 
+import re
 from collections import Counter
 
 from AbstractShingler import AbstractShingler
 from LogBucket import LogBucket
 
 from mcrit.libs.utility import generate_unique_pairs
+
+# pre-indexed store that moves sp down: "x29, x30, [sp, #-0x20]!"
+AARCH64_PUSH = re.compile(r"\[sp, #-(0x[0-9a-f]+|\d+)\]!$")
+# frame reservation: "sp, sp, #0x60", or "sp, sp, #0x1, lsl #12" for 0x1000
+AARCH64_RESERVE = re.compile(r"^sp, sp, #(0x[0-9a-f]+|\d+)(, lsl #12)?$")
 
 
 class FuzzyStatPairShingler(AbstractShingler):
@@ -17,10 +23,30 @@ class FuzzyStatPairShingler(AbstractShingler):
         self._weight = weight
         self._log_buckets = LogBucket(self._config.SHINGLER_LOGBUCKETS, self._config.SHINGLER_LOGBUCKET_RANGE)
 
+    def _getAArch64StackSize(self, function_object):
+        """The frame an AArch64 prologue sets up: what pre-indexed stores push onto sp
+        (stp x29, x30, [sp, #-0x20]!) plus what sub sp, sp, #imm reserves, in its first ten
+        instructions (#238)."""
+        stack_size = 0
+        for ins in function_object.blocks[function_object.offset][:10]:
+            operands = ins.operands or ""
+            if ins.mnemonic in ("stp", "str") and operands.endswith("]!"):
+                pushed = AARCH64_PUSH.search(operands)
+                if pushed:
+                    stack_size += int(pushed.group(1), 0)
+            elif ins.mnemonic == "sub":
+                reserved = AARCH64_RESERVE.match(operands)
+                if reserved:
+                    stack_size += int(reserved.group(1), 0) << (12 if reserved.group(2) else 0)
+        return stack_size if 0 <= stack_size < self._config.SHINGLER_LOGBUCKETS else 0
+
     def _getStackSize(self, function_object):
         stack_size = 0
+        from smda.aarch64.AArch64InstructionEscaper import AArch64InstructionEscaper
         from smda.intel.IntelInstructionEscaper import IntelInstructionEscaper
 
+        if function_object._escaper is AArch64InstructionEscaper:
+            return self._getAArch64StackSize(function_object)
         if function_object._escaper is not IntelInstructionEscaper:
             return stack_size
         for ins in function_object.blocks[function_object.offset][:10]:
