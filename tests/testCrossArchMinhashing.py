@@ -8,8 +8,8 @@
 #   * minhashes are computed with the correct per-architecture escaper (not a hardcoded Intel one),
 #   * a near-duplicate of the same architecture yields MINHASH-only matches (score < 100.0),
 #   * a PicHash match (score == 100.0) is also detected where expected,
-#   * an Intel sample and an AArch64 sample do NOT match via minhash (known limitation until
-#     cross-architecture matching is gated - documented here as current behavior).
+#   * an Intel sample and an AArch64 sample do NOT match: matching reports no samples of another
+#     architecture (#93).
 #
 # Fixtures are the SMDA reports you used for validation. Until they are in place under
 # tests/fixtures/, the tests skip with a clear message. The expected match offsets below are
@@ -208,10 +208,12 @@ class CrossArchMinHashingTestSuite(unittest.TestCase):
         worker.updateMinHashesForSample(aarch64_entry.sample_id)
         matcher = MatcherSample(worker)
         result = matcher.getMatchesForSample(intel_entry.sample_id)
-        # the only expected matches (if any) should be within the intel sample, never vs AArch64
+        # the only expected matches (if any) should be within the intel sample, never vs AArch64;
+        # the match layout is (family_id, sample_id, function_id, score, flags)
         for function_data in result["matches"]["functions"]:
             for m in function_data["matches"]:
-                self.assertNotEqual(m[0], aarch64_entry.sample_id)
+                self.assertNotEqual(m[1], aarch64_entry.sample_id)
+        self.assertNotIn(aarch64_entry.sample_id, [sample["sample_id"] for sample in result["matches"]["samples"]])
 
 
 if __name__ == "__main__":

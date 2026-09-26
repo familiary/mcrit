@@ -4,16 +4,19 @@ import json
 import logging
 import os
 import unittest
+from unittest.mock import patch
 
 from smda.common.SmdaReport import SmdaReport
 
 from mcrit.index.MinHashIndex import MinHashIndex
 from mcrit.index.SearchQueryParser import SearchQueryParser
 from mcrit.libs.utility import generate_unique_pairs
-from mcrit.minhash.EscaperFingerprint import getEscaperFingerprint
+from mcrit.minhash.EscaperFingerprint import getEscaperFingerprint, getEscaperFingerprints
 from mcrit.storage.UniqueBlocksResult import UniqueBlocksResult
 
 from .context import config
+
+FIXTURES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 EXAMPLE_REPORT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_report.smda")
 
@@ -272,13 +275,15 @@ class EscaperProvenanceTestSuite(unittest.TestCase):
         self.assertIn("smda_version", status)
         self.assertIn("escaper_fingerprint", status)
         self.assertEqual(getEscaperFingerprint(), status["escaper_fingerprint"])
+        self.assertEqual(getEscaperFingerprints(), status["escaper_fingerprints"])
 
     def testExportRecordsEscaperProvenance(self):
         index = MinHashIndex(config)
         export_config = index.getExportData()["config"]
         # persisted per architecture, so widening the probe later cannot invalidate exports
         # that are already in the wild (mcrit/minhash/EscaperFingerprint.py)
-        self.assertEqual({"intel": getEscaperFingerprint()}, export_config["escaper"])
+        self.assertEqual(getEscaperFingerprints(), export_config["escaper"])
+        self.assertEqual(getEscaperFingerprint(), export_config["escaper"]["intel"])
         self.assertIn("smda_version", export_config)
 
     def _minimalExport(self, index, **config_overrides):
@@ -310,21 +315,56 @@ class EscaperProvenanceTestSuite(unittest.TestCase):
         """An export carrying an architecture this instance does not probe must not flip the
         flag for the architecture it does carry - intersection semantics, not equality."""
         index = MinHashIndex(config)
-        export_data = self._minimalExport(index, escaper={"intel": getEscaperFingerprint(), "aarch64": "deadbeefdeadbeef"})
+        export_data = self._minimalExport(index, escaper={"intel": getEscaperFingerprint(), "riscv64": "deadbeefdeadbeef"})
         report = index.addImportData(export_data)
         self.assertFalse(report["escaper_mismatch"])
 
     def testImportOfPartiallyDifferingEscaperFlagsOnlyTheMismatch(self):
         index = MinHashIndex(config)
-        export_data = self._minimalExport(index, escaper={"intel": "0000000000000000", "aarch64": getEscaperFingerprint()})
+        export_data = self._minimalExport(index, escaper={"intel": "0000000000000000", "riscv64": getEscaperFingerprint()})
         report = index.addImportData(export_data)
         self.assertIsNotNone(report)
         self.assertTrue(report["escaper_mismatch"])
 
+    def _exportOf(self, report_path, **config_overrides):
+        index = MinHashIndex(config)
+        index.addReport(SmdaReport.fromFile(report_path))
+        export_data = index.getExportData()
+        export_data["config"].update(config_overrides)
+        return export_data
+
+    def testImportComparesOnlyTheArchitecturesTheExportHolds(self):
+        """An Intel-only export is not flagged for a change in how another architecture is escaped."""
+        local = getEscaperFingerprints()
+        other_cil = dict(local, cil="0000000000000000")
+        intel_only = self._exportOf(os.path.join(FIXTURES_PATH, "crossarch_intel_a.smda"), escaper=other_cil)
+        self.assertFalse(MinHashIndex(config).addImportData(intel_only)["escaper_mismatch"])
+        with_cil = self._exportOf(os.path.join(FIXTURES_PATH, "crossarch_cil_a.smda"), escaper=other_cil)
+        self.assertTrue(MinHashIndex(config).addImportData(with_cil)["escaper_mismatch"])
+
+    def testAnOlderExportIsComparedByTheArchitecturesOfItsSamples(self):
+        # an export from before #93 carries the Intel fingerprint only
+        intel_only_fingerprint = {"intel": "0000000000000000"}
+        aarch64 = self._exportOf(os.path.join(FIXTURES_PATH, "crossarch_aarch64_a.smda"), escaper=intel_only_fingerprint)
+        with patch("mcrit.index.MinHashIndex.LOGGER") as logger:
+            self.assertFalse(MinHashIndex(config).addImportData(aarch64)["escaper_mismatch"])
+        # the warning names what the export's samples are, not only which fingerprints it lacks
+        self.assertEqual(["aarch64"], logger.warning.call_args.args[1])
+        intel = self._exportOf(os.path.join(FIXTURES_PATH, "crossarch_intel_a.smda"), escaper=intel_only_fingerprint)
+        self.assertTrue(MinHashIndex(config).addImportData(intel)["escaper_mismatch"])
+
+    def testAnExportOfSamplesWithoutArchitectureHasNothingToCompare(self):
+        export_data = self._exportOf(os.path.join(FIXTURES_PATH, "crossarch_intel_a.smda"), escaper={"intel": "0000000000000000"})
+        for sample_entry in export_data["sample_entries"].values():
+            sample_entry["architecture"] = ""
+        with patch("mcrit.index.MinHashIndex.LOGGER") as logger:
+            self.assertFalse(MinHashIndex(config).addImportData(export_data)["escaper_mismatch"])
+        self.assertFalse([call for call in logger.warning.call_args_list if "escaper" in str(call)])
+
     def testImportWithNoComparableArchitectureIsNotFlagged(self):
         """Nothing shared means nothing comparable - a skip with a warning, not a mismatch."""
         index = MinHashIndex(config)
-        report = index.addImportData(self._minimalExport(index, escaper={"aarch64": "deadbeefdeadbeef"}))
+        report = index.addImportData(self._minimalExport(index, escaper={"riscv64": "deadbeefdeadbeef"}))
         self.assertFalse(report["escaper_mismatch"])
 
 

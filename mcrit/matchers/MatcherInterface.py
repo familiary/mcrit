@@ -212,6 +212,10 @@ class MatcherInterface:
         # the query's own sample must never be shortlisted away - self-matches are how a
         # sample-vs-corpus result reports its own functions
         votes.pop(self._sample_id, None)
+        # samples of another architecture are dropped from the report, so they must not take the
+        # places of samples that would be reported
+        for sample_id in self._otherArchitectureSampleIds(set(votes)):
+            del votes[sample_id]
         shortlist = self._rankShortlist(votes, shortlist_size)
         if self._sample_id is not None:
             shortlist.add(self._sample_id)
@@ -404,9 +408,54 @@ class MatcherInterface:
                 minhash_matches = self._harmonizeMinHashMatches(self._sample_id, self._performMinHashMatching(candidate_groups, matching_cache))
                 all_minhash_matches.update(minhash_matches)
             LOGGER.info("Calculated MinHash matches.")
+        pichash_matches = self._dropOtherArchitectures(pichash_matches)
+        all_minhash_matches = self._dropOtherArchitectures(all_minhash_matches)
         matching_report = self._craftResultDict(pichash_matches, all_minhash_matches)
         LOGGER.info("Returning aggregated match report.")
         return matching_report
+
+    def _prefetchSampleEntries(self, sample_ids) -> None:
+        """Fetch the entries of sample_ids not fetched yet in one lookup, rather than one or two
+        per sample later on (N+1, #111). Lazy per-id lookups stay the fallback for anything the
+        batch did not return."""
+        missing = [sample_id for sample_id in sample_ids if sample_id not in self._sample_id_to_entry]
+        if not missing or not hasattr(self._storage, "getSampleEntriesByIds"):
+            return
+        for sample_id, entry in self._storage.getSampleEntriesByIds(missing).items():
+            self._sample_id_to_entry.setdefault(sample_id, entry)
+            # same predicate as getLibraryInfoForSampleId(...) is not None
+            self._sample_to_lib_info.setdefault(sample_id, bool(entry.is_library))
+
+    def _otherArchitectureSampleIds(self, sample_ids) -> Set[int]:
+        """The samples among sample_ids that are of another architecture than the one matched (#93).
+
+        A PicHash or a MinHash says the same thing about two functions only when both were escaped
+        by the same instruction set's rules; across architectures an equal hash is a coincidence,
+        and the shingles of different instruction sets can still share bands. An architecture that
+        is not known on either side (an empty string, as a sample SMDA could not disassemble has)
+        is not taken as a different one.
+        """
+        own_architecture = (self._sample_info or {}).get("architecture")
+        if not own_architecture:
+            return set()
+        self._prefetchSampleEntries(sample_ids)
+        return {
+            sample_id
+            for sample_id in sample_ids
+            if sample_id in self._sample_id_to_entry and self._sample_id_to_entry[sample_id].architecture and self._sample_id_to_entry[sample_id].architecture != own_architecture
+        }
+
+    def _dropOtherArchitectures(self, matches: HarmonizedMatches) -> HarmonizedMatches:
+        """Leave out matches against samples of another architecture. For a corpus of one
+        architecture this changes nothing."""
+        if not matches:
+            return matches
+        other = self._otherArchitectureSampleIds({match_ids[1] for match_ids in matches})
+        if not other:
+            return matches
+        kept = {match_ids: strength for match_ids, strength in matches.items() if match_ids[1] not in other}
+        LOGGER.info("Left out %d matches against %d samples of another architecture", len(matches) - len(kept), len(other))
+        return kept
 
     # Reports PROGRESS
     @staticmethod
@@ -662,12 +711,7 @@ class MatcherInterface:
         # prefetch every foreign sample entry in one $in instead of two find_ones per
         # distinct sample inside the loop below (N+1, #111). The lazy per-id lookups stay
         # as the fallback for anything the batch did not return.
-        missing_sample_ids = {match_ids[1] for match_ids in matches if match_ids[1] != sample_id and match_ids[1] not in self._sample_id_to_entry}
-        if missing_sample_ids and hasattr(self._storage, "getSampleEntriesByIds"):
-            for foreign_sample_id, entry in self._storage.getSampleEntriesByIds(list(missing_sample_ids)).items():
-                self._sample_id_to_entry.setdefault(foreign_sample_id, entry)
-                # same predicate as getLibraryInfoForSampleId(...) is not None
-                self._sample_to_lib_info.setdefault(foreign_sample_id, bool(entry.is_library))
+        self._prefetchSampleEntries({match_ids[1] for match_ids in matches if match_ids[1] != sample_id})
         aggregation = {
             "num_own_functions_matched": 0,
             "num_foreign_functions_matched": 0,

@@ -7,6 +7,8 @@ import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from itertools import zip_longest
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
@@ -43,6 +45,16 @@ from mcrit.storage.SampleEntry import SampleEntry
 from mcrit.storage.StorageInterface import StorageInterface
 
 LOGGER = logging.getLogger(__name__)
+
+# the picblocks this process hashes blocks with, recorded on every sample it stores (#240)
+try:
+    PICBLOCKS_VERSION = package_version("picblocks")
+except PackageNotFoundError:
+    # an install without package metadata; pyproject.toml requires picblocks 2.1.0 or newer
+    PICBLOCKS_VERSION = "2.1.0"
+# the first picblocks that escapes a block by its own architecture's rules; before, every block was
+# escaped as Intel code, so non-Intel block hashes stored by an older one have to be recomputed
+PICBLOCKS_ARCHITECTURE_AWARE = "2.1.0"
 if MongoClient is None:
     LOGGER.warning("pymongo package import failed - MongoDB backend will not be available.")
 
@@ -324,6 +336,8 @@ class MongoDbStorage(StorageInterface):
         self._getDb()["samples"].create_index("family_id")
         # the stale-minhash count on /status is a distinct plus a count over this field (#142)
         self._getDb()["samples"].create_index("minhash_smda_version")
+        # and the stale-picblockhash count over these two, which skips Intel samples in the index (#240)
+        self._getDb()["samples"].create_index([("architecture", 1), ("picblockhash_version", 1)])
         self._getDb()["families"].create_index("family_id")
         self._getDb()["families"].create_index("family_name")
         self._getDb()["functions"].create_index("function_id")
@@ -882,6 +896,22 @@ class MongoDbStorage(StorageInterface):
     def countSamplesWithStaleMinHashes(self, threshold_version: str) -> int:
         return self._getDb().samples.count_documents(self._staleMinHashVersionQuery(threshold_version))
 
+    def _stalePicBlockHashQuery(self) -> Dict[str, Any]:
+        """Samples of an architecture other than Intel whose block hashes a picblocks before
+        PICBLOCKS_ARCHITECTURE_AWARE computed, or an unrecorded one - it escaped every block as Intel
+        code (#240). Intel blocks hash the same either way, and a sample of unknown architecture has
+        no code to hash."""
+        threshold = version.parse(PICBLOCKS_ARCHITECTURE_AWARE)
+        recorded = self._getDb().samples.distinct("picblockhash_version")
+        stale_values = [value for value in recorded if self._isStaleMinHashVersion(value, threshold)]
+        return {
+            "architecture": {"$nin": ["intel", ""]},
+            "$or": [{"picblockhash_version": {"$exists": False}}, {"picblockhash_version": {"$in": stale_values}}],
+        }
+
+    def countSamplesWithStalePicBlockHashes(self) -> Optional[int]:
+        return self._getDb().samples.count_documents(self._stalePicBlockHashQuery())
+
     def _updateFamilyStats(self, family_id, num_samples_inc, num_functions_inc, num_library_samples_inc):
         result = self._getDb().families.update_one(
             {"family_id": family_id},
@@ -1179,7 +1209,7 @@ class MongoDbStorage(StorageInterface):
             if not self.getSampleBySha256(smda_report.sha256):
                 family_id = self.addFamily(smda_report.family or "")
                 sample_entry = SampleEntry(smda_report, sample_id=self._useCounter("samples"), family_id=family_id)
-                self._dbInsert("samples", sample_entry.toDict())
+                self._dbInsert("samples", {**sample_entry.toDict(), "picblockhash_version": PICBLOCKS_VERSION})
                 function_ids = self._useCounterBulk("functions", smda_report.num_functions)
                 function_dicts = []
                 for function_id, smda_function in zip(function_ids, smda_report.getFunctions()):
@@ -2694,6 +2724,14 @@ class MongoDbStorage(StorageInterface):
                 report_version = report_version.rsplit(" ", 1)[-1]
             if version.parse(report_version) < compatibility_threshold:
                 samples_to_be_updated[sample_document["sample_id"]] = sample_document
+        # and those whose block hashes a picblocks escaped as Intel code while they are not (#240)
+        num_stale_picblockhash_samples = 0
+        for sample_document in self._getDb().samples.find(
+            self._stalePicBlockHashQuery(), {"sample_id": 1, "smda_version": 1, "architecture": 1, "base_addr": 1, "binary_size": 1, "bitness": 1, "_id": 0}
+        ):
+            num_stale_picblockhash_samples += 1
+            if sample_document["sample_id"] not in samples_to_be_updated:
+                samples_to_be_updated[sample_document["sample_id"]] = sample_document
         # reprocess functions on a per sample level
         total_samples = len(samples_to_be_updated)
         if progress_reporter:
@@ -2703,8 +2741,11 @@ class MongoDbStorage(StorageInterface):
         picblockhashes_updatable = 0
         picblockhashes_updated = 0
         xcfg_missing = 0
+        picblockhash_index_invalidated = False
         for sample_id, sample_info in samples_to_be_updated.items():
             pic_hash_updates = []
+            sample_xcfg_missing = 0
+            picblockhashes_updated_before = picblockhashes_updated
             sample_function_documents = list(self._getDb().functions.find({"sample_id": sample_id}, {"function_id": 1, "_pichash": 1, "_picblockhashes": 1, "_xcfg": 1, "_id": 0}))
             # one $in for the whole sample rather than a lookup per function (#137); inline
             # `_xcfg` is the fallback for pre-migration documents (see _attachXcfgBlobs)
@@ -2721,6 +2762,7 @@ class MongoDbStorage(StorageInterface):
                 binary_info.bitness = sample_info["bitness"]
                 if "_xcfg" not in function_document or not function_document["_xcfg"]:
                     xcfg_missing += 1
+                    sample_xcfg_missing += 1
                     continue
                 smda_xcfg = json.loads(function_document["_xcfg"])
                 old_pichash = int(function_document["_pichash"], 16)
@@ -2753,8 +2795,19 @@ class MongoDbStorage(StorageInterface):
                     pic_hash_updates.append(UpdateOne({"function_id": function_document["function_id"]}, update_command, upsert=True))
             # batch insert updates for function_entries
             if pic_hash_updates:
+                if picblockhashes_updated > picblockhashes_updated_before and not picblockhash_index_invalidated:
+                    # block hashes are about to be rewritten in place, so the inverted index stops
+                    # describing the corpus. Marking it incomplete first makes getUniqueBlocks fall
+                    # back to the scan - slow but correct - until rebuildPicBlockHashIndex runs, even
+                    # if this run does not finish. Updating it incrementally here would mean diffing
+                    # old against new hashes per function, which is what the rebuild does anyway.
+                    self._setPicBlockHashIndexComplete(False)
+                    picblockhash_index_invalidated = True
                 self._getDb().samples.update_one({"sample_id": sample_id}, {"$set": {"smda_version": smda_version}})
                 self._getDb().functions.bulk_write(pic_hash_updates, ordered=False)
+            # only a sample whose every function was rehashed holds block hashes of this picblocks
+            if not sample_xcfg_missing:
+                self._getDb().samples.update_one({"sample_id": sample_id}, {"$set": {"picblockhash_version": PICBLOCKS_VERSION}})
             if progress_reporter:
                 progress_reporter.step()
         self._getDb().command("reIndex", "functions")
@@ -2763,16 +2816,11 @@ class MongoDbStorage(StorageInterface):
         )
         if xcfg_missing:
             LOGGER.warning(f"{xcfg_missing} functions could not be updated as there was not CFG available.")
-        if picblockhashes_updated:
-            # block hashes were rewritten in place, so the inverted index no longer describes the
-            # corpus. Marking it incomplete makes getUniqueBlocks fall back to the scan - slow but
-            # correct - until rebuildPicBlockHashIndex runs. Updating it incrementally here would
-            # mean diffing old against new hashes per function, which is what the rebuild does
-            # anyway and does in one pass.
-            self._setPicBlockHashIndexComplete(False)
+        if picblockhash_index_invalidated:
             LOGGER.warning("picblockhash index invalidated by the recalculation - run rebuildPicBlockHashIndex().")
         return {
             "outdated_samples": total_samples,
+            "stale_picblockhash_samples": num_stale_picblockhash_samples,
             "functions_updatable": functions_updatable,
             "functions_updated": functions_updated,
             "picblockhashes_updatable": picblockhashes_updatable,

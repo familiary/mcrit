@@ -809,7 +809,8 @@ class StorageInterface:
         raise NotImplementedError
 
     def recalculateAllPicHashes(self, progress_reporter=None) -> int:
-        """Iterate across all SampleEntries and check if the SMDA version is older than the one currently available
+        """Iterate across all SampleEntries and check if the SMDA version is older than the one currently available,
+            or if their block hashes were computed by a picblocks that escaped non-Intel code as Intel (#240).
             If yes, process all FunctionEntries and use this SMDA version to recalculate and update the PicHash
             In the end, rebuild the PicHashIndex
         Returns:
@@ -845,6 +846,12 @@ class StorageInterface:
     def countSamplesWithStaleMinHashes(self, threshold_version: str) -> int:
         """How many samples getSamplesWithStaleMinHashes would answer, for /status (#142)."""
         return len(self.getSamplesWithStaleMinHashes(threshold_version))
+
+    def countSamplesWithStalePicBlockHashes(self) -> Optional[int]:
+        """How many samples of an architecture other than Intel hold block hashes computed by a
+        picblocks that escaped them as Intel code, which recalculateAllPicHashes redoes, for
+        /status (#240). None where the backend does not record it."""
+        return None
 
     def deleteAllMinHashes(self, progress_reporter=None) -> int:
         """drop every minhash in all function_entries as a preparation for a full rebuild

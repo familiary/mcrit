@@ -235,10 +235,22 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 exported_escapers,
             )
         else:
-            shared_architectures = sorted(set(local_escapers).intersection(exported_escapers))
-            if not shared_architectures:
+            shared_architectures = set(local_escapers).intersection(exported_escapers)
+            # only the architectures the export holds samples of: a change in how smda escapes
+            # another one leaves these minhashes as comparable as before
+            exported_samples = [sample_entry for sample_entry in export_data.get("sample_entries", {}).values() if isinstance(sample_entry, dict)]
+            exported_architectures = {sample_entry.get("architecture") for sample_entry in exported_samples if sample_entry.get("architecture")}
+            if exported_samples:
+                # samples of an unknown architecture only (SMDA could not disassemble them) hold no
+                # minhashes any escaper produced, so there is then nothing to compare at all
+                shared_architectures &= exported_architectures
+            shared_architectures = sorted(shared_architectures)
+            if exported_samples and not exported_architectures:
+                pass
+            elif not shared_architectures:
                 LOGGER.warning(
-                    "Export carries no escaper probe this instance can compare (export: %s, local: %s). Imported minhashes may or may not share this instance's escaping behaviour.",
+                    "Export carries no escaper fingerprint for the architectures of its samples (samples: %s, export fingerprints: %s, local: %s). Imported minhashes may or may not share this instance's escaping behaviour.",
+                    sorted(exported_architectures) or "unknown",
                     sorted(exported_escapers),
                     sorted(local_escapers),
                 )
@@ -520,6 +532,8 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 # mcrit/minhash/EscaperFingerprint.py for why this is worth surfacing
                 "smda_version": SMDA_VERSION,
                 "escaper_fingerprint": getEscaperFingerprint(),
+                # per architecture, as exports record them (#93); the field above stays Intel's
+                "escaper_fingerprints": getEscaperFingerprints(),
             }
         }
         # operator signal for a half-migrated instance (#137): the inline fallback keeps serving
@@ -533,6 +547,10 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         threshold = Worker.getMinHashCompatibilityThreshold()
         status["status"]["minhash_compatibility_threshold"] = threshold
         status["status"]["num_samples_with_stale_minhashes"] = storage.countSamplesWithStaleMinHashes(threshold)
+        # how many non-Intel samples' block hashes were escaped as Intel code; recalculatePicHashes redoes them (#240)
+        num_stale_picblockhash_samples = storage.countSamplesWithStalePicBlockHashes()
+        if num_stale_picblockhash_samples is not None:
+            status["status"]["num_samples_with_stale_picblockhashes"] = num_stale_picblockhash_samples
         return status
 
     def getVersion(self):
