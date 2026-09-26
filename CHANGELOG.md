@@ -15,6 +15,7 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+
 ## [1.12.0] - 2026-09-25
 
 ### Added
