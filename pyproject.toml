@@ -35,7 +35,8 @@ dependencies = [
     "numpy>=1.26",
     # MongoDbStorage compares smda versions with packaging.version
     "packaging",
-    "picblocks>=1.1.2",
+    # 2.1.0 hashes a block with its own architecture's escaper; before, every block was escaped as Intel (#93)
+    "picblocks>=2.1.0",
     "pymongo",
     "pyparsing>=3",
     "python-dotenv",

@@ -2,6 +2,7 @@
 
 import logging
 import unittest
+from unittest.mock import patch
 
 from smda.common.SmdaFunction import SmdaFunction
 from smda.common.SmdaInstruction import SmdaInstruction
@@ -37,14 +38,38 @@ class EscaperFingerprintTestSuite(unittest.TestCase):
         int(fingerprint, 16)
 
     def testPerArchitectureMappingAgreesWithTheScalar(self):
-        """For the single architecture MCRIT ships today, mapping and scalar must agree - the
-        export stores the mapping while status reports the scalar."""
-        self.assertEqual({"intel": getEscaperFingerprint()}, getEscaperFingerprints())
+        """For Intel, the scalar's default, mapping and scalar must agree - exports store the
+        mapping, while status reports the scalar next to it."""
+        self.assertEqual(getEscaperFingerprint(), getEscaperFingerprints()["intel"])
+        self.assertEqual({"intel": getEscaperFingerprint()}, getEscaperFingerprints(("intel",)))
 
     def testProbeCoversEveryInstruction(self):
         escaped = getEscapedProbe("intel")
         self.assertEqual(len(ESCAPER_PROBE_INSTRUCTIONS["intel"]), len(escaped))
         self.assertTrue(all(line.strip() for line in escaped))
+
+    def testEveryArchitectureWithMinHashesIsProbed(self):
+        # MCRIT computes minhashes for these (#93); an escaper change in any of them must show
+        fingerprints = getEscaperFingerprints()
+        self.assertEqual({"intel", "aarch64", "cil", "dalvik"}, set(fingerprints))
+        self.assertNotIn(FINGERPRINT_UNAVAILABLE, fingerprints.values())
+        self.assertEqual(len(set(fingerprints.values())), len(fingerprints))
+
+    def testEachArchitectureIsFingerprintedOnItsOwn(self):
+        # adding an architecture must not change what exports recorded for the others
+        for architecture in ESCAPER_PROBE_INSTRUCTIONS:
+            self.assertEqual(getEscaperFingerprints((architecture,)), {architecture: getEscaperFingerprints()[architecture]})
+
+    def testAnArchitectureSmdaHasNoEscaperForIsUnavailable(self):
+        # an older smda answers None for an architecture it lacks, and escapes to raw text with it
+        with patch.object(SmdaFunction, "getInstructionEscaper", return_value=None):
+            self.assertEqual({"dalvik": FINGERPRINT_UNAVAILABLE}, getEscaperFingerprints(("dalvik",)))
+
+    def testEveryProbeLineIsEscaped(self):
+        for architecture, instructions in ESCAPER_PROBE_INSTRUCTIONS.items():
+            escaped = getEscapedProbe(architecture)
+            self.assertEqual(len(instructions), len(escaped))
+            self.assertTrue(all(line.strip() for line in escaped), architecture)
 
     def testUnknownArchitectureIsRejected(self):
         with self.assertRaises(ValueError):
