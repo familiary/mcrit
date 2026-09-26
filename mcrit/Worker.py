@@ -262,6 +262,10 @@ class Worker(QueueRemoteCallee):
     def recomputeFamilyStats(self):
         return self._storage.recomputeFamilyStats()
 
+    @Remote()
+    def deleteOrphanedQueueFiles(self, dry_run=False):
+        return self.queue.delete_orphaned_files(dry_run=dry_run)
+
     # Reports PROGRESS
     @Remote(progress=True)
     def rebuildPicBlockHashIndex(self, progress_reporter=NoProgressReporter()):

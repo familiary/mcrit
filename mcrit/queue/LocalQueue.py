@@ -583,12 +583,33 @@ class LocalQueue:
         result = job["result"]
         file_params = json.loads(job["payload"]["file_params"])
         del self._jobs[id]
-        self._delete_grid(result)
+        if result is not None:
+            self._delete_grid(result)
         for f in file_params.values():
             meta = self._grid_to_meta(f)
             LOGGER.debug("Job meta: %s", meta)
             meta["jobs"].remove(id)
+            # as MongoQueue does: a file no job uses and nobody is about to claim goes with its last job
+            if not meta["jobs"] and meta.get("tmp_lock", 0) == 0:
+                self._delete_grid(f)
         return 1
+
+    def delete_orphaned_files(self, dry_run=False):
+        """As MongoQueue.delete_orphaned_files; there are no chunks to leave behind in memory."""
+        results = [grid for grid, meta in self._files_meta.items() if meta and meta.get("result") and str(meta.get("job")) not in self._jobs]
+        file_params = [
+            grid
+            for grid, meta in self._files_meta.items()
+            if meta
+            and not meta.get("result")
+            and meta.get("tmp_lock") == 0
+            and isinstance(meta.get("jobs"), list)
+            and not any(str(job_id) in self._jobs for job_id in meta["jobs"])
+        ]
+        if not dry_run:
+            for grid in results + file_params:
+                self._delete_grid(grid)
+        return {"dry_run": dry_run, "results": len(results), "file_params": len(file_params), "chunk_files": 0}
 
     delete_history = []
 

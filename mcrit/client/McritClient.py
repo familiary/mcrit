@@ -269,6 +269,15 @@ class McritClient:
             return response
         return self._handle(response)
 
+    def deleteOrphanedQueueFiles(self, dry_run=False):
+        """
+        Schedule a job that deletes the GridFS files and chunks no job refers to any more (#80); with dry_run it only counts them; answers the job id
+        """
+        response = requests.post(f"{self.mcrit_server}/delete_orphaned_queue_files", params={"dry_run": "true" if dry_run else "false"}, headers=self.headers, timeout=self.timeout)
+        if self.raw:
+            return response
+        return self._handle(response)
+
     def recalculatePicHashes(self):
         response = requests.get(f"{self.mcrit_server}/recalculate_pichashes", headers=self.headers, timeout=self.timeout)
         if self.raw:

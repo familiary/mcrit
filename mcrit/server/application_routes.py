@@ -105,6 +105,8 @@ def get_app():
     _app.add_route("/rebuild_index", status_resource, suffix="rebuild_index")  # get
     # schedule a job that sets every family's sample/function counters from the collections (#151)
     _app.add_route("/recompute_family_stats", status_resource, suffix="recompute_family_stats")  # post
+    # schedule a job that deletes the GridFS files and chunks left behind by deleted jobs (#80)
+    _app.add_route("/delete_orphaned_queue_files", status_resource, suffix="delete_orphaned_queue_files")  # post
     # schedule a job that updates all function_entries where the pichash was possibly calculated with an outdated SMDA version
     # schedule a job that rebuilds the inverted picblockhash index getUniqueBlocks reads.
     # An instance upgrading into this feature has no index and keeps using the old full scan until

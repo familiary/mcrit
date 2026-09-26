@@ -15,6 +15,49 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- `POST /delete_orphaned_queue_files` (`McritClient.deleteOrphanedQueueFiles`) schedules a job that
+  deletes the queue's GridFS data no job refers to any more: results whose job is gone, submitted
+  files no existing job uses and no submission holds, and chunks whose file document is gone. Its
+  result says how many of each it deleted; with `dry_run=true` it deletes nothing and says how many
+  it would have, which a real run can undercut when a submission claims one of the files in between.
+  This is what the deletion paths fixed below left behind, so an instance that has deleted jobs
+  before - including through the query-sample cleanup - should run it once. MongoDB reuses the space
+  freed; returning it to the operating system still takes a `compact`. A job is looked for in every
+  queue of the database, since they share its GridFS. `dry_run=true` or `dry_run=false` has to be
+  given in the query string; a request without it, or with any other value, is answered with 400
+  rather than taken as a real run. Chunks younger than an hour are left alone, as GridFS writes a
+  file's chunks before its document, and so is a file still claimed by a submission that died before
+  creating its job. The submitted files it deletes include binaries of indexed samples that an
+  earlier bulk deletion left in the queue: MCRIT never serves those, but they may be a deployment's
+  only copy of a binary, so take one first if that matters; the dry run counts them among the file
+  parameters.
+
+### Fixed
+
+- Deleting a job left its data in GridFS ([#80]). `DELETE /jobs/{id}` and the query-sample cleanup
+  removed only the `fs.files` document of the job's result and of the files it was given, never
+  their `fs.chunks`, so every submitted binary and every result stayed in the database for good,
+  unreachable. Deleting jobs in bulk (`DELETE /jobs` by method or age) removed the result with its
+  chunks, but left the submitted files linked to the deleted jobs, so nothing could ever delete
+  those. Both now delete through GridFS, which takes the chunks along, and release the jobs' files,
+  deleting each one no other job uses. A file is only deleted after clearing its hash in the same
+  update that checks it is still unused, as `clean()` already did, because a new submission of the
+  same binary claims the file by that hash; before, a submission arriving between the check and the
+  deletion could be handed a file that was deleted under it. Bulk deletion also deletes exactly the
+  jobs it listed, rather than evaluating its filter a second time, which also caught a matching job
+  submitted in between without releasing its files and then failed on the count; it works through
+  them in chunks of 10,000, and it now lowers the queue counters for what it deleted, which it
+  computed and never applied, so `/jobs/stats` went on counting bulk-deleted jobs until asked
+  `with_refresh=true` - and even that left the counts of a method with no jobs left as they were,
+  which it now sets to zero. Both lower a job's count from its state just before it is deleted
+  rather than from one read long before, so the counts rarely drift; `with_refresh=true` corrects
+  them when they do. Either deletion removes the job before its result and files, so an interruption
+  leaves only files no job refers to, which the sweep above takes, rather than a finished job
+  without its result, which a repeated request would be handed. The memory queue deletes a job's
+  unused files with it too, and deletes a job without a result.
+
 ## [1.12.0] - 2026-09-25
 
 ### Added
@@ -586,3 +629,4 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#80]: https://github.com/danielplohmann/mcrit/issues/80

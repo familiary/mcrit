@@ -118,6 +118,23 @@ class StatusResource:
         db_log_msg(self.index, req, "StatusResource.on_get_rebuild_band_df_index - success.")
         return
 
+    @timing
+    def on_post_delete_orphaned_queue_files(self, req, resp):
+        """Schedule a job that deletes the GridFS files and chunks no job refers to any more; with ``dry_run=true`` it only counts them. Answers the job id."""
+        # required, and strictly true or false: a missing, repeated or misspelt value is refused
+        # rather than taken as a real, destructive run
+        dry_run = req.params.get("dry_run")
+        dry_run = dry_run.lower().strip() if isinstance(dry_run, str) else None
+        if dry_run not in ("true", "false"):
+            resp.status = falcon.HTTP_400
+            resp.data = jsonify({"status": "failed", "data": {"message": "dry_run=true or dry_run=false has to be given in the query string."}})
+            db_log_msg(self.index, req, "StatusResource.on_post_delete_orphaned_queue_files - failed - invalid dry_run.")
+            return
+        job_id = self.index.deleteOrphanedQueueFiles(dry_run == "true", force_recalculation=True)
+        resp.data = jsonify({"status": "successful", "data": job_id})
+        db_log_msg(self.index, req, "StatusResource.on_post_delete_orphaned_queue_files - success.")
+        return
+
     def on_post_recompute_family_stats(self, req, resp):
         """Schedule a job that sets every family's sample, function and library counters from the collections, recreating missing family documents. Answers the job id."""
         job_id = self.index.recomputeFamilyStats(force_recalculation=True)

@@ -19,7 +19,7 @@ import re
 import threading
 import time
 import traceback
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import gridfs
@@ -70,6 +70,8 @@ class MongoQueue:
         self._default_insert["attempts_left"] = max_attempts
         self.fs = None
         self.fs_files = None
+        # how old a finished job has to be before clean() deletes it; effectively never, as clean()
+        # would otherwise also drop matching results people still look at (see the TODO there)
         self.cache_time: float = 10**9
         # overridden by QueueFactory from QUEUE_CLEAN_INTERVAL
         self.clean_interval: float = queue_config.QUEUE_CLEAN_INTERVAL
@@ -179,7 +181,12 @@ class MongoQueue:
         return statistics
 
     def refreshCounters(self):
+        """Recount the jobs per method and state. Counters are best-effort: a job put, taken or
+        deleted while the collection is being scanned may be counted in its old state."""
         aggregated = {}
+        # the names before the scan: a method whose first job arrives during it keeps its count
+        # instead of being zeroed for having had no jobs when the scan went past
+        counted_methods = [document["name"] for document in self._getQueueCounters().find({"name": {"$type": "string", "$ne": "workers"}}, {"name": 1})]
         for doc in self._getCollection().find():
             method = doc["payload"]["method"]
             if method not in aggregated:
@@ -187,6 +194,9 @@ class MongoQueue:
             state = self._identifyJobState(doc)
             aggregated[method][state] += 1
 
+        # a method with no jobs left is counted as zero, not left at whatever it was counted at before
+        for name in counted_methods:
+            aggregated.setdefault(name, {"queued": 0, "failed": 0, "in_progress": 0, "finished": 0, "terminated": 0})
         operations = [UpdateOne({"name": key}, {"$set": counters}, upsert=True) for key, counters in aggregated.items()]
         operations.append(UpdateOne({"last_updated": {"$ne": None}}, {"$set": {"last_updated": datetime.now()}}, upsert=True))
         if operations:
@@ -552,27 +562,44 @@ class MongoQueue:
         return self._wrap_one(self._getCollection().find_one({"_id": job_id}))
 
     def delete_job(self, job_id, with_result=True):
-        job_id = ObjectId(job_id)
-        deletable_job = self._getCollection().find_one({"_id": job_id})
-        if deletable_job:
-            self.updateQueueCounter(deletable_job["payload"]["method"], self._identifyJobState(deletable_job), -1)
-            # if job has file parameters, we need to remove them from GridFS as well
-            print(deletable_job)
-            if "file_params" in deletable_job["payload"]:
-                file_params_dict = json.loads(deletable_job["payload"]["file_params"])
-                for _, file_object_id in file_params_dict.items():
-                    file_object_id = ObjectId(file_object_id)
-                    # update gridFs entry of file to not link
-                    # to this job anymore
-                    self._getFsFiles().update_one({"_id": file_object_id}, {"$pull": {"metadata.jobs": str(job_id)}})
-                    # check if file is safe to delete
-                    if self._getFsFiles().count_documents({"_id": file_object_id, "metadata.jobs": [], "metadata.tmp_lock": 0}) > 0:
-                        self._getFsFiles().delete_one({"_id": file_object_id})
-            if with_result:
-                # delete result from GridFS
-                self._getFsFiles().delete_one({"_id": ObjectId(deletable_job["result"])})
-        job_deletion_result = self._getCollection().delete_one({"_id": job_id})
-        return job_deletion_result.deleted_count
+        # the job first, its data after: interrupted in between, this leaves files no job refers
+        # to, which delete_orphaned_files reclaims - never a finished job whose result is gone,
+        # which the job cache would keep handing out. One command, so that the state it is
+        # uncounted from is the state it was deleted in, not one a worker has moved it out of.
+        deletable_job = self._getCollection().find_one_and_delete({"_id": ObjectId(job_id)})
+        if deletable_job is None:
+            return 0
+        self.updateQueueCounter(deletable_job["payload"]["method"], self._identifyJobState(deletable_job), -1)
+        if with_result and deletable_job["result"]:
+            self._getFs().delete(ObjectId(deletable_job["result"]))
+        self._releaseFileParams(deletable_job)
+        return 1
+
+    def _releaseFileParams(self, job_document):
+        """Unlink a job from the files it was given, and delete those no other job uses any more.
+
+        Deleting goes through GridFS, which removes a file's chunks along with it; deleting only the
+        fs.files document, as this used to, left the chunks - the whole binary - behind (#80).
+        """
+        job_id = str(job_document["_id"])
+        file_ids = [ObjectId(file_id) for file_id in json.loads(job_document["payload"].get("file_params", "{}")).values()]
+        if not file_ids:
+            return
+        self._getFsFiles().update_many({"_id": {"$in": file_ids}}, {"$pull": {"metadata.jobs": job_id}})
+        for file_id in file_ids:
+            self._retireAndDeleteFile(file_id, {"metadata.jobs": [], "metadata.tmp_lock": 0})
+
+    def _retireAndDeleteFile(self, file_id, still_unused):
+        """Delete a file parameter, unless it has been claimed again since it was found unused.
+
+        Files are shared by sha256 and a new submission claims one by raising its tmp_lock through
+        that hash. Clearing the hash in the same update that re-checks `still_unused` makes the
+        file unclaimable before it is deleted, so it cannot vanish under a job just handed it.
+        """
+        if self._getFsFiles().find_one_and_update({"_id": file_id, **still_unused}, {"$set": {"metadata.sha256": None}}) is None:
+            return False
+        self._getFs().delete(file_id)
+        return True
 
     def delete_jobs(self, method=None, created_before=None, finished_before=None, with_results=True):
         filter_count = len([1 for item in [method, created_before, finished_before] if item is not None])
@@ -598,19 +625,34 @@ class MongoQueue:
                 combined_filter["$and"].append(finished_filter)
             else:
                 combined_filter = finished_filter
-        # run find() first to determine how many jobs of which method will be deleted and what their results are
-        jobs_to_be_deleted = [j for j in self._getCollection().find(combined_filter)]
-        # delete results
-        counter_updates = []
-        for deletable_job in jobs_to_be_deleted:
-            counter_updates.append((deletable_job["payload"]["method"], self._identifyJobState(deletable_job), -1))
-            if with_results and deletable_job["result"]:
-                # delete result from GridFS
-                self._getFs().delete(ObjectId(deletable_job["result"]))
-        job_deletion_result = self._getCollection().delete_many(combined_filter)
-        if len(jobs_to_be_deleted) != job_deletion_result.deleted_count:
+        # the ids first, which fixes the selection; each chunk's documents are read when it is deleted
+        jobs_to_be_deleted = list(self._getCollection().find(combined_filter, {"_id": 1}))
+        num_deleted = 0
+        # in chunks, each finished before the next starts: one $in over every id stops being a valid
+        # command beyond ~800k ids, and failing then would leave jobs whose results are already gone
+        for chunk in self._batched(jobs_to_be_deleted, 10000):
+            # by id, not by the filter again: a job matching it that arrived since find() was not
+            # counted above, and its files would not be released. The jobs go first, as in delete_job.
+            chunk_ids = [job["_id"] for job in chunk]
+            # read again just before deleting: the states from find() may be minutes old by now,
+            # and a job a worker took meanwhile would be uncounted from the state it left
+            current = list(self._getCollection().find({"_id": {"$in": chunk_ids}}))
+            deleted_now = self._getCollection().delete_many({"_id": {"$in": chunk_ids}}).deleted_count
+            num_deleted += deleted_now
+            if deleted_now == len(current):
+                self.updateQueueCounters([(job["payload"]["method"], self._identifyJobState(job), -1) for job in current])
+            else:
+                # someone else deleted some of them in between, and which ones is not known
+                self.refreshCounters()
+            for deletable_job in current:
+                if with_results and deletable_job["result"]:
+                    # delete result from GridFS
+                    self._getFs().delete(ObjectId(deletable_job["result"]))
+                # after the job is gone, so that a file shared with a job outside the selection stays
+                self._releaseFileParams(deletable_job)
+        if len(jobs_to_be_deleted) != num_deleted:
             raise Exception("Number of deleted jobs was unequal to number of jobs to delete!")
-        return job_deletion_result.deleted_count
+        return num_deleted
 
     def _file_to_grid(self, binary, metadata=None):
         object_id = self._getFs().put(binary, metadata=metadata)
@@ -722,6 +764,99 @@ class MongoQueue:
 
         # delete jobs
         self._getCollection().delete_many(job_query)
+
+    # a chunk group without its fs.files document can be a file GridFS is still writing: put()
+    # stores the chunks first, so only ids older than this are taken as leftovers
+    ORPHANED_CHUNKS_MIN_AGE = timedelta(hours=1)
+
+    def delete_orphaned_files(self, dry_run=False):
+        """Delete the GridFS data no job refers to any more, and answer how much of it was deleted.
+
+        Job deletion used to remove only a file's fs.files document, which left its chunks behind,
+        and delete_jobs never released the file parameters of the jobs it deleted (#80). This
+        reclaims what that left: results whose job is gone, file parameters no existing job uses
+        and no submission holds, and chunks whose file document is gone. With dry_run, nothing is
+        deleted and the answer is what would have been.
+
+        Files are read in batches, and only then are the jobs they name looked up: a job is
+        created before it is linked to a file or given a result, so every job a file names when it
+        is read is found, and a submission arriving during the sweep cannot lose its file to it.
+        Jobs are looked up in every queue of the database, as they all share its GridFS.
+        """
+        # taken before anything is read: a chunk group older than this was complete before the sweep began
+        chunk_cutoff = datetime.now(UTC) - self.ORPHANED_CHUNKS_MIN_AGE
+        report = {"dry_run": dry_run, "results": 0, "file_params": 0, "chunk_files": 0}
+        batch = []
+        # batch_size: a getMore after each batch is handled, so no cursor sits idle while a large one is deleted
+        for document in self._getFsFiles().find({}, {"metadata": 1}).batch_size(1000):
+            batch.append(document)
+            if len(batch) == 1000:
+                self._deleteOrphanedFileBatch(batch, dry_run, report)
+                batch = []
+        self._deleteOrphanedFileBatch(batch, dry_run, report)
+        fs_chunks = self._getCollection().database["fs.chunks"]
+        # a streamed $group rather than distinct(), whose answer is one document and capped at 16 MB
+        old_groups = (group["_id"] for group in fs_chunks.aggregate([{"$group": {"_id": "$files_id"}}], allowDiskUse=True, batchSize=1000))
+        old_groups = (files_id for files_id in old_groups if isinstance(files_id, ObjectId) and files_id.generation_time < chunk_cutoff)
+        for chunk_batch in self._batched(old_groups, 1000):
+            # checked against fs.files right before deleting, not against what the scan above saw
+            with_document = {document["_id"] for document in self._getFsFiles().find({"_id": {"$in": chunk_batch}}, {"_id": 1})}
+            orphaned = [files_id for files_id in chunk_batch if files_id not in with_document]
+            report["chunk_files"] += len(orphaned)
+            if orphaned and not dry_run:
+                fs_chunks.delete_many({"files_id": {"$in": orphaned}})
+        return report
+
+    def _deleteOrphanedFileBatch(self, documents, dry_run, report):
+        results, file_params, referenced_job_ids = [], [], set()
+        for document in documents:
+            metadata = document.get("metadata") or {}
+            if metadata.get("result"):
+                # results name their job by ObjectId (QueueRemoteCalls), file parameters by its str
+                results.append((document["_id"], str(metadata.get("job"))))
+                referenced_job_ids.add(str(metadata.get("job")))
+            elif metadata.get("tmp_lock") == 0 and isinstance(metadata.get("jobs"), list):
+                file_params.append((document["_id"], metadata["jobs"]))
+                referenced_job_ids.update(str(job_id) for job_id in metadata["jobs"])
+        if not documents:
+            return
+        existing = self._existingJobIds(referenced_job_ids)
+        orphaned_results = [file_id for file_id, job_id in results if job_id not in existing]
+        orphaned_file_params = [(file_id, jobs) for file_id, jobs in file_params if not existing.intersection(str(job_id) for job_id in jobs)]
+        if dry_run:
+            report["results"] += len(orphaned_results)
+            report["file_params"] += len(orphaned_file_params)
+            return
+        for file_id in orphaned_results:
+            self._getFs().delete(file_id)
+        report["results"] += len(orphaned_results)
+        # a submission can still claim one of them until it is retired, and then it stays
+        report["file_params"] += sum(self._retireAndDeleteFile(file_id, {"metadata.jobs": jobs, "metadata.tmp_lock": 0}) for file_id, jobs in orphaned_file_params)
+
+    def _existingJobIds(self, job_ids):
+        """Which of the given job ids (as str) belong to a job in any queue of this database, looked up in batches."""
+        database = self._getCollection().database
+        collection_names = set(database.list_collection_names())
+        # every queue keeps a counters collection next to its jobs, which tells them from other collections
+        queues = [database[name] for name in collection_names if f"{name}_counters" in collection_names and name != self._getCollection().name]
+        queues.append(self._getCollection())
+        object_ids = [ObjectId(job_id) for job_id in job_ids if ObjectId.is_valid(job_id)]
+        existing = set()
+        for id_batch in self._batched(iter(object_ids), 1000):
+            for queue in queues:
+                existing.update(str(document["_id"]) for document in queue.find({"_id": {"$in": id_batch}}, {"_id": 1}))
+        return existing
+
+    @staticmethod
+    def _batched(items, size):
+        batch = []
+        for item in items:
+            batch.append(item)
+            if len(batch) == size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
 
     def release_all_jobs(self, consumer_id=None):
         # release all jobs associated with our consumer id if they are started, locked, but not finished.
