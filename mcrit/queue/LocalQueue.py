@@ -1,10 +1,11 @@
 import json
 import logging
 import traceback
-import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
+
+from bson import ObjectId
 
 # Only do basicConfig if no handlers have been configured
 if not logging.root.handlers:
@@ -431,7 +432,8 @@ class LocalQueue:
         if sample_ids is not None and method is None:
             return []
         selected_sample_ids = set(sample_ids) if sample_ids is not None else None
-        selected_job_ids = set(job_ids) if job_ids is not None else None
+        # ids are keyed as lower-case ObjectId strings (#203), and MongoQueue parses either case
+        selected_job_ids = {str(job_id).lower() for job_id in job_ids} if job_ids is not None else None
         jobs = []
         for job_id, job_document in self._jobs.items():
             if method is not None and job_document["payload"]["method"] != method:
@@ -476,7 +478,7 @@ class LocalQueue:
         return best["_id"]
 
     def _file_to_grid(self, file, metadata=None):
-        id = str(uuid.uuid4())
+        id = str(ObjectId())
         try:
             file.seek(0)
             data = file.read()
@@ -497,7 +499,8 @@ class LocalQueue:
         return id
 
     def _grid_to_file(self, grid, results_only=True):
-        file = self._files[grid]
+        # .get() here and below, as in get_job: indexing these defaultdicts with an unknown id leaves a None entry behind
+        file = self._files.get(grid)
         if file is None:
             return None
         if results_only:
@@ -538,23 +541,21 @@ class LocalQueue:
         return self._file_to_grid(json.dumps(dicts).encode("ascii"), **kwargs)
 
     def _grid_to_dicts(self, grid, **kwargs):
-        return json.loads(self._grid_to_file(grid, **kwargs).decode("ascii"))
+        grid_file = self._grid_to_file(grid, **kwargs)
+        return None if grid_file is None else json.loads(grid_file.decode("ascii"))
 
     def _grid_to_meta(self, grid):
-        return self._files_meta[grid]
+        return self._files_meta.get(grid)
 
     def _delete_grid(self, grid):
-        meta = self._files_meta[grid]
-        try:
-            if self._hash_to_file[meta["sha256"]] == grid:
-                del self._hash_to_file[meta["sha256"]]
-        except KeyError:
-            pass
-        del self._files[grid]
-        del self._files_meta[grid]
+        # a job without a result (failed or terminated) passes None; like an unknown id it has nothing to delete
+        meta = self._files_meta.pop(grid, None)
+        self._files.pop(grid, None)
+        if meta is not None and self._hash_to_file.get(meta.get("sha256")) == grid:
+            del self._hash_to_file[meta["sha256"]]
 
     def put(self, payload, await_jobs=[], username=None):
-        id = str(uuid.uuid4())
+        id = str(ObjectId())
         job_data: Dict[str, Any] = defaultdict(lambda: None)
         job_data["_id"] = id
         job_data["number"] = self._job_counter

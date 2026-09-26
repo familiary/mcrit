@@ -15,6 +15,28 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- With memory storage and the fake queue (`STORAGE_METHOD = "memory"`, `QUEUE_METHOD = "fake"`), no
+  job or result could be fetched by id: `LocalQueue` minted `uuid4` ids, and `/jobs/{id}`,
+  `/jobs/{id}/result`, `/results/{id}` and `/results/{id}/job`, as well as `DELETE /jobs/{id}`,
+  accept only the 24 hex characters of an ObjectId, so every one of them answered 400 ([#203]).
+  `LocalQueue` now mints ObjectIds as `MongoQueue` does; the accepted id format is unchanged. The id
+  check is also anchored at the end: an id that merely started with 24 hex characters used to pass
+  it and then fail as an invalid ObjectId inside `MongoQueue`, which the client saw as a 500
+  instead of the 400 it now gets. Ids from either queue have exactly 24, so no valid request is
+  affected, and the routes hand them on in lower case, the form both queues store, so an id in
+  upper case now finds its job in `LocalQueue` too, as it always did in `MongoQueue` - and so does
+  one in a `GET /jobs?job_ids=...` selection. Reaching these
+  routes in that mode exposed `LocalQueue` indexing its file tables with ids they did not hold.
+  `/results/{id}/job` for an unknown id and `DELETE /jobs/{id}` for a job without a result (failed
+  or terminated; this one also answered 500 and left the job half deleted) each left an empty entry
+  behind, on which the next periodic clean-up, and from then on every new job, failed with a
+  `TypeError`; `/results/{id}?compact=true` for an unknown id answered 500. All three now answer
+  `null`, or delete the job, and leave the tables alone. `MongoQueue` answered every one of the
+  result routes for an unknown result id with a 500 (GridFS raising `NoFile` for its metadata) and
+  now answers `null` as well.
+
 ## [1.12.0] - 2026-09-25
 
 ### Added
@@ -586,3 +608,4 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#203]: https://github.com/danielplohmann/mcrit/issues/203

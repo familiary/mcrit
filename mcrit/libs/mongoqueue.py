@@ -643,9 +643,9 @@ class MongoQueue:
         self._getFs().delete(oid)
 
     def _grid_to_meta(self, grid):
-        oid = ObjectId(grid)
-        entry = self._getFs().get(oid)
-        return entry.metadata
+        # None for an unknown id, as _grid_to_file answers: GridFS.get raised NoFile, a 500 on /results/{id}
+        entry = self._getFs().find_one({"_id": ObjectId(grid)})
+        return None if entry is None else entry.metadata
 
     def get_cached_job_id(self, payload):
         """The job whose result a repeated request with the same descriptor should reuse.

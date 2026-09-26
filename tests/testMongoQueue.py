@@ -52,6 +52,14 @@ class MongoQueueTest(TestCase):
         job = self.queue.next()
         self.assert_job_equal(job, data)
 
+    def test_an_unknown_file_id_has_no_metadata_and_no_content(self):
+        unknown = "0" * 24
+        self.assertIsNone(self.queue._grid_to_meta(unknown))
+        self.assertIsNone(self.queue._grid_to_file(unknown))
+        self.assertIsNone(self.queue._grid_to_dicts(unknown))
+        known = self.queue._dicts_to_grid({"a": 1}, metadata={"result": True, "job": unknown})
+        self.assertEqual({"result": True, "job": unknown}, self.queue._grid_to_meta(known))
+
     def test_get_empty_queue(self):
         job = self.queue.next()
         self.assertEqual(job, None)

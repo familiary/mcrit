@@ -1,6 +1,7 @@
 import json
 import unittest
-from unittest.mock import MagicMock
+import uuid
+from unittest.mock import ANY, MagicMock, call
 
 import falcon
 import falcon.testing
@@ -93,6 +94,159 @@ class StoredBytesAccessors(unittest.TestCase):
         self.assertEqual(STORED, index.getResultBytes(result_id))
         self.assertEqual(RESULT, index.getResult(result_id))
         self.assertIsNone(index.getResultBytesForJob("0123456789abcdef01234567"))
+
+
+class JobIdsInMemoryMode(unittest.TestCase):
+    """Memory storage with the fake queue must be reachable through the job routes (#203).
+
+    LocalQueue minted uuid4 ids, which the routes reject as not being 24 hex characters, so no
+    job or result could be looked up in that mode. It now mints ObjectIds, as MongoQueue does.
+    """
+
+    def setUp(self):
+        self.index = MinHashIndex(config)
+        resource = JobResource(self.index)
+        app = falcon.App()
+        app.add_route("/jobs/{job_id}", resource)
+        app.add_route("/jobs/{job_id}/result", resource, suffix="job_result")
+        app.add_route("/results/{result_id}", resource, suffix="results")
+        app.add_route("/results/{result_id}/job", resource, suffix="result_job")
+        self.client = falcon.testing.TestClient(app)
+
+    def test_queue_ids_look_like_the_ids_mongoqueue_hands_out(self):
+        # the job id comes from LocalQueue.put, the result id from LocalQueue._file_to_grid
+        job_id = self.index.recomputeFamilyStats()
+        result_id = self.index.getJobData(job_id)["result"]
+        for queue_id in (job_id, result_id):
+            self.assertRegex(queue_id, "^[0-9a-f]{24}$")
+
+    def test_every_id_is_new(self):
+        # a repeated id does not fail cleanly: the second job's result lands on the first one's
+        # entry and awaiting it polls forever, so this has to be caught here, in milliseconds
+        queue = self.index.queue
+        job_ids = {queue.put({"method": "noSuchMethod", "descriptor": f"d{number}", "file_params": "{}"}) for number in range(20)}
+        file_ids = {queue._file_to_grid(b"x") for _ in range(20)}
+        self.assertEqual((20, 20), (len(job_ids), len(file_ids)))
+
+    def test_an_unknown_file_id_has_no_metadata(self):
+        # None, not an empty dict: delete_job indexes what it gets, and should fail loudly on a missing entry
+        queue = self.index.queue
+        self.assertIsNone(queue._grid_to_meta("0" * 24))
+        self.assertIsNone(queue._grid_to_file("0" * 24))
+        self.assertIsNone(queue._grid_to_dicts("0" * 24))
+
+    def test_a_job_and_its_result_can_be_fetched_by_id(self):
+        job_id = self.index.recomputeFamilyStats()
+        job = self.client.simulate_get(f"/jobs/{job_id}")
+        self.assertEqual(falcon.HTTP_200, job.status)
+        self.assertEqual(job_id, job.json["data"]["_id"])
+        result_id = job.json["data"]["result"]
+        expected_result = self.index.getResultForJob(job_id)
+        for path in (f"/jobs/{job_id}/result", f"/results/{result_id}"):
+            with self.subTest(path=path):
+                response = self.client.simulate_get(path)
+                self.assertEqual(falcon.HTTP_200, response.status)
+                self.assertEqual(expected_result, response.json["data"])
+        result_job = self.client.simulate_get(f"/results/{result_id}/job")
+        self.assertEqual(falcon.HTTP_200, result_job.status)
+        self.assertEqual(job_id, result_job.json["data"]["_id"])
+
+    def test_unknown_ids_answer_null_and_leave_the_queue_intact(self):
+        """A lookup must not create entries: LocalQueue keeps its files in defaultdicts, and a None
+        entry left behind by a lookup made the next clean() - and with it the next job - fail."""
+        self.index.recomputeFamilyStats()  # a real job and result for clean() to walk past
+        unknown = "0" * 24
+        for path, query in (
+            (f"/jobs/{unknown}", ""),
+            (f"/jobs/{unknown}/result", ""),
+            (f"/results/{unknown}", ""),
+            (f"/results/{unknown}/job", ""),
+            (f"/results/{unknown}", "compact=true"),
+        ):
+            with self.subTest(path=path, query=query):
+                response = self.client.simulate_get(path, query_string=query)
+                self.assertEqual(falcon.HTTP_200, response.status)
+                self.assertIsNone(response.json["data"])
+        queue = self.index.queue
+        self.assertNotIn(None, list(queue._files.values()) + list(queue._files_meta.values()))
+        queue.clean()
+
+    def test_a_job_id_selection_in_upper_case_finds_the_job(self):
+        # GET /jobs?job_ids=... (#210) matches case-insensitively on MongoQueue, which parses the ids
+        job_id = self.index.recomputeFamilyStats()
+        queue = self.index.queue
+        self.assertEqual([job_id], [job.job_id for job in queue.get_jobs(0, 10, job_ids=[job_id.upper()])])
+        self.assertEqual(1, queue.get_job_count(job_ids=[job_id.upper()]))
+
+    def test_an_id_in_upper_case_finds_the_same_job_and_result(self):
+        # MongoQueue parses either case into the same ObjectId; LocalQueue keys by the lower-case string
+        job_id = self.index.recomputeFamilyStats()
+        result_id = self.index.getJobData(job_id)["result"]
+        self.assertEqual(job_id, self.client.simulate_get(f"/jobs/{job_id.upper()}").json["data"]["_id"])
+        self.assertEqual(self.index.getResultForJob(job_id), self.client.simulate_get(f"/results/{result_id.upper()}").json["data"])
+        self.assertEqual(job_id, self.client.simulate_get(f"/results/{result_id.upper()}/job").json["data"]["_id"])
+
+    def test_a_job_without_a_result_can_be_deleted(self):
+        """A failed job has no result; deleting it made LocalQueue delete the grid entry None, which
+        created one, answered 500 and left the next clean() - and every job after it - failing."""
+        job_id = self.index.getMatchesForSample(12345)  # no such sample: the job fails
+        self.assertIsNone(self.index.getJobData(job_id)["result"])
+        response = self.client.simulate_delete(f"/jobs/{job_id}")
+        self.assertEqual(falcon.HTTP_200, response.status)
+        self.assertEqual(1, response.json["data"]["num_deleted"])
+        queue = self.index.queue
+        self.assertNotIn(None, list(queue._files.values()) + list(queue._files_meta.values()))
+        queue.clean()
+
+    def test_a_job_can_be_deleted_by_id(self):
+        job_id = self.index.recomputeFamilyStats()
+        response = self.client.simulate_delete(f"/jobs/{job_id}")
+        self.assertEqual(falcon.HTTP_200, response.status)
+        self.assertEqual(1, response.json["data"]["num_deleted"])
+        self.assertIsNone(self.index.getJobData(job_id))
+
+
+class InvalidIdsAreRejected(unittest.TestCase):
+    """Every id route answers 400 before touching the index for anything that is not exactly 24 hex characters."""
+
+    INVALID = {
+        "uuid4": str(uuid.uuid4()),
+        "23 hex": "0" * 23,
+        "25 hex": "0" * 25,
+        "24 hex and a suffix": JOB_ID + "-x",
+        "24 hex and a newline": JOB_ID + "\n",
+        "24 non-hex": "g" * 24,
+        "empty": "",
+        "missing": None,
+    }
+
+    def test_each_route_rejects_each_invalid_id(self):
+        routes = {
+            "on_get": JobResource.on_get,
+            "on_delete": JobResource.on_delete,
+            "on_get_results": JobResource.on_get_results,
+            "on_get_job_result": JobResource.on_get_job_result,
+            "on_get_result_job": JobResource.on_get_result_job,
+        }
+        for route_name, route in routes.items():
+            for label, invalid_id in self.INVALID.items():
+                with self.subTest(route=route_name, id=label):
+                    index = MagicMock()
+                    resp = falcon.Response()
+                    route(JobResource(index), falcon.Request(falcon.testing.create_environ(path="/jobs")), resp, invalid_id)
+                    self.assertEqual(falcon.HTTP_400, resp.status)
+                    # the only call allowed is the audit log entry db_log_msg writes for the rejection
+                    self.assertEqual([call._storage.dbLogEvent(ANY, username="anonymous")], index.method_calls)
+
+    def test_a_valid_id_reaches_the_index_in_lower_case(self):
+        for valid_id in (JOB_ID, JOB_ID.upper()):
+            with self.subTest(id=valid_id):
+                index = MagicMock()
+                index.getJobData.return_value = None
+                resp = falcon.Response()
+                JobResource(index).on_get(falcon.Request(falcon.testing.create_environ(path="/jobs")), resp, valid_id)
+                self.assertNotEqual(falcon.HTTP_400, resp.status)
+                index.getJobData.assert_called_once_with(JOB_ID)
 
 
 class JobCollectionSelectorsTest(unittest.TestCase):
