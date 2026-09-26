@@ -36,8 +36,8 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   `STORAGE_DROP_DISASSEMBLY`) cannot be rehashed completely, so it stays counted until it is
   deleted and submitted again. Rewritten block hashes mark the picblockhash index incomplete until
   `rebuildPicBlockHashIndex` runs, as any recalculation that changes block hashes does, and
-  unique-blocks results computed before stay in the job cache until requested with
-  `force_recalculation`.
+  unique-blocks results computed before stay in the job cache until their job is deleted
+  (`DELETE /jobs/<job_id>`), since the unique-blocks routes do not take `force_recalculation`.
 
 ### Fixed
 
