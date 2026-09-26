@@ -21,7 +21,8 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   answered with a job computed before an upgrade that changed such results.** A job's cache key
   held the method, its parameters and the hashes of uploaded files, so after an upgrade that
   changes what these reports hold, asking again returned the job the old code computed until
-  someone passed `force_recalculation`. These jobs now record a results version
+  someone passed `force_recalculation`, or deleted the job for unique blocks, whose routes do not
+  take that flag. These jobs now record a results version
   (`mcrit.Worker.RESULTS_VERSION`, appended to the job descriptor) and are only reused within one.
   NOTE that after upgrading to this release, and after any later release that bumps the version,
   the first repeat of each request (the same method and parameters, or the same uploaded file for
