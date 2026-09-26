@@ -27,15 +27,17 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   before 2.1.0 computed**, which escaped every block as Intel code, and `/status` counts them as
   `num_samples_with_stale_picblockhashes` ([#240]). Samples stored from now on record the
   picblocks their block hashes came from (`picblockhash_version`); a non-Intel sample without that
-  record (every one stored or imported before), or with an older one, is rehashed and then
-  recorded. Intel samples are left to the existing SMDA version check, since their block hashes did
-  not change. NOTE that a sample with a function whose disassembly is gone (e.g. dropped with
+  record, or with an older one, is rehashed and then recorded. That covers every sample stored
+  before, and every imported one, whose block hashes another instance computed. Intel samples are
+  left to the existing SMDA version check, since their block hashes did not change. MongoDB storage
+  only; the in-memory storage has no recalculation and leaves the count out of `/status`.
+
+  NOTE that a sample with a function whose disassembly is gone (e.g. dropped with
   `STORAGE_DROP_DISASSEMBLY`) cannot be rehashed completely, so it stays counted until it is
-  deleted and submitted again; that rewritten block hashes mark the picblockhash index incomplete
-  until `rebuildPicBlockHashIndex` runs, as any recalculation that changes block hashes does; and
-  that unique-blocks results computed before stay in the job cache until requested with
-  `force_recalculation`. MongoDB storage only; the in-memory storage has no recalculation and leaves
-  the count out of `/status`.
+  deleted and submitted again. Rewritten block hashes mark the picblockhash index incomplete until
+  `rebuildPicBlockHashIndex` runs, as any recalculation that changes block hashes does, and
+  unique-blocks results computed before stay in the job cache until requested with
+  `force_recalculation`.
 
 ### Fixed
 
