@@ -15,6 +15,12 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- `docs/limitations.md` records what the data model deliberately leaves out, starting with
+  functions whose body a linker folded under several names: MCRIT keeps one of them, which bounds
+  attribution by name and understates it when scored against a single expected name ([#126]).
+
 ## [1.12.0] - 2026-09-25
 
 ### Added
@@ -586,3 +592,4 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#126]: https://github.com/danielplohmann/mcrit/issues/126

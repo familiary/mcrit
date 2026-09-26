@@ -163,6 +163,8 @@ class StorageInterface:
     def updateFunctionLabels(self, smda_report: "SmdaReport", username: str) -> Optional["SampleEntry"]:
         """Use a given SMDA report to update all non-dummy function labels for the SampleEntry matching its SHA256
         If no matching SampleEntry exists, no update happens.
+        One name per function address is taken, the one the report gives: other names a linker folded
+        onto the same body (identical code folding) are not recorded - see docs/limitations.md.
 
         Args:
             smda_report: the SmdaReport to be used for updating function labels
