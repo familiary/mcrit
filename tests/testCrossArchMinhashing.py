@@ -84,19 +84,16 @@ CIL_MINHASH_ONLY_OFFSETS = [
     0x2A3C,  # score 68.75
 ]
 CIL_PICHASH_OFFSETS = []
-# Dalvik (#239): two functions from smda's own Dalvik test sample (tests/blockblast_classes_xored in
-# the smda repository, a classes.dex XORed with the byte index, sha256 70f65a5d...), in report A as
-# smda disassembles it. No second build of that app is at hand, so report B holds the same two
-# functions from a copy of the DEX with one instruction of the enum initializer at 0x1680c changed -
-# sput-object at 0x1684a turned into const-string, the same 21c format, so nothing else moves - and
-# its checksum and signature recomputed (sha256 530b98a6...). Both reports keep only these two
-# functions; their statistics are cut down to them, other report metadata (code areas, binweight)
-# still describes the whole DEX.
+# Dalvik (#239): two builds of the HackingTeam RCS Android implant, classes.dex of APK 87efe6a1... (A)
+# and of APK 07278c56... (B). Both reports keep only three of the implant's own methods; their
+# statistics are cut down to them, other report metadata (code areas, binweight) still describes the
+# whole DEX.
 DALVIK_MINHASH_ONLY_OFFSETS = [
-    0x1680C,  # score 57.8125 against its changed copy
+    0x16D0C,  # HttpUtils.uploadFile, score 87.5 (189 instructions in A, 161 in B)
+    0x205F8,  # Logger.WriteErrorLog, score 81.25
 ]
 DALVIK_PICHASH_OFFSETS = [
-    0xFF5C,  # score 100.0, unchanged
+    0x19B10,  # Serialization.binarySerialize, score 100.0
 ]
 
 
