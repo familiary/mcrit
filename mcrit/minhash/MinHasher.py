@@ -12,6 +12,14 @@ from mcrit.minhash.ShingleLoader import ShingleLoader
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
 
+# Bumped by every change that alters what a shingler produces for some architecture, and recorded
+# per sample next to the smda version its minhashes were escaped with (#238).
+MINHASH_SHINGLER_REVISION = 1
+# Per architecture whose shingling changed, the first revision whose minhashes are current. A sample
+# of that architecture recorded at an older revision, or at none, holds stale minhashes, which
+# repairMinHashes rehashes and /status counts. 1: FuzzyStatPairShingler reads AArch64 frame sizes.
+SHINGLER_REVISION_SINCE = {"aarch64": 1}
+
 
 class MinHasher:
     MINHASH_STRATEGY_HASH_ALL = 1
