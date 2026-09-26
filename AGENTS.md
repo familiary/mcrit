@@ -116,6 +116,7 @@ mcrit client submit <file> -f <family_name>
 - Supported Python: 3.12+ (`requires-python = ">=3.12"`).
 - License: GPL-3.0-only. The version is bumped manually in **three** places that must agree — `pyproject.toml`, `McritConfig.VERSION` (served by the `/version` endpoint), and the newest entry in `CHANGELOG.md` — do not change unless asked. `tests/testReleaseGuard.py` asserts the first two agree, and the release workflow refuses a tag that does not match all three. Every PR that changes `mcrit/` adds an entry under `## [Unreleased]` or carries the `no-changelog` label. How a release is cut is in [`RELEASING.md`](RELEASING.md).
 - Never introduce or log secrets/API tokens/keys.
+- A change that alters what a match report, cross compare or unique-blocks result holds for the same corpus and parameters bumps `RESULTS_VERSION` in `mcrit/Worker.py`, so cached jobs computed before it are not handed out again (#241).
 
 ## Agent guardrails
 

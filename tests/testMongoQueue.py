@@ -21,11 +21,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)-15s %(message)s")
 logging.disable(logging.CRITICAL)
 
 
-def _payload(method, *params, **kwparams):
+def _payload(method, *params, results_version=None, **kwparams):
     """A job payload built the way QueueRemoteCalls.remote_call_function builds one for a
     real call, e.g. _payload("getMatchesForSampleVs", 8, 12, band_matches_required=2)."""
     parsed_params, file_params = rearrange_params(list(params), dict(kwparams), [], [])
-    descriptor = get_descriptor(method, parsed_params, {})
+    descriptor = get_descriptor(method, parsed_params, {}, results_version=results_version)
     return _createJobPayload(method, parsed_params, file_params, descriptor)
 
 
@@ -498,6 +498,16 @@ class MongoQueueSelectorTest(TestCase):
         # 1 is a text prefix of 12: [,}] after the id in the regex must keep them apart
         selected_one = self.queue.get_jobs(0, 100, method="getMatchesForSample", sample_ids=[1])
         self.assertEqual([job_1], [job.job_id for job in selected_one])
+
+    def test_sample_ids_selects_jobs_with_a_results_version(self):
+        # #241 appends the results version to the descriptor; the selector reads its first argument
+        versioned_8 = self.queue.put(_payload("getMatchesForSample", 8, results_version=1))
+        versioned_12 = self.queue.put(_payload("getMatchesForSample", 12, band_matches_required=2, results_version=1))
+        unversioned_8 = self.queue.put(_payload("getMatchesForSample", 8))
+        selected = self.queue.get_jobs(0, 100, method="getMatchesForSample", sample_ids=[8])
+        self.assertEqual({versioned_8, unversioned_8}, {job.job_id for job in selected})
+        selected = self.queue.get_jobs(0, 100, method="getMatchesForSample", sample_ids=[12])
+        self.assertEqual([versioned_12], [job.job_id for job in selected])
 
     def test_sample_ids_read_only_their_own_keys_of_the_descriptor_index(self):
         # a single regex with an alternation gets no index bounds and is tested against every key;

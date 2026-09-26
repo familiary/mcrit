@@ -165,7 +165,7 @@ def RemotifyFunctionWrapper(function):
 
         # get descriptor:
         hashes = hash_all(file_params)
-        descriptor = get_descriptor(name, params, hashes)
+        descriptor = get_descriptor(name, params, hashes, results_version=function.results_version)
 
         # Evaluate Cached jobs
         if not force_recalculation:
@@ -247,8 +247,18 @@ def hash_all(d):
     return {key: sha256(val) for key, val in d.items()}
 
 
-def get_descriptor(name, params, hashes):
-    return json.dumps((name, params, hashes), sort_keys=True)
+def get_descriptor(name, params, hashes, results_version=None):
+    """What identifies a request, so a repeated one can reuse the job that answered it.
+
+    A method whose result is a report computed from the corpus declares a results_version
+    (see Remote). It is appended as a fourth element, so a job made before a release that
+    changed such reports - or before the version was recorded at all - is not handed out
+    again. Readers that take the parameters or hashes by position ([1], [2], and the
+    anchored "0" regex of MongoQueue's sample_ids selector) are unaffected.
+    """
+    if results_version is None:
+        return json.dumps((name, params, hashes), sort_keys=True)
+    return json.dumps((name, params, hashes, {"results_version": results_version}), sort_keys=True)
 
 
 def upload_file_params(self, file_params, hashes):
@@ -285,10 +295,11 @@ def _createJobPayload(method_name, params, grid_params, descriptor):
 
 
 # Marks Functions within a QueueRemoteCallee
-def Remote(progress=False, file_locations=[], kwfile_locations=[], json_locations=[], kwjson_locations=[]):
+def Remote(progress=False, file_locations=[], kwfile_locations=[], json_locations=[], kwjson_locations=[], results_version=None):
     def change_function(function):
         function.remote = True
         function.progressor = progress
+        function.results_version = results_version
         function.file_locations = file_locations
         function.kwfile_locations = kwfile_locations
         function.json_locations = json_locations

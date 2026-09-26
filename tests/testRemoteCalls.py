@@ -4,6 +4,7 @@ import time
 import unittest
 from threading import Thread
 from unittest import TestCase
+from unittest.mock import patch
 
 import pymongo
 import pytest
@@ -20,6 +21,7 @@ from mcrit.queue.QueueRemoteCalls import (
     Remote,
     _createJobPayload,
     get_descriptor,
+    rearrange_params,
     upload_file_params,
 )
 
@@ -60,6 +62,10 @@ class myWorker(QueueRemoteCallee):
 
     def function_that_isnt_remote(self, a, b, c):
         pass
+
+    @Remote(results_version=1)
+    def versioned(self, i):
+        return i
 
     @Remote()
     def child_job(self, i):
@@ -215,6 +221,25 @@ class LocalQueueRemoteCallTest(TestCase):
                 job_id_1 = self.caller.test(*params, **kwparams)
                 job_id_2 = self.caller.test(*params, force_recalculation=True, **kwparams)
                 self.assertNotEqual(job_id_1, job_id_2)
+        self.queue.clear()
+
+    def test_job_cache_keeps_results_versions_apart(self):
+        # #241: a job computed before a release changed its kind of report is not handed out again
+        params, _ = rearrange_params([7], {}, [], [])
+        unversioned = str(self.queue.put(_createJobPayload("versioned", params, {}, get_descriptor("versioned", params, {}))))
+        job_id_1 = self.caller.versioned(7)
+        self.assertNotEqual(unversioned, job_id_1)
+        self.caller.awaitResult(job_id_1)
+        self.assertEqual(job_id_1, self.caller.versioned(7))
+        with patch.object(myWorker.versioned, "results_version", 2):
+            job_id_2 = self.caller.versioned(7)
+            self.assertNotIn(job_id_2, (unversioned, job_id_1))
+            self.caller.awaitResult(job_id_2)
+            self.assertEqual(job_id_2, self.caller.versioned(7))
+        self.assertEqual(job_id_1, self.caller.versioned(7))
+        # and the descriptor still reads the way its positional readers expect
+        descriptor = loads(self.queue.get_job(job_id_1).payload["descriptor"])
+        self.assertEqual(["versioned", {"0": 7}, {}, {"results_version": 1}], descriptor)
         self.queue.clear()
 
     def _set_job_fields(self, job_id, **fields):
