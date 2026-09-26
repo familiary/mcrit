@@ -932,8 +932,13 @@ class MemoryStorage(StorageInterface):
             "num_samples": len(sample_ids),
         }
         candidate_picblockhashes: Dict[int, Dict[str, Any]] = {}
+        wanted_sample_ids = set(sample_ids)
         for function_id, entry in self._functions.items():
             sample_id = entry.sample_id
+            # the blocks of the samples asked about only, as MongoDbStorage reads them; a block
+            # another sample holds too is removed below
+            if sample_id not in wanted_sample_ids:
+                continue
             for block_entry in entry.picblockhashes:
                 block_hash = block_entry["hash"]
                 if block_hash not in candidate_picblockhashes:
@@ -955,7 +960,7 @@ class MemoryStorage(StorageInterface):
         LOGGER.info(f"Found {len(candidate_picblockhashes)} candidate picblock hashes")
         for functiond_id, entry in self._functions.items():
             sample_id = entry.sample_id
-            if sample_id not in sample_ids:
+            if sample_id not in wanted_sample_ids:
                 for block_entry in entry.picblockhashes:
                     candidate_picblockhashes.pop(block_entry["hash"], None)
         # update statistics again after having reduced to results
