@@ -78,6 +78,9 @@ class UniqueBlocksResult:
         # we need to filter first, according to the desired parameters
         filtered_blocks: Dict[int, Dict[str, Any]] = {}
         for block_hash, entry in self.unique_blocks.items():
+            # no disassembly stored for its function: nothing to write a pattern from
+            if not entry.get("instructions"):
+                continue
             if min_ins and entry["length"] < min_ins:
                 continue
             if max_ins and entry["length"] > max_ins:

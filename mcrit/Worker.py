@@ -31,6 +31,7 @@ from mcrit.minhash.MinHasher import MinHasher
 from mcrit.queue.LocalQueue import Job
 from mcrit.queue.QueueFactory import QueueFactory
 from mcrit.queue.QueueRemoteCalls import NoProgressReporter, QueueRemoteCallee, Remote
+from mcrit.storage.FunctionEntry import smdaFunctionFromXcfg
 from mcrit.storage.SampleEntry import SampleEntry
 from mcrit.storage.StorageFactory import StorageFactory
 
@@ -424,6 +425,9 @@ class Worker(QueueRemoteCallee):
         blocks covering the least covered sample, i.e. the k the cover actually achieved. It also
         echoes the two parameters, so a result says what shaped it, and "blocks_considered" records
         how many blocks survived min_instructions while the counts above describe everything found.
+        "blocks_without_instructions" counts the blocks found whose function was stored without its
+        disassembly: they are left out of unique_blocks and of the cover, having no instructions to
+        show and no bytes to match on.
         """
         # TODO we could propagate this progress reporter into the storage function for more fine grained progress tracking
         progress_reporter.set_total(1)
@@ -433,9 +437,15 @@ class Worker(QueueRemoteCallee):
         blocks_result_dict["statistics"]["has_yara_rule"] = False
         blocks_result_dict["statistics"]["yara_covers"] = 0
         blocks_result_dict["statistics"]["has_complete_yara_rule"] = False
+        # a block whose function has no disassembly (STORAGE_DROP_DISASSEMBLY, #42) has no
+        # instructions to show and no bytes to match on: it is counted rather than returned, since
+        # whatever renders the blocks reads their instructions, and it can never join the cover
+        found_blocks = blocks_result_dict["unique_blocks"]
+        unique_blocks = {block_hash: entry for block_hash, entry in found_blocks.items() if entry["instructions"]}
+        blocks_result_dict["statistics"]["blocks_without_instructions"] = len(found_blocks) - len(unique_blocks)
         if min_instructions:
-            blocks_result_dict["unique_blocks"] = {block_hash: entry for block_hash, entry in blocks_result_dict["unique_blocks"].items() if entry["length"] >= min_instructions}
-        unique_blocks = blocks_result_dict["unique_blocks"]
+            unique_blocks = {block_hash: entry for block_hash, entry in unique_blocks.items() if entry["length"] >= min_instructions}
+        blocks_result_dict["unique_blocks"] = unique_blocks
         blocks_result_dict["statistics"]["covers_required"] = covers_required
         blocks_result_dict["statistics"]["min_instructions"] = min_instructions
         blocks_result_dict["statistics"]["blocks_considered"] = len(unique_blocks)
@@ -598,10 +608,20 @@ class Worker(QueueRemoteCallee):
         minhashes = []
         smda_functions = []
         LOGGER.info("Calculating MinHashes: hashing for %d function entries requested.", len(function_entries))
+        without_disassembly = 0
         for func in function_entries:
             binary_info = BinaryInfo(b"")
             binary_info.architecture = func.architecture
-            smda_functions.append((func.function_id, SmdaFunction.fromDict(func.xcfg, binary_info=binary_info)))
+            smda_function = smdaFunctionFromXcfg(func.xcfg, binary_info)
+            if smda_function is None:
+                without_disassembly += 1
+                continue
+            smda_functions.append((func.function_id, smda_function))
+        if without_disassembly:
+            # a function whose disassembly was dropped (STORAGE_DROP_DISASSEMBLY, or over the 16 MiB
+            # document limit, #42) cannot be hashed; failing the batch would leave every other
+            # function in it unhashed as well, on every retry
+            LOGGER.warning("Calculating MinHashes: %d function entries have no stored disassembly and are skipped.", without_disassembly)
         # filter down to functions that fulfill size requirements
         smda_functions = [(function_id, smda_function) for function_id, smda_function in smda_functions if self.minhasher.isMinHashableFunction(smda_function)]
         LOGGER.info("Calculating MinHashes: %d function entries are indexable.", len(smda_functions))

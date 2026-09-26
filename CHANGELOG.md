@@ -15,6 +15,39 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **One function stored without its disassembly failed every function hashed beside it.** A
+  function's `xcfg` reads back as `{}` once `STORAGE_DROP_DISASSEMBLY` removed it, once a blob over
+  MongoDB's 16 MiB limit was dropped at insert ([#42]), or after importing an export of such an
+  instance, and smda rejects `{}` ("serialized function is incomplete"; smda before 4.4.5 raised
+  `KeyError`). `Worker.calculateMinHashes` handed it over anyway, so the minhashing job of that
+  sample - and every `complete_minhashes` batch of 10,000 functions it fell into - failed, on
+  every retry; `recalculateAllPicHashes` stopped on a stored `{}` and link-hunt clustering
+  (`MatchingResult.clusterLinkHuntResult`) on an entry whose disassembly was dropped. All of them now
+  rebuild through one helper, `FunctionEntry.smdaFunctionFromXcfg`, skip such a function and log
+  one warning per call with the number skipped; `recalculateAllPicHashes` no longer counts a
+  skipped function's old block hashes in `picblockhashes_updatable`.
+  `FunctionEntry.toSmdaFunction` answers `None` for it, so a caller that used its result
+  unchecked now has to handle `None`. An `xcfg` that is present but lacks a field smda requires
+  still raises, now naming the fields. The cause does not depend on the smda version: every smda
+  release MCRIT supports requires the same fields (4.4.5 and newer check for them, older ones read
+  them unconditionally), and none can rebuild a function from `{}`. A skipped function stays
+  without a minhash, and the warning with the count is the only trace of it.
+
+  The unique-blocks job (`getUniqueBlocks`) failed the same way, with `KeyError: 'blocks'`, when a
+  candidate block's function had no disassembly: MemoryStorage only guarded against `None`, and
+  MongoDbStorage decoded a missing or `{}` blob to `{}` and indexed it anyway. Such blocks are now
+  reported without instructions (an empty `instructions` list and `escaped_sequence`) on both
+  backends, as MemoryStorage already did for a block offset its xcfg lacks, instead of failing the
+  job. The job leaves them out of its result and counts them in
+  `statistics["blocks_without_instructions"]`: with no instructions to show and no bytes to match
+  on, a block cover that picked them claimed a complete rule that then failed to render (`max()` of
+  no instructions) or rendered an empty, invalid string, and MCRITweb's block table fails on a
+  block without instructions the same way. `UniqueBlocksResult.generateBlockCover` skips such a
+  block too, for results stored before. A sample hashed under `STORAGE_DROP_DISASSEMBLY` therefore
+  completes the job with no unique blocks to show and no YARA rule, and says why in that count.
+
 ## [1.12.0] - 2026-09-25
 
 ### Added

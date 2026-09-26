@@ -985,9 +985,11 @@ class MemoryStorage(StorageInterface):
         for function_id, entry in self._functions.items():
             if function_id not in function_id_to_block_offsets.keys():
                 continue
-            if entry.xcfg is None:
+            # an xcfg is None when not loaded and {} once its disassembly was dropped
+            # (STORAGE_DROP_DISASSEMBLY, #42); either way its blocks keep no instructions
+            blocks = (entry.xcfg or {}).get("blocks")
+            if not blocks:
                 continue
-            blocks = entry.xcfg["blocks"]
             for block_offset, picblockhash in function_id_to_block_offsets[function_id]:
                 # a live xcfg (from SmdaFunction.toDict()) keys blocks by int, while one that has
                 # been through a JSON round trip keys them by str - accept either

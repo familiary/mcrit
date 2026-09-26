@@ -36,7 +36,7 @@ from mcrit.index.SearchQueryTree import (
 from mcrit.libs.utility import decode_two_complement, encode_two_complement
 from mcrit.minhash.MinHash import MinHash
 from mcrit.storage.FamilyEntry import FamilyEntry
-from mcrit.storage.FunctionEntry import FunctionEntry
+from mcrit.storage.FunctionEntry import FunctionEntry, smdaFunctionFromXcfg
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
 from mcrit.storage.MatchingCache import MatchingCache
 from mcrit.storage.SampleEntry import SampleEntry
@@ -2723,6 +2723,12 @@ class MongoDbStorage(StorageInterface):
                     xcfg_missing += 1
                     continue
                 smda_xcfg = json.loads(function_document["_xcfg"])
+                # rebuilt before anything is counted: a function stored as {} is skipped, and its
+                # old block hashes are not updatable
+                smda_function = smdaFunctionFromXcfg(smda_xcfg, binary_info)
+                if smda_function is None:
+                    xcfg_missing += 1
+                    continue
                 old_pichash = int(function_document["_pichash"], 16)
                 old_blockhashes = []
                 if "_picblockhashes" in function_document:
@@ -2730,7 +2736,6 @@ class MongoDbStorage(StorageInterface):
                         blockhash["hash"] = int(blockhash["hash"], 16)
                         old_blockhashes.append(blockhash)
                     picblockhashes_updatable += len(old_blockhashes)
-                smda_function = SmdaFunction.fromDict(smda_xcfg, binary_info=binary_info)
                 new_pichash = smda_function.getPicHash(binary_info)
                 if old_pichash != new_pichash:
                     functions_updated += 1
@@ -2979,8 +2984,14 @@ class MongoDbStorage(StorageInterface):
             # inline `_xcfg` is the fallback for pre-migration documents (see _attachXcfgBlobs)
             entry["_xcfg"] = block_xcfg_blobs.get(function_id) or entry.get("_xcfg") or "{}"
             self._decodeXcfg(entry)
+            # a function whose disassembly was dropped (STORAGE_DROP_DISASSEMBLY, #42) decodes to {}:
+            # its blocks keep no instructions rather than failing the whole job, as in MemoryStorage
+            blocks = entry["xcfg"].get("blocks") or {}
             for block_offset, picblockhash in function_id_to_block_offsets[function_id]:
-                candidate_picblockhashes[picblockhash]["instructions"] = entry["xcfg"]["blocks"][str(block_offset)]
+                block_instructions = blocks.get(str(block_offset))
+                if block_instructions is None:
+                    continue
+                candidate_picblockhashes[picblockhash]["instructions"] = block_instructions
         LOGGER.info(f"Instructions for {len(candidate_picblockhashes)} blocks extracted.")
         return {"statistics": block_statistics, "unique_blocks": candidate_picblockhashes}
 
