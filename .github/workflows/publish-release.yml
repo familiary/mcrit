@@ -165,11 +165,17 @@ jobs:
 
           import mcrit
           from mcrit.config.McritConfig import McritConfig
+          from mcrit.shinglers.LogBucket import LogBucket
 
           installed = pathlib.Path(mcrit.__file__).parent
           assert "site-packages" in str(installed), f"imported a source tree: {installed}"
           assert McritConfig.VERSION == os.environ["VERSION"], McritConfig.VERSION
-          assert (installed / "cache" / "logbuckets.json").exists(), "package data did not ship"
+
+          def refuse_to_build(self):
+              raise AssertionError("package data did not ship: the default logbucket table had to be rebuilt")
+
+          LogBucket._buildTable = refuse_to_build
+          assert len(LogBucket()._value_to_bucket_range) == 100000
           assert not (installed / "shinglers" / "archived").exists(), "archived shinglers shipped"
           print(f"mcrit {McritConfig.VERSION} imported from {installed}")
           PY

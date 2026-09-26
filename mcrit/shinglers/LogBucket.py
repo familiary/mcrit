@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+from typing import Dict, List, Tuple
 
 # Only do basicConfig if no handlers have been configured
 if not logging.root.handlers:
@@ -44,29 +45,58 @@ class LogBucket:
     As a result, with increasing values, buckets become wider and allow for a "scaled" amount of Fuzziness.
     """
 
-    _value_to_bucket_range = {}
+    # tables by (max_value, bucket_width), shared by the instances of this class, as ShingleLoader
+    # constructs each shingler twice and each MinHasher would otherwise build the table twice; the
+    # tables and the ranges getLogBucketRange returns from them must therefore never be modified
+    _tables: Dict[Tuple[int, int], Dict[int, List[int]]] = {}
 
     def __init__(self, max_value=100000, bucket_width=1):
+        # checked here rather than left to fail on the first lookup, far from the configuration at fault
+        for name, value in (("max_value", max_value), ("bucket_width", bucket_width)):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"LogBucket needs an int {name}, got {value!r}")
+        if max_value < 1 or bucket_width < 0:
+            raise ValueError(f"LogBucket needs max_value >= 1 and bucket_width >= 0, got {max_value} and {bucket_width}")
         self._max_value = max_value
         self._bucket_width = bucket_width
         self._init_buckets()
 
     def _init_buckets(self):
-        this_path = str(os.path.abspath(__file__))
-        root_path = os.sep.join(this_path.split(os.sep)[:-3])
-        bucket_path = os.sep.join([root_path, "mcrit", "cache", "logbuckets.json"])
-        os.makedirs(os.path.dirname(bucket_path), exist_ok=True)
-        value_to_bucket_range = {}
+        key = (self._max_value, self._bucket_width)
+        if key not in LogBucket._tables:
+            LogBucket._tables[key] = self._loadTable()
+        self._value_to_bucket_range = LogBucket._tables[key]
+        self._recordTableBounds()
+
+    def _loadTable(self):
+        # The table only depends on max_value and bucket_width, so the file carries both in its name:
+        # asking for other parameters must never be answered with a table built for the defaults.
+        # Only the defaults' table is shipped. Any other is built here and kept in memory, never
+        # written: the package directory may be read-only, and several workers start at once.
+        bucket_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache", f"logbuckets_{self._max_value}_{self._bucket_width}.json")
         if os.path.isfile(bucket_path):
             with open(bucket_path) as fjson:
-                value_to_bucket_range = json.load(fjson)
-            self._value_to_bucket_range = {int(bucket): value for bucket, value in value_to_bucket_range.items()}
-            self._recordTableBounds()
-            return
-        else:
-            LOGGER.info(f"Calculating logbuckets for the first time - we will cache them for future use @{bucket_path}")
+                return {int(value): bucket_range for value, bucket_range in json.load(fjson).items()}
+        LOGGER.info(f"No shipped logbucket table for max_value={self._max_value}, bucket_width={self._bucket_width}, calculating it")
+        # Every range should hold the centre bucket and bucket_width buckets either side. From
+        # bucket_width 5 on, the slice start goes negative for the lowest values past the width,
+        # giving them an empty or wrong range; a max_value too small for its width runs the top
+        # values past the buckets built, giving a short range or an IndexError.
+        try:
+            table = self._buildTable()
+        except IndexError:
+            table = {}
+        malformed = [value for value in range(self._max_value) if len(table.get(value, ())) != 2 * self._bucket_width + 1]
+        if malformed:
+            raise ValueError(f"bucket_width={self._bucket_width} is too wide for max_value={self._max_value}: values {malformed[:5]} get no proper bucket range")
+        return table
+
+    def _buildTable(self):
         value_to_bucket_id = {}
+        value_to_bucket_range = {}
         buckets = []
+        # a set for the membership test: the list alone made building the default table take 1.3 s instead of 0.2 s
+        known_buckets = set()
         # first generate a list of logarithmically-scaled buckets and map to their values of origin
         for value in range(self._max_value * 2):
             log_value = math.log(value, 2) if value > 0 else 0
@@ -76,7 +106,8 @@ class LogBucket:
             else:
                 window_size = 2 ** math.floor(floored_exponent / 2)
                 middle_bucket = window_size * math.ceil(value / window_size)
-            if middle_bucket not in buckets:
+            if middle_bucket not in known_buckets:
+                known_buckets.add(middle_bucket)
                 buckets.append(middle_bucket)
             value_to_bucket_id[value] = len(buckets) - 1
         # as these would have incremental steps at values that are divisible by 2, we center around best fitting buckets per value.
@@ -105,20 +136,13 @@ class LogBucket:
                     bucket_range.append(buckets[index])
             if len(bucket_range):
                 value_to_bucket_range[value] = bucket_range
-        self._value_to_bucket_range = value_to_bucket_range
-        self._recordTableBounds()
-        with open(bucket_path, "w") as fjson:
-            json.dump(value_to_bucket_range, fjson)
+        return value_to_bucket_range
 
     def _recordTableBounds(self):
         """Remember the range the table actually covers, for clamping.
 
-        Not derived from max_value on purpose. The cache file name carries none of the
-        parameters it was built with, so an instance asking for one max_value can be served a
-        table built for another - LogBucket(1024, 1) returns the cached 100,000-entry table.
-        Until that is fixed upstream, the only bounds that can be trusted are the ones present.
-        Entries are also skipped where a bucket range comes out empty, so the top key is not
-        guaranteed to be max_value - 1 even on a freshly built table.
+        That is 0 and max_value - 1 for any table accepted, since a malformed one is refused, but
+        reading the bounds from the table keeps the clamp from ever naming a missing key.
         """
         self._lowest_value = min(self._value_to_bucket_range) if self._value_to_bucket_range else 0
         self._highest_value = max(self._value_to_bucket_range) if self._value_to_bucket_range else 0
