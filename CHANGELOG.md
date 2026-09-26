@@ -15,6 +15,26 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **With `STORAGE_BAND_BUCKET_SIZE` set, a band hash that deletions shrank back under
+  `STORAGE_BAND_DF_CUTOFF` lost the candidates in its upper buckets.** The df-indexed lookup
+  matches bucket 0 alone, the only document carrying df. For a hash that never spilled that is all
+  of it, and a spilled hash has a df the cutoff rejects - but pulls can bring a spilled hash's df
+  back under the cutoff while its surviving postings sit in buckets above 0. The lookup then
+  returned bucket 0's postings only, often none, and matching treated the hash as one without
+  candidates, with no error. A lookup now also fetches the upper buckets of every admitted hash
+  whose bucket 0 names a tail above 0, in one indexed query per band; only deletions produce such
+  a hash, so the query is normally never made, and the df index flag is now read once per lookup
+  rather than once per band. This covers the df-indexed lookup; the `$size` fallback, used only
+  until `rebuild_band_df_index` has run once after enabling bucketing, still measures bucket 0
+  alone. The df match now admits bucket 0 alone, so a stray df on an upper bucket (only switching
+  bucketing back off, which is unsupported, stamps one) cannot admit that bucket twice, and a
+  lookup reads a bucket 0 without a posting list as an empty one instead of failing the job with
+  `KeyError: 'function_ids'`. `getCandidatesForMinHash`, the single-function lookup no matcher
+  uses but the storage interface offers, read only the first document the lookup returned, so
+  under bucketing it missed every bucket but one even without a cutoff; it reads them all now.
+
 ## [1.12.0] - 2026-09-25
 
 ### Added

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import unittest
+from unittest import mock
 
 import pytest
 from smda.common.SmdaReport import SmdaReport
@@ -251,6 +252,113 @@ class BandBucketingTest(unittest.TestCase):
         storage = self._rawStorage(2, "pull_unknown")
         storage._updateBands({0: {4242: [1]}}, method="pull")
         self.assertEqual(self._bandState(storage), [])
+
+    def _candidates(self, storage, band_hash, band_matches_required=1):
+        """The candidates every lookup path finds for a query function whose band 0 hash is band_hash."""
+        query = mock.Mock(hasMinHash=mock.Mock(return_value=True))
+        found = {}
+        with mock.patch.object(storage, "getBandHashesForMinHash", return_value={0: band_hash}):
+            for accumulation in ("dict", "numpy"):
+                with mock.patch.object(storage._storage_config, "STORAGE_CANDIDATE_ACCUMULATION", accumulation):
+                    found[accumulation] = sorted(storage.getCandidatesForMinHashes({42: query}, band_matches_required=band_matches_required).get(42, []))
+            found["single"] = sorted(storage.getCandidatesForMinHash(query, band_matches_required=band_matches_required))
+        return found
+
+    def testLookupReachesTheBucketsAShrunkHashKeeps(self):
+        """Pulls can leave a hash under the cutoff with its postings above bucket 0.
+
+        The df-indexed lookup matched bucket 0 alone - the only document carrying df - so those
+        postings were never returned, silently: the hash looked like one with no candidates.
+        """
+        for df_cutoff in (0, 2):
+            with self.subTest(df_cutoff=df_cutoff):
+                storage = self._rawStorage(2, "lookup_shrunk", df_cutoff=df_cutoff)
+                self.assertTrue(storage.isBandDfIndexComplete())
+                # buckets [1,2] [3,4] [5,6] [7]; pulling 1..5 leaves [] [6] [7] with df 2
+                storage._updateBands({0: {4242: list(range(1, 8))}}, method="push")
+                storage._updateBands({0: {4242: [1, 2, 3, 4, 5]}}, method="pull")
+                self.assertEqual([6, 7], sorted(i for row in self._bandState(storage) for i in row[4]))
+                self.assertEqual({"dict": [6, 7], "numpy": [6, 7], "single": [6, 7]}, self._candidates(storage, 4242))
+                # one band hash is one vote: a posting read twice would pass a second band's worth
+                self.assertEqual({"dict": [], "numpy": [], "single": []}, self._candidates(storage, 4242, band_matches_required=2))
+
+    def testLookupReadsBucketZeroOnceWhenItKeepsPostings(self):
+        """Bucket 0 still holding a posting while an upper bucket survives: every posting once, no more."""
+        storage = self._rawStorage(2, "lookup_shrunk_head", df_cutoff=2)
+        # buckets [1,2] [3,4] [5,6] [7]; pulling 2..6 leaves [1] [7] with df 2 and tail 3
+        storage._updateBands({0: {4242: list(range(1, 8))}}, method="push")
+        storage._updateBands({0: {4242: [2, 3, 4, 5, 6]}}, method="pull")
+        self.assertEqual({"dict": [1, 7], "numpy": [1, 7], "single": [1, 7]}, self._candidates(storage, 4242))
+        self.assertEqual({"dict": [], "numpy": [], "single": []}, self._candidates(storage, 4242, band_matches_required=2))
+
+    def testALookupReadsARecreatedBucketZeroAsEmpty(self):
+        """The recompute after a pull recreates a missing bucket 0 for its bookkeeping, without a posting list."""
+        for df_cutoff in (0, 2):
+            with self.subTest(df_cutoff=df_cutoff):
+                storage = self._rawStorage(2, "lookup_recreated", df_cutoff=df_cutoff)
+                storage._updateBands({0: {4242: list(range(1, 8))}}, method="push")
+                storage._getDb()["band_0"].delete_one({"band_hash": 4242, "bucket": 0})
+                storage._updateBands({0: {4242: [3, 4, 5]}}, method="pull")
+                head = storage._getDb()["band_0"].find_one({"band_hash": 4242, "bucket": 0})
+                self.assertIsNotNone(head)
+                # [6] and [7] survive in buckets 2 and 3: df 2, which the cutoff admits
+                self.assertEqual({"dict": [6, 7], "numpy": [6, 7], "single": [6, 7]}, self._candidates(storage, 4242))
+
+    def testAStrayDfOnAnUpperBucketDoesNotAdmitIt(self):
+        """A pull run with bucketing switched off stamps df on every bucket; only bucket 0's may count."""
+        storage = self._rawStorage(2, "lookup_stray_df", df_cutoff=2)
+        storage._updateBands({0: {4242: list(range(1, 8))}}, method="push")
+        storage._updateBands({0: {4242: [1, 2, 3, 4, 5]}}, method="pull")
+        storage._getDb()["band_0"].update_many({"band_hash": 4242, "bucket": {"$gt": 0}}, {"$set": {"df": 1}})
+        self.assertEqual({"dict": [6, 7], "numpy": [6, 7], "single": [6, 7]}, self._candidates(storage, 4242))
+        self.assertEqual({"dict": [], "numpy": [], "single": []}, self._candidates(storage, 4242, band_matches_required=2))
+
+    def testTheLookupStaysOnTheDfIndex(self):
+        """Decided from the (band_hash, df) index entries, so an over-cutoff bucket 0 is never read."""
+        storage = self._rawStorage(2, "lookup_df_index", df_cutoff=2)
+        storage._updateBands({0: {**{band_hash: [1] for band_hash in range(200)}, **{band_hash: [1, 2, 3, 4, 5] for band_hash in range(1000, 1050)}}}, method="push")
+        wanted = list(range(200)) + list(range(1000, 1050))
+        explain = storage._getDb().command("aggregate", "band_0", pipeline=storage._bandLookupPipeline(wanted, True), explain=True)
+        stages = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                if node.get("stage") == "IXSCAN":
+                    stages.append(node)
+                # plans the optimizer rejected say nothing about what runs; their layout also differs
+                # between mongod versions, so they are skipped wherever they appear
+                for key, value in node.items():
+                    if key != "rejectedPlans":
+                        walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(explain)
+        self.assertTrue(stages, explain)
+        self.assertTrue(all(stage["keyPattern"] == {"band_hash": 1, "df": 1} for stage in stages), [stage["keyPattern"] for stage in stages])
+
+    def testALookupReadsTheSettingsOnce(self):
+        """Not once per band: the df index flag is read once per lookup call and passed down."""
+        storage = self._rawStorage(2, "lookup_settings", df_cutoff=2)
+        storage._updateBands({0: {4242: [1, 2]}}, method="push")
+        query = mock.Mock(hasMinHash=mock.Mock(return_value=True))
+        every_band = {band_number: 4242 for band_number in range(storage._storage_config.STORAGE_NUM_BANDS)}
+        with (
+            mock.patch.object(storage, "getBandHashesForMinHash", return_value=every_band),
+            mock.patch.object(storage, "isBandDfIndexComplete", wraps=storage.isBandDfIndexComplete) as flag,
+        ):
+            storage.getCandidatesForMinHashes({42: query})
+        self.assertEqual(1, flag.call_count)
+
+    def testLookupStillSkipsASpilledHashOverTheCutoff(self):
+        storage = self._rawStorage(2, "lookup_spilled", df_cutoff=2)
+        storage._updateBands({0: {5555: [10, 11, 12, 13, 14]}}, method="push")
+        self.assertEqual({"dict": [], "numpy": [], "single": []}, self._candidates(storage, 5555))
+        # without a cutoff every bucket of it is found
+        storage = self._rawStorage(2, "lookup_spilled_nocut")
+        storage._updateBands({0: {5555: [10, 11, 12, 13, 14]}}, method="push")
+        self.assertEqual({"dict": [10, 11, 12, 13, 14], "numpy": [10, 11, 12, 13, 14], "single": [10, 11, 12, 13, 14]}, self._candidates(storage, 5555))
 
     def testCutoffAboveBucketSizeIsRejected(self):
         """Only bucket 0 carries df, so a cutoff a spilled hash could fit under would return bucket 0 alone."""

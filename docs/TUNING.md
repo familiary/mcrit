@@ -177,6 +177,9 @@ Documents written before the knob was on have no `bucket` field, so the upsert f
 `{band_hash, bucket: 0}` will not match them - it would insert a second document for the hash and
 split the posting list invisibly, which no error would report. The rebuild stamps `bucket: 0` and
 is what makes them addressable. Run it after setting the knob and before the next ingest.
+**Switching it back to `0` on a database that has spilled is not supported:** the single-document
+code paths neither read nor maintain the buckets above 0, so deletions and lookups made that way
+leave them out of step with bucket 0.
 
 Matching results are unchanged with it on or off; the tests assert identical matches against a
 corpus where the split is forced.

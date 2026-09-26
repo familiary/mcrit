@@ -1651,22 +1651,28 @@ class MongoDbStorage(StorageInterface):
                 band_hash_to_function_ids[band_number][band_hash].add(function_id)
         return target_band_hashes_per_band, band_hash_to_function_ids
 
-    def _bandLookupPipeline(self, band_hashes: List[int]) -> List[Dict[str, Any]]:
+    def _bandLookupPipeline(self, band_hashes: List[int], df_index_complete: Optional[bool] = None) -> List[Dict[str, Any]]:
         """Aggregation returning the wanted band documents, dropping over-long posting lists.
 
         The cutoff is applied server-side rather than after the fetch on purpose: the cost of a
         stopword band hash is dominated by shipping and BSON-decoding a posting list with
         millions of entries, so a client-side check would pay almost the whole price before
-        discarding it.
+        discarding it. `df_index_complete` passes in the flag a caller already read, so a lookup
+        over all bands reads the settings document once rather than once per band.
         """
         cutoff = getattr(self._storage_config, "STORAGE_BAND_DF_CUTOFF", 0)
         if cutoff <= 0:
             return [{"$match": {"band_hash": {"$in": band_hashes}}}]
-        if self.isBandDfIndexComplete():
+        if df_index_complete is None:
+            df_index_complete = self.isBandDfIndexComplete()
+        if df_index_complete:
             # the whole point of storing df: with a (band_hash, df) index mongod decides from
             # the index entry alone, so an over-long posting list is never read. Filtering on
             # $size instead still reads every document to measure it, which measured no faster
             # than not filtering at all.
+            # no bucket predicate here: with one, mongod prefers the (band_hash, bucket) index and
+            # reads every over-cutoff bucket 0 before discarding it. _bandLookupHits drops the stray
+            # upper bucket a df could admit instead.
             return [{"$match": {"band_hash": {"$in": band_hashes}, "df": {"$lte": cutoff}}}]
         # no trustworthy df yet: fall back to measuring the list, which is correct but only
         # saves the transfer, not the read
@@ -1680,6 +1686,41 @@ class MongoDbStorage(StorageInterface):
             {"$match": {"$expr": {"$lte": [{"$size": {"$ifNull": ["$function_ids", []]}}, cutoff]}}},
         ]
 
+    def _bandLookupPlan(self) -> Tuple[bool, bool]:
+        """(df index complete, lookup reads bucket 0 alone), decided once per lookup call.
+
+        The settings document is read once here rather than once per band. The lookup matches on
+        df, which only bucket 0 of a bucketed hash carries, when a cutoff is set and the df index
+        is trusted.
+        """
+        cutoff = getattr(self._storage_config, "STORAGE_BAND_DF_CUTOFF", 0)
+        df_index_complete = cutoff > 0 and self.isBandDfIndexComplete()
+        return df_index_complete, bool(self._bandBucketSize()) and df_index_complete
+
+    def _bandLookupHits(self, band_number: int, band_hashes: List[int], plan: Tuple[bool, bool]):
+        """The band documents a candidate lookup reads: every posting of every hash the cutoff admits.
+
+        The df-indexed pipeline matches bucket 0 alone. For a hash that never spilled that is all
+        of it, and a hash that spilled has a df the cutoff rejects - unless pulls shrank it back
+        under the cutoff while its surviving postings sit in buckets above 0. Its bucket 0 then
+        names a tail above 0, and those buckets are fetched as well; otherwise the lookup would
+        quietly treat the hash as one without candidates. Only deletions produce such a hash, so
+        the extra, indexed query is normally never made.
+        """
+        df_index_complete, bucket_zero_only = plan
+        collection = self._getDb()["band_%d" % band_number]
+        shrunk = []
+        for hit in collection.aggregate(self._bandLookupPipeline(band_hashes, df_index_complete)):
+            if bucket_zero_only and (hit.get("bucket") or 0) != 0:
+                # df belongs on bucket 0 alone; one found on a bucket above it - only switching
+                # bucketing back off, which is unsupported, stamps one - must not admit that bucket
+                continue
+            yield hit
+            if bucket_zero_only and (hit.get("tail") or 0) > 0:
+                shrunk.append(hit["band_hash"])
+        if shrunk:
+            yield from collection.find({"band_hash": {"$in": shrunk}, "bucket": {"$gt": 0}}, {"_id": 0, "band_hash": 1, "function_ids": 1})
+
     def _getCandidatesForMinHashesNumpy(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, as_arrays=False):
         """Variant C: accumulate band hits as int64 arrays instead of dict[qid][cid] -> count.
 
@@ -1691,14 +1732,14 @@ class MongoDbStorage(StorageInterface):
         """
         target_band_hashes_per_band, band_hash_to_function_ids = self._collectBandHashTargets(function_id_to_minhash)
         hit_chunks = {}
+        plan = self._bandLookupPlan()
         for band_number, band_hashes in target_band_hashes_per_band.items():
-            cursor = self._getDb()["band_%d" % band_number].aggregate(self._bandLookupPipeline(list(band_hashes)))
-            for hit in cursor:
+            for hit in self._bandLookupHits(band_number, list(band_hashes), plan):
                 reference_function_ids = band_hash_to_function_ids[band_number][hit["band_hash"]]
                 # int64, not int32: function ids come from a counter that never reuses an id, so they
                 # pass 2**31 - 1 within a few million samples. numpy 2 then raises OverflowError, and
                 # numpy 1.x silently wraps the id onto a different function.
-                posting_list = np.array(hit["function_ids"], dtype=np.int64)
+                posting_list = np.array(hit.get("function_ids") or [], dtype=np.int64)
                 for function_id in reference_function_ids:
                     if function_id not in hit_chunks:
                         hit_chunks[function_id] = [posting_list]
@@ -1734,14 +1775,14 @@ class MongoDbStorage(StorageInterface):
             return self._getCandidatesForMinHashesNumpy(function_id_to_minhash, band_matches_required=band_matches_required)
         candidates = {}
         target_band_hashes_per_band, band_hash_to_function_ids = self._collectBandHashTargets(function_id_to_minhash)
+        plan = self._bandLookupPlan()
         for band_number, band_hashes in target_band_hashes_per_band.items():
-            cursor = self._getDb()["band_%d" % band_number].aggregate(self._bandLookupPipeline(list(band_hashes)))
-            for hit in cursor:
+            for hit in self._bandLookupHits(band_number, list(band_hashes), plan):
                 reference_function_ids = band_hash_to_function_ids[band_number][hit["band_hash"]]
                 for function_id in reference_function_ids:
                     if function_id not in candidates:
                         candidates[function_id] = {}
-                    for hit_function_id in hit["function_ids"]:
+                    for hit_function_id in hit.get("function_ids") or []:
                         if hit_function_id not in candidates[function_id]:
                             candidates[function_id][hit_function_id] = 0
                         candidates[function_id][hit_function_id] += 1
@@ -1760,11 +1801,12 @@ class MongoDbStorage(StorageInterface):
             return set()
         candidates = {}
         band_hashes = self.getBandHashesForMinHash(minhash)
+        plan = self._bandLookupPlan()
         for band_number, band_hash in sorted(band_hashes.items()):
-            band_documents = list(self._getDb()["band_%d" % band_number].aggregate(self._bandLookupPipeline([band_hash])))
-            band_document = band_documents[0] if band_documents else None
-            if band_document:
-                for function_id in band_document["function_ids"]:
+            # every document, not the first: under bucketing a hash's postings span several
+            for band_document in self._bandLookupHits(band_number, [band_hash], plan):
+                # a bucket 0 recreated to hold a hash's bookkeeping can carry no posting list
+                for function_id in band_document.get("function_ids") or []:
                     if function_id not in candidates:
                         candidates[function_id] = 0
                     candidates[function_id] += 1
