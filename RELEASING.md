@@ -125,3 +125,23 @@ MCRIT depends on `smda` (`>=4.2.13`) and is depended on by `mcritweb` (`>=1.5.3`
 needs a newer smda, release smda first and raise the floor in `pyproject.toml`; when a change
 here is needed by mcritweb, release MCRIT first, then mcritweb with its floor raised, then bump
 `docker-mcrit`.
+
+## Releases before v1.10.0
+
+GitHub releases stopped at v1.3.0 while the tags carried on, and `publish-release.yml` only makes
+releases from v1.10.0 on (#192). `.github/workflows/scripts/backfill_releases.py` fills the gap once,
+with the notes of each version taken from `CHANGELOG.md`. Run it from a full clone (not a shallow
+one) with `gh` authenticated as a maintainer:
+
+```bash
+python .github/workflows/scripts/backfill_releases.py            # prints what it would create
+python .github/workflows/scripts/backfill_releases.py --apply    # creates the releases
+```
+
+The dry run prints each `gh release create` command in full, notes included, exactly as `--apply`
+runs it. It skips versions that already have a release, never marks one as latest, and creates no
+tags: a version in the changelog without a tag (v1.4.4 to v1.4.7) is listed with the commit that
+set it, its date, and a warning where that date is not the changelog's, to be tagged there by hand
+or left out. None of the four was ever published to PyPI, which goes from 1.4.3 to 1.5.0; v1.4.4's
+own commit says it changed nothing and was not tagged on purpose, and the commit that set v1.4.6
+is dated three months after the changelog's date for it and also carries the move to ruff.

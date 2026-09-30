@@ -953,8 +953,13 @@ class MemoryStorage(StorageInterface):
             "num_samples": len(sample_ids),
         }
         candidate_picblockhashes: Dict[int, Dict[str, Any]] = {}
+        wanted_sample_ids = set(sample_ids)
         for function_id, entry in self._functions.items():
             sample_id = entry.sample_id
+            # the blocks of the samples asked about only, as MongoDbStorage reads them; a block
+            # another sample holds too is removed below
+            if sample_id not in wanted_sample_ids:
+                continue
             for block_entry in entry.picblockhashes:
                 block_hash = block_entry["hash"]
                 if block_hash not in candidate_picblockhashes:
@@ -976,7 +981,7 @@ class MemoryStorage(StorageInterface):
         LOGGER.info(f"Found {len(candidate_picblockhashes)} candidate picblock hashes")
         for functiond_id, entry in self._functions.items():
             sample_id = entry.sample_id
-            if sample_id not in sample_ids:
+            if sample_id not in wanted_sample_ids:
                 for block_entry in entry.picblockhashes:
                     candidate_picblockhashes.pop(block_entry["hash"], None)
         # update statistics again after having reduced to results
@@ -1006,9 +1011,11 @@ class MemoryStorage(StorageInterface):
         for function_id, entry in self._functions.items():
             if function_id not in function_id_to_block_offsets.keys():
                 continue
-            if entry.xcfg is None:
+            # an xcfg is None when not loaded and {} once its disassembly was dropped
+            # (STORAGE_DROP_DISASSEMBLY, #42); either way its blocks keep no instructions
+            blocks = (entry.xcfg or {}).get("blocks")
+            if not blocks:
                 continue
-            blocks = entry.xcfg["blocks"]
             for block_offset, picblockhash in function_id_to_block_offsets[function_id]:
                 # a live xcfg (from SmdaFunction.toDict()) keys blocks by int, while one that has
                 # been through a JSON round trip keys them by str - accept either
@@ -1065,6 +1072,21 @@ class MemoryStorage(StorageInterface):
 
     def isBandDfIndexComplete(self) -> bool:
         return True
+
+    # getCandidatesForMinHash skips a posting list longer than the cutoff (#217), so the coverage
+    # report's numbers are what this backend's lookup skips too
+    APPLIES_BAND_DF_CUTOFF = True
+
+    def _countBandDf(self, band_number: int, thresholds: List[int]) -> Dict[str, Any]:
+        # df is the length of the in-memory posting list; an empty list holds no posting, and the
+        # MongoDB count skips its empty documents the same way
+        lengths = [len(function_ids) for function_ids in self._bands[band_number].values() if function_ids]
+        return {
+            "band_hashes": len(lengths),
+            "postings": sum(lengths),
+            "max_df": max(lengths, default=0),
+            "over": {threshold: [sum(1 for df in lengths if df > threshold), sum(df for df in lengths if df > threshold)] for threshold in thresholds},
+        }
 
     def rebuildMinhashBandIndex(self, progress_reporter=None):
         # TODO while minhashes are considerably small, there is a still chance that the

@@ -121,6 +121,10 @@ in IDA.
 In July 2023, we started populating a [Github repository](https://github.com/danielplohmann/mcrit-data) which contains ready-to-use reference data for common compilers and libraries.
 
 
+## Known Limitations
+
+See [docs/limitations.md](docs/limitations.md) for what MCRIT's model deliberately does not capture.
+
 ## Version History
 
 See [CHANGELOG.md](CHANGELOG.md) for the full release history.
