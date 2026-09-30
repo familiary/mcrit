@@ -104,7 +104,7 @@ class PicBlockHashRecalculationTest(unittest.TestCase):
         # the block hashes may be half rewritten, so getUniqueBlocks must not trust the index
         self.assertFalse(self.storage._isPicBlockHashIndexComplete())
 
-    def test_a_sample_that_cannot_be_rehashed_completely_stays_stale(self):
+    def test_a_sample_that_cannot_be_rehashed_completely_is_marked_unrehashable(self):
         old = self._add_from_before_the_fix(load_report("crossarch_aarch64_a.smda"))
         function_id = self.storage._database.functions.find_one({"sample_id": old.sample_id}, sort=[("function_id", 1)])["function_id"]
         # a function whose disassembly is gone (e.g. dropped with STORAGE_DROP_DISASSEMBLY) keeps its old block hashes
@@ -115,7 +115,9 @@ class PicBlockHashRecalculationTest(unittest.TestCase):
 
         self.assertEqual(1, result["xcfg_missing"])
         self.assertNotIn("picblockhash_version", self.samples.find_one({"sample_id": old.sample_id}))
-        self.assertEqual(1, self._stale_count())
+        # it is not counted as work left, since a rerun could not do it either (#249)
+        self.assertEqual(0, self._stale_count())
+        self.assertEqual(1, self.index.getStatus()["status"]["num_samples_pichash_unrehashable"])
 
 
 if __name__ == "__main__":

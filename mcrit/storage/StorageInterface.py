@@ -827,6 +827,7 @@ class StorageInterface:
 
     def recalculateAllPicHashes(self, progress_reporter=None) -> int:
         """Iterate across all SampleEntries and check if the SMDA version is older than the one currently available,
+            and which it has not yet rehashed with a compatible one (#249),
             or if their block hashes were computed by a picblocks that escaped non-Intel code as Intel (#240).
             If yes, process all FunctionEntries and use this SMDA version to recalculate and update the PicHash
             In the end, rebuild the PicHashIndex
@@ -855,6 +856,13 @@ class StorageInterface:
         since = SHINGLER_REVISION_SINCE.get(architecture or "")
         return since is not None and (recorded_revision is None or recorded_revision < since)
 
+    @staticmethod
+    def _stripReportVersionPrefix(report_version: Optional[str]) -> Optional[str]:
+        """Reports exported by MCRIT4IDA carry "MCRIT4IDA <smda version>" as their smda version."""
+        if report_version and report_version.startswith("MCRIT4IDA"):
+            return report_version.rsplit(" ", 1)[-1]
+        return report_version
+
     def deleteMinHashesForSample(self, sample_id: int) -> int:
         """Drop the minhashes of one sample's functions and their band entries, without touching
         the rest of the index; how many functions had one (#142)."""
@@ -879,6 +887,16 @@ class StorageInterface:
         """How many samples of an architecture other than Intel hold block hashes computed by a
         picblocks that escaped them as Intel code, which recalculateAllPicHashes redoes, for
         /status (#240). None where the backend does not record it."""
+        return None
+
+    def countSamplesWithStalePicHashes(self) -> Optional[int]:
+        """How many samples recalculateAllPicHashes would still pick for an older smda escaper,
+        for /status (#249). None where the backend does not record it."""
+        return None
+
+    def countSamplesWithUnrehashablePicHashes(self) -> Optional[int]:
+        """How many samples recalculateAllPicHashes found missing disassembly under the running
+        smda, and so no longer picks, for /status (#249). None where the backend does not record it."""
         return None
 
     def deleteAllMinHashes(self, progress_reporter=None) -> int:

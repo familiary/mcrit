@@ -15,6 +15,33 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **`recalculatePicHashes` picked most of the corpus again on every run.** It chose samples by
+  their report's `smda_version` and only overwrote that field on samples where some hash changed, so
+  every sample whose hashes came out the same stayed selected - 8,691, then 7,096 of 8,699 samples
+  on a real corpus, each run a near-full pass ([#249]). It now records the smda it rehashed a sample
+  with in a new per-sample field, `pichash_smda_version`, for every sample whose functions were all
+  rehashed, changed or not, and selects by that; a sample without the field is judged by its report's
+  `smda_version` as before, so a corpus the old code already bumped is not revisited, and one without
+  any `smda_version` is picked. A newly added report is stamped on insert, as its hashes are computed
+  then; an imported sample is not, and is judged by its report's version. A second run now selects
+  nothing. NOTE that `smda_version` is no longer overwritten: it keeps naming the smda
+  that produced the report. A sample with a function whose disassembly is gone (e.g. dropped with
+  `STORAGE_DROP_DISASSEMBLY`) cannot be rehashed, and would otherwise be picked again on every run,
+  by this selection and by the non-Intel block hash one of [#240]: it gets neither stamp, but is
+  marked with the running smda in `pichash_unrehashable_smda_version`, and neither selection picks
+  it again while that smda runs. The result counts the samples marked in a run in
+  `samples_skipped_xcfg_missing`. `/status` reports the samples still pending in
+  `num_samples_with_stale_pichashes` and the marked ones apart in
+  `num_samples_pichash_unrehashable`; a marked sample no longer counts in
+  `num_samples_with_stale_picblockhashes` either. NOTE that a marked sample is retried once when
+  smda changes, and unmarked if it then rehashes completely; one whose disassembly was restored
+  before that is retried by unsetting its `pichash_unrehashable_smda_version`. The counts read
+  three new `samples` indexes, built on first start: one on `smda_version` for the distinct report
+  versions, one on `pichash_smda_version` and `smda_version` for the stamps, and a sparse one on
+  `pichash_unrehashable_smda_version`. A run killed midway loses at most the sample it was on.
+
 ## [1.13.0] - 2026-09-29
 
 **Results change in this release, and the upgrade has an order.** Matching stays within one
@@ -943,3 +970,4 @@ date, the version, and what changed.
 [#238]: https://github.com/danielplohmann/mcrit/issues/238
 [#240]: https://github.com/danielplohmann/mcrit/issues/240
 [#69]: https://github.com/danielplohmann/mcrit/issues/69
+[#249]: https://github.com/danielplohmann/mcrit/issues/249
