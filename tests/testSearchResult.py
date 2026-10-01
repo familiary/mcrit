@@ -77,7 +77,7 @@ class McritClientTypedSearchTest(unittest.TestCase):
         index, _ = _index_with_report()
         wire = index.getFunctionSearchResults("offset:>=0", limit=3)
         client = McritClient("http://mcrit.test")
-        with patch("mcrit.client.McritClient.requests.get", return_value=self._client_answering(wire)) as get:
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=self._client_answering(wire)) as get:
             typed = client.searchFunctions("offset:>=0", limit=3, sort_by="num_blocks", is_ascending=False)
             self.assertIn("/search/functions?", get.call_args.args[0])
             self.assertIn("sort_by=num_blocks", get.call_args.args[0])
@@ -92,14 +92,14 @@ class McritClientTypedSearchTest(unittest.TestCase):
     def test_raw_responses_answer_the_response_itself(self):
         client = McritClient("http://mcrit.test", raw_responses=True)
         response = MagicMock(status_code=400)
-        with patch("mcrit.client.McritClient.requests.get", return_value=response):
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=response):
             self.assertIs(response, client.searchFunctions("bad query"))
             # the dict method is unchanged: it never answered the raw response
             self.assertIsNone(client.search_functions("bad query"))
 
     def test_a_failed_search_answers_none(self):
         client = McritClient("http://mcrit.test")
-        with patch("mcrit.client.McritClient.requests.get", return_value=MagicMock(status_code=400)):
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=MagicMock(status_code=400)):
             self.assertIsNone(client.searchSamples("bad query"))
             self.assertIsNone(client.searchFamilies("bad query"))
 
@@ -110,7 +110,7 @@ class McritClientTypedSearchTest(unittest.TestCase):
         client = McritClient("http://mcrit.test", raise_client_errors=True)
         failed = MagicMock(status_code=400, url="http://mcrit.test/search/samples")
         failed.json.return_value = {"status": "failed", "data": {"message": "bad query"}}
-        with patch("mcrit.client.McritClient.requests.get", return_value=failed):
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=failed):
             for search in (client.searchSamples, client.searchFamilies, client.searchFunctions, client.search_samples):
                 with self.subTest(search=search.__name__ if hasattr(search, "__name__") else "search_samples"):
                     with self.assertRaises(McritBadRequest):

@@ -497,7 +497,7 @@ def assertCutoffKeepsListsOfItsLength(test, storage, minhashes, posting_lengths)
 class ClientTest(unittest.TestCase):
     def test_the_client_sends_the_knobs_only_when_given(self):
         client = McritClient("http://mcrit.test")
-        with patch("mcrit.client.McritClient.requests.get") as get:
+        with patch("mcrit.client.McritClient.requests.Session.get") as get:
             get.return_value.status_code = 200
             get.return_value.json.return_value = {"status": "successful", "data": "0123456789abcdef01234567"}
             client.requestMatchesForSample(7, shortlist_size=25, band_df_cutoff=200)
@@ -635,7 +635,7 @@ class ForwardingTest(unittest.TestCase):
             "getMatchesForSmdaFunction": ("post", lambda: client.getMatchesForSmdaFunction(MagicMock(), **KNOBS), KNOBS),
         }
         for name, (verb, call, expected) in cases.items():
-            with self.subTest(name), patch(f"mcrit.client.McritClient.requests.{verb}") as request:
+            with self.subTest(name), patch(f"mcrit.client.McritClient.requests.Session.{verb}") as request:
                 request.return_value.status_code = 200
                 request.return_value.json.return_value = {"status": "successful", "data": "0123456789abcdef01234567"}
                 call()
@@ -895,7 +895,7 @@ class PresetTest(unittest.TestCase):
 
     def test_the_client_sends_it_only_when_given(self):
         client = McritClient("http://mcrit.test")
-        with patch("mcrit.client.McritClient.requests.get") as get:
+        with patch("mcrit.client.McritClient.requests.Session.get") as get:
             get.return_value.status_code = 200
             get.return_value.json.return_value = {"status": "successful", "data": "0123456789abcdef01234567"}
             for call in (
@@ -907,7 +907,7 @@ class PresetTest(unittest.TestCase):
                 self.assertEqual("identification", get.call_args.kwargs["params"]["preset"])
                 call(None)
                 self.assertNotIn("preset", get.call_args.kwargs["params"])
-        with patch("mcrit.client.McritClient.requests.post") as post:
+        with patch("mcrit.client.McritClient.requests.Session.post") as post:
             post.return_value.status_code = 200
             post.return_value.json.return_value = {"status": "successful", "data": "0123456789abcdef01234567"}
             client.requestMatchesForSmdaReport(MagicMock(toDict=MagicMock(return_value={})), preset="hunt")

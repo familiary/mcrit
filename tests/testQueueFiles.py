@@ -501,7 +501,7 @@ class DeleteOrphanedQueueFilesRouteTest(unittest.TestCase):
                 index.deleteOrphanedQueueFiles.assert_not_called()
 
     def test_the_client_posts_to_the_route(self):
-        with patch("mcrit.client.McritClient.requests.post") as post:
+        with patch("mcrit.client.McritClient.requests.Session.post") as post:
             post.return_value.status_code = 200
             post.return_value.json.return_value = {"status": "successful", "data": "0123456789abcdef01234567"}
             self.assertEqual("0123456789abcdef01234567", McritClient("http://mcrit.test").deleteOrphanedQueueFiles(dry_run=True))

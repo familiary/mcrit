@@ -15,6 +15,15 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Changed
+
+- `McritClient` sends all requests through one `requests.Session`, so consecutive calls reuse a
+  connection instead of opening a new one, with a new TLS handshake on HTTPS, every time. Against
+  mcrit.malpedia.io, 166 sequential block-hash queries took 46 s instead of 166 s. A session keeps
+  the cookies a server sets for the life of the client, is not formally thread-safe, and can hit a
+  pooled connection the server already closed, which surfaces as a connection error on that call.
+  Tests patch `requests.Session` methods instead of the module-level `requests` functions. (#254)
+
 ## [1.13.0] - 2026-09-29
 
 **Results change in this release, and the upgrade has an order.** Matching stays within one

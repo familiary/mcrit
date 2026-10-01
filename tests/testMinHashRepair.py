@@ -235,7 +235,7 @@ class RepairRouteAndClient(unittest.TestCase):
     def test_the_client_posts_and_answers_the_job_id(self):
         response = MagicMock(status_code=200)
         response.json.return_value = {"status": "successful", "data": "0123456789abcdef01234567"}
-        with patch("mcrit.client.McritClient.requests.post", return_value=response) as post:
+        with patch("mcrit.client.McritClient.requests.Session.post", return_value=response) as post:
             self.assertEqual("0123456789abcdef01234567", McritClient("http://mcrit.test").repairMinHashes())
         self.assertIn("/repair_minhashes", post.call_args.args[0])
 

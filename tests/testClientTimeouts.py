@@ -38,12 +38,13 @@ class ClientTimeoutTest(unittest.TestCase):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
                 continue
             target = node.func.value
-            if isinstance(target, ast.Name) and target.id == "requests" and node.func.attr in HTTP_VERBS:
+            is_session = isinstance(target, ast.Attribute) and target.attr == "_session" and isinstance(target.value, ast.Name) and target.value.id == "self"
+            if is_session and node.func.attr in HTTP_VERBS:
                 calls += 1
                 if not any(keyword.arg == "timeout" for keyword in node.keywords):
                     missing.append(node.lineno)
         self.assertGreater(calls, 50)
-        self.assertEqual([], missing, "requests calls without timeout= on these lines of McritClient.py")
+        self.assertEqual([], missing, "session calls without timeout= on these lines of McritClient.py")
 
     def test_the_default_bounds_the_connect_and_leaves_the_read_to_the_caller(self):
         connect, read = DEFAULT_TIMEOUT
@@ -60,7 +61,7 @@ class ClientTimeoutTest(unittest.TestCase):
             ("delete", lambda: client.deleteSample(7)),
         ]
         for verb, call in cases:
-            with self.subTest(verb=verb), patch(f"mcrit.client.McritClient.requests.{verb}", return_value=ok()) as sent:
+            with self.subTest(verb=verb), patch(f"mcrit.client.McritClient.requests.Session.{verb}", return_value=ok()) as sent:
                 call()
                 self.assertEqual((3, 30), sent.call_args.kwargs["timeout"])
 
@@ -69,7 +70,7 @@ class ClientTimeoutTest(unittest.TestCase):
         mcrit version: an older client simply ignores it."""
         client = McritClient("http://mcrit.test")
         client.timeout = (5, 60)
-        with patch("mcrit.client.McritClient.requests.get", return_value=ok()) as sent:
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=ok()) as sent:
             client.getVersion()
         self.assertEqual((5, 60), sent.call_args.kwargs["timeout"])
 

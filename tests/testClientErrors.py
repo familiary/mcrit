@@ -92,20 +92,20 @@ class HandleResponseTest(unittest.TestCase):
 class ClientModesTest(unittest.TestCase):
     def test_the_default_client_keeps_answering_none(self):
         client = McritClient("http://mcrit.test")
-        with patch("mcrit.client.McritClient.requests.get", return_value=answer(404, FAILED)):
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=answer(404, FAILED)):
             self.assertIsNone(client.getSampleById(7))
-        with patch("mcrit.client.McritClient.requests.get", return_value=answer(500, FAILED)):
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=answer(500, FAILED)):
             self.assertIsNone(client.getSampleById(7))
 
     def test_a_raising_client_raises_through_its_methods(self):
         client = McritClient("http://mcrit.test", raise_client_errors=True, raise_server_errors=True)
-        with patch("mcrit.client.McritClient.requests.get", return_value=answer(404, FAILED)):
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=answer(404, FAILED)):
             with self.assertRaises(McritNotFound):
                 client.getSampleById(7)
-        with patch("mcrit.client.McritClient.requests.get", return_value=answer(500, FAILED)):
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=answer(500, FAILED)):
             with self.assertRaises(McritServerError):
                 client.getFamily(1)
-        with patch("mcrit.client.McritClient.requests.delete", return_value=answer(400, FAILED)):
+        with patch("mcrit.client.McritClient.requests.Session.delete", return_value=answer(400, FAILED)):
             with self.assertRaises(McritBadRequest):
                 client.deleteFamily(1)
 
@@ -116,10 +116,10 @@ class ClientModesTest(unittest.TestCase):
         client = McritClient("http://mcrit.test", raise_client_errors=True, raise_server_errors=True)
         for method, verb in (("rebuildPicBlockHashIndex", "get"), ("repairMinHashes", "post"), ("recomputeFamilyStats", "post")):
             with self.subTest(method=method):
-                with patch(f"mcrit.client.McritClient.requests.{verb}", return_value=answer(500, FAILED)):
+                with patch(f"mcrit.client.McritClient.requests.Session.{verb}", return_value=answer(500, FAILED)):
                     with self.assertRaises(McritServerError):
                         getattr(client, method)()
-                with patch(f"mcrit.client.McritClient.requests.{verb}", return_value=answer(401, FAILED)):
+                with patch(f"mcrit.client.McritClient.requests.Session.{verb}", return_value=answer(401, FAILED)):
                     with self.assertRaises(McritUnauthorized):
                         getattr(client, method)()
 
@@ -134,22 +134,22 @@ class ClientModesTest(unittest.TestCase):
         in later - a method that calls handle_response directly answers None whatever mode the
         client is in."""
         client = McritClient("http://mcrit.test", raise_client_errors=True)
-        with patch("mcrit.client.McritClient.requests.put", return_value=answer(404, FAILED, url="http://mcrit.test/functions/7")):
+        with patch("mcrit.client.McritClient.requests.Session.put", return_value=answer(404, FAILED, url="http://mcrit.test/functions/7")):
             with self.assertRaises(McritNotFound):
                 client.modifyFunction(7, "decrypt_config")
 
     def test_one_mode_does_not_imply_the_other(self):
         server_only = McritClient("http://mcrit.test", raise_server_errors=True)
-        with patch("mcrit.client.McritClient.requests.get", return_value=answer(404, FAILED)):
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=answer(404, FAILED)):
             self.assertIsNone(server_only.getSampleById(7))
-        with patch("mcrit.client.McritClient.requests.get", return_value=answer(500, FAILED)):
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=answer(500, FAILED)):
             with self.assertRaises(McritServerError):
                 server_only.getSampleById(7)
 
     def test_raw_mode_hands_out_the_response_whatever_the_status(self):
         client = McritClient("http://mcrit.test", raw_responses=True, raise_client_errors=True, raise_server_errors=True)
         response = answer(500, FAILED)
-        with patch("mcrit.client.McritClient.requests.get", return_value=response):
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=response):
             self.assertIs(response, client.getSampleById(7))
             self.assertIs(response, client.getFunctionById(7))
             self.assertIs(response, client.isFunctionId(7))
@@ -170,10 +170,10 @@ class ClientModesTest(unittest.TestCase):
         client = McritClient("http://mcrit.test", raise_client_errors=True, raise_server_errors=True)
         for method in ("rebuildFunctionRangeIndex", "rebuildBandDfIndex"):
             with self.subTest(method=method):
-                with patch("mcrit.client.McritClient.requests.get", return_value=answer(500, FAILED)):
+                with patch("mcrit.client.McritClient.requests.Session.get", return_value=answer(500, FAILED)):
                     with self.assertRaises(McritServerError):
                         getattr(client, method)()
-                with patch("mcrit.client.McritClient.requests.get", return_value=answer(401, FAILED)):
+                with patch("mcrit.client.McritClient.requests.Session.get", return_value=answer(401, FAILED)):
                     with self.assertRaises(McritUnauthorized):
                         getattr(client, method)()
 
@@ -187,7 +187,7 @@ class GetQueueDataTest(unittest.TestCase):
 
     def test_sample_ids_and_job_ids_are_sent_as_comma_separated_lists(self):
         client = McritClient("http://mcrit.test")
-        with patch("mcrit.client.McritClient.requests.get", return_value=self._success()) as mock_get:
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=self._success()) as mock_get:
             client.getQueueData(method="getMatchesForSample", sample_ids=[7, 8, 9], job_ids=["a1b2c3d4e5f6a1b2c3d4e5f6"])
         url = mock_get.call_args.args[0]
         self.assertIn("method=getMatchesForSample", url)
@@ -196,7 +196,7 @@ class GetQueueDataTest(unittest.TestCase):
 
     def test_neither_parameter_is_sent_when_not_given(self):
         client = McritClient("http://mcrit.test")
-        with patch("mcrit.client.McritClient.requests.get", return_value=self._success()) as mock_get:
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=self._success()) as mock_get:
             client.getQueueData()
         url = mock_get.call_args.args[0]
         self.assertNotIn("sample_ids", url)
@@ -204,7 +204,7 @@ class GetQueueDataTest(unittest.TestCase):
 
     def test_an_empty_list_is_still_sent_present_but_empty(self):
         client = McritClient("http://mcrit.test")
-        with patch("mcrit.client.McritClient.requests.get", return_value=self._success()) as mock_get:
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=self._success()) as mock_get:
             client.getQueueData(method="getMatchesForSample", sample_ids=[], job_ids=[])
         url = mock_get.call_args.args[0]
         self.assertIn("sample_ids=&", url)
@@ -213,7 +213,7 @@ class GetQueueDataTest(unittest.TestCase):
     def test_raw_mode_returns_the_response_untouched(self):
         client = McritClient("http://mcrit.test", raw_responses=True)
         response = self._success()
-        with patch("mcrit.client.McritClient.requests.get", return_value=response):
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=response):
             self.assertIs(response, client.getQueueData(sample_ids=[1, 2], job_ids=["x"]))
 
 

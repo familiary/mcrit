@@ -103,7 +103,7 @@ class ClientEncodingTest(unittest.TestCase):
             ),
         )
         for verb, call, expected in cases:
-            with self.subTest(verb), patch(f"mcrit.client.McritClient.requests.{verb}", return_value=answer) as request:
+            with self.subTest(verb), patch(f"mcrit.client.McritClient.requests.Session.{verb}", return_value=answer) as request:
                 try:
                     call()
                 except Exception:
@@ -122,7 +122,7 @@ class ClientEncodingTest(unittest.TestCase):
         answer = MagicMock(status_code=200)
         answer.json.return_value = {"status": "successful", "data": {"sample_info": {}, "job_id": None}}
         filename, family = quote("sample (1)&x.exe", safe=""), quote("Emotet Loader", safe="")
-        with patch("mcrit.client.McritClient.requests.post", return_value=answer) as request:
+        with patch("mcrit.client.McritClient.requests.Session.post", return_value=answer) as request:
             try:
                 client.addBinarySample(b"MZ", filename=filename, family=family, version="1")
             except Exception:

@@ -225,14 +225,14 @@ class RouterTest(unittest.TestCase):
 class ClientGetSamplesByIdsTest(unittest.TestCase):
     def test_empty_list_answers_without_a_request(self):
         for client in (McritClient("http://mcrit.test"), McritClient("http://mcrit.test", raw_responses=True)):
-            with patch("mcrit.client.McritClient.requests.post") as post:
+            with patch("mcrit.client.McritClient.requests.Session.post") as post:
                 self.assertEqual({}, client.getSamplesByIds([]))
                 post.assert_not_called()
 
     def test_a_success_answers_entries_keyed_by_int(self):
         client = McritClient("http://mcrit.test")
         body = {"status": "successful", "data": {"5": _sample_dict(5), "-3": _sample_dict(-3, sha256="b" * 64)}}
-        with patch("mcrit.client.McritClient.requests.post", return_value=_answer(200, body)) as post:
+        with patch("mcrit.client.McritClient.requests.Session.post", return_value=_answer(200, body)) as post:
             result = client.getSamplesByIds([5, -3])
         post.assert_called_once_with("http://mcrit.test/samples/ids", data="5,-3", headers={}, timeout=DEFAULT_TIMEOUT)
         self.assertEqual({5, -3}, set(result.keys()))
@@ -243,31 +243,31 @@ class ClientGetSamplesByIdsTest(unittest.TestCase):
     def test_raw_mode_hands_out_the_response(self):
         client = McritClient("http://mcrit.test", raw_responses=True)
         response = _answer(200, {"status": "successful", "data": {}})
-        with patch("mcrit.client.McritClient.requests.post", return_value=response):
+        with patch("mcrit.client.McritClient.requests.Session.post", return_value=response):
             self.assertIs(response, client.getSamplesByIds([5]))
 
     def test_error_modes_match_getFunctionsByIds(self):
         failed = {"status": "failed", "data": {"message": "We don't have a sample with that id."}}
         raising_client = McritClient("http://mcrit.test", raise_client_errors=True, raise_server_errors=True)
-        with patch("mcrit.client.McritClient.requests.post", return_value=_answer(404, failed)):
+        with patch("mcrit.client.McritClient.requests.Session.post", return_value=_answer(404, failed)):
             with self.assertRaises(McritNotFound):
                 raising_client.getSamplesByIds([5])
         default_client = McritClient("http://mcrit.test")
-        with patch("mcrit.client.McritClient.requests.post", return_value=_answer(404, failed)):
+        with patch("mcrit.client.McritClient.requests.Session.post", return_value=_answer(404, failed)):
             self.assertEqual({}, default_client.getSamplesByIds([5]))
 
 
 class ClientGetFamiliesByIdsTest(unittest.TestCase):
     def test_empty_list_answers_without_a_request(self):
         for client in (McritClient("http://mcrit.test"), McritClient("http://mcrit.test", raw_responses=True)):
-            with patch("mcrit.client.McritClient.requests.post") as post:
+            with patch("mcrit.client.McritClient.requests.Session.post") as post:
                 self.assertEqual({}, client.getFamiliesByIds([]))
                 post.assert_not_called()
 
     def test_a_success_answers_entries_keyed_by_int(self):
         client = McritClient("http://mcrit.test")
         body = {"status": "successful", "data": {"1": _family_dict(1, "fam_one"), "2": _family_dict(2, "fam_two")}}
-        with patch("mcrit.client.McritClient.requests.post", return_value=_answer(200, body)) as post:
+        with patch("mcrit.client.McritClient.requests.Session.post", return_value=_answer(200, body)) as post:
             result = client.getFamiliesByIds([1, 2])
         post.assert_called_once_with("http://mcrit.test/families/ids", data="1,2", headers={}, timeout=DEFAULT_TIMEOUT)
         self.assertEqual({1: "fam_one", 2: "fam_two"}, {k: v.family_name for k, v in result.items()})
@@ -278,17 +278,17 @@ class ClientGetFamiliesByIdsTest(unittest.TestCase):
     def test_raw_mode_hands_out_the_response(self):
         client = McritClient("http://mcrit.test", raw_responses=True)
         response = _answer(200, {"status": "successful", "data": {}})
-        with patch("mcrit.client.McritClient.requests.post", return_value=response):
+        with patch("mcrit.client.McritClient.requests.Session.post", return_value=response):
             self.assertIs(response, client.getFamiliesByIds([1]))
 
     def test_error_modes_match_getFunctionsByIds(self):
         failed = {"status": "failed", "data": {"message": "We don't have a family with that id."}}
         raising_client = McritClient("http://mcrit.test", raise_client_errors=True, raise_server_errors=True)
-        with patch("mcrit.client.McritClient.requests.post", return_value=_answer(404, failed)):
+        with patch("mcrit.client.McritClient.requests.Session.post", return_value=_answer(404, failed)):
             with self.assertRaises(McritNotFound):
                 raising_client.getFamiliesByIds([1])
         default_client = McritClient("http://mcrit.test")
-        with patch("mcrit.client.McritClient.requests.post", return_value=_answer(404, failed)):
+        with patch("mcrit.client.McritClient.requests.Session.post", return_value=_answer(404, failed)):
             self.assertEqual({}, default_client.getFamiliesByIds([1]))
 
 
