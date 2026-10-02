@@ -15,6 +15,24 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- `McritClient.awaitResult` asked the server for the result of a job that failed, instead of
+  reporting the failure it had just waited for ([#252]). A job whose attempts ran out keeps
+  `result` None, and the wait had only two outcomes - terminated raises, anything else fetches
+  `job.result` - so the client went on to request `/results/None` and the server answered 400
+  (`Valid ResultIDs are hexstrings with 24 characters.`): as `None` by default, as that message
+  with `raise_client_errors=True`, and in neither case naming the job or its `last_error`.
+  docker-mcrit's `repair.sh` died that way when a production `recalculatePicHashes` lost its
+  attempts to its worker's child timeout plus a lock expiry counted as the last one. The wait now
+  raises a dedicated `JobFailedError`, carrying the job id and the queue's `last_error` when one
+  is recorded, next to `JobTerminatedError` and raised whatever the client's error mode, because a
+  caller that waited wants to know the job failed rather than receive a `None` it cannot tell
+  from other failures. NOTE that a job which finished despite a reclaimed lock still answers its
+  result: the failure is decided by the missing result, not by `attempts_left`. `Job.last_error`
+  reads a missing field as None now - the client wraps server answers in that class, and a job
+  that never errored does not carry one.
+
 ## [1.13.0] - 2026-09-29
 
 **Results change in this release, and the upgrade has an order.** Matching stays within one
@@ -943,3 +961,4 @@ date, the version, and what changed.
 [#238]: https://github.com/danielplohmann/mcrit/issues/238
 [#240]: https://github.com/danielplohmann/mcrit/issues/240
 [#69]: https://github.com/danielplohmann/mcrit/issues/69
+[#252]: https://github.com/danielplohmann/mcrit/issues/252

@@ -25,6 +25,23 @@ class JobTerminatedError(Exception):
     pass
 
 
+class JobFailedError(Exception):
+    """A job the client waited for used up its attempts without producing a result.
+
+    Like JobTerminatedError it is raised whatever error mode the client was built in: the
+    failure is the queue's answer about the job, not one HTTP status a mode could decide over.
+    Carries the job id and the queue's ``last_error`` for the job, which is None when no
+    attempt recorded one - a lock expiry can use up the last attempt on its own."""
+
+    def __init__(self, job_id, last_error=None):
+        self.job_id = job_id
+        self.last_error = last_error
+        message = f"job {job_id} failed"
+        if last_error:
+            message += f": {last_error}"
+        super().__init__(message)
+
+
 def isJobTerminated(job):
     if job is None:
         return True
@@ -1007,6 +1024,11 @@ class McritClient:
             job = self.getJobData(job_id)
         if isJobTerminated(job):
             raise JobTerminatedError
+        if job.result is None:
+            # the wait above only ends without a result on a failed job - a job the queue
+            # reclaimed mid-run keeps attempts_left 0 but can still finish, and then carries
+            # its result, so the failure is decided by the missing result, not isJobFailed
+            raise JobFailedError(job_id, job.last_error)
         result_id = job.result
         return self.getResult(result_id, compact=compact)
 

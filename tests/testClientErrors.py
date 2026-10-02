@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from mcrit.client.McritClient import (
+    JobFailedError,
+    JobTerminatedError,
     McritBadRequest,
     McritClient,
     McritClientError,
@@ -215,6 +217,70 @@ class GetQueueDataTest(unittest.TestCase):
         response = self._success()
         with patch("mcrit.client.McritClient.requests.get", return_value=response):
             self.assertIs(response, client.getQueueData(sample_ids=[1, 2], job_ids=["x"]))
+
+
+class AwaitResultTest(unittest.TestCase):
+    """awaitResult's answer to a job that ends without a result (#252)."""
+
+    JOB_ID = "a1b2c3d4e5f6a1b2c3d4e5f6"
+    RESULT_ID = "b1b2c3d4e5f6a1b2c3d4e5f6"
+
+    @staticmethod
+    def _job_answer(**fields):
+        """A /jobs/<id> answer whose queue fields the test overrides."""
+        data = {"_id": AwaitResultTest.JOB_ID, "attempts_left": 1, "terminated": False, "result": None, "last_error": None}
+        data.update(fields)
+        return answer(200, {"status": "successful", "data": data})
+
+    def test_a_job_that_used_up_its_attempts_raises_and_does_not_ask_for_its_result(self):
+        client = McritClient("http://mcrit.test")
+        failure = "RuntimeError: child worker exited (returncode 1) without producing a result_id"
+        with patch(
+            "mcrit.client.McritClient.requests.get",
+            side_effect=[self._job_answer(), self._job_answer(attempts_left=0, last_error=failure)],
+        ) as mock_get:
+            with self.assertRaises(JobFailedError) as raised:
+                client.awaitResult(self.JOB_ID, sleep_time=0)
+        self.assertEqual(self.JOB_ID, raised.exception.job_id)
+        self.assertEqual(failure, raised.exception.last_error)
+        self.assertIn(failure, str(raised.exception))
+        # the client polled the job twice and never built a request from the missing result id
+        self.assertEqual(2, mock_get.call_count)
+        for call in mock_get.call_args_list:
+            self.assertNotIn("/results/", call.args[0])
+
+    def test_a_failed_job_without_a_recorded_error_still_names_the_job(self):
+        # a lock expiry can use up the last attempt without an attempt recording one
+        client = McritClient("http://mcrit.test")
+        with patch(
+            "mcrit.client.McritClient.requests.get",
+            side_effect=[self._job_answer(), self._job_answer(attempts_left=0)],
+        ):
+            with self.assertRaises(JobFailedError) as raised:
+                client.awaitResult(self.JOB_ID, sleep_time=0)
+        self.assertIsNone(raised.exception.last_error)
+        self.assertIn(self.JOB_ID, str(raised.exception))
+
+    def test_a_finished_job_still_answers_its_result_even_when_its_attempts_ran_out(self):
+        # the queue can reclaim a lock mid-run, use up the last attempt, and the worker
+        # finishes anyway - the result on such a job is good and must still be served
+        client = McritClient("http://mcrit.test")
+        result = {"status": "successful", "data": {"matches": {}}}
+        with patch(
+            "mcrit.client.McritClient.requests.get",
+            side_effect=[self._job_answer(attempts_left=0, result=self.RESULT_ID), answer(200, result)],
+        ) as mock_get:
+            self.assertEqual({"matches": {}}, client.awaitResult(self.JOB_ID, sleep_time=0))
+        self.assertEqual(2, mock_get.call_count)
+
+    def test_a_terminated_job_still_raises_terminated(self):
+        client = McritClient("http://mcrit.test")
+        with patch(
+            "mcrit.client.McritClient.requests.get",
+            side_effect=[self._job_answer(), self._job_answer(terminated=True)],
+        ):
+            with self.assertRaises(JobTerminatedError):
+                client.awaitResult(self.JOB_ID, sleep_time=0)
 
 
 if __name__ == "__main__":
