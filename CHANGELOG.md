@@ -77,6 +77,19 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ### Fixed
 
+- **Deleting a sample left it in the pichash counts and the function-range index** ([#261]).
+  `deleteSample` took the sample out of the bands and the picblockhash index but not out of
+  `pichash_counts` or `function_ranges`, which adding a sample fills, so a deleted sample stayed
+  counted and a deleted and re-added one was counted twice. Measured on a 7,244-sample corpus after
+  475 samples were deleted and added back: the counts summed to 9,050,959 for 8,657,357 functions,
+  306 of 5,000 sampled counts wrong. Only `MINHASH_PICHASH_MAX_MATCHES` reads the counts, so a
+  deployment that leaves it at 0, the default, saw nothing; one that sets it could lose exact
+  matches whose pichash an inflated count pushed over the cap. A corpus that deleted samples
+  before this release still carries the surplus. `MongoDbStorage.rebuildPicHashCountIndex()`
+  clears it, though no route or client method runs it yet; `rebuild_function_range_index`
+  (`McritClient.rebuildFunctionRangeIndex()`) drops the stale ranges, which are harmless since
+  function ids are never reused.
+
 - **`McritClient` raised a `JSONDecodeError` for a 2xx whose body is not JSON** ([#257]). A reverse
   proxy's error or login page, or an empty answer, with a 200 or 202 status went through
   `response.json()` unguarded and came out of the client as a `ValueError` in either error mode,
@@ -1245,6 +1258,7 @@ date, the version, and what changed.
 [#202]: https://github.com/danielplohmann/mcrit/issues/202
 [#203]: https://github.com/danielplohmann/mcrit/issues/203
 [#215]: https://github.com/danielplohmann/mcrit/issues/215
+[#261]: https://github.com/danielplohmann/mcrit/issues/261
 [#257]: https://github.com/danielplohmann/mcrit/issues/257
 [#252]: https://github.com/danielplohmann/mcrit/issues/252
 [#249]: https://github.com/danielplohmann/mcrit/issues/249
