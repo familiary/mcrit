@@ -1,21 +1,34 @@
 import argparse
 import hashlib
+import importlib.util
 import json
+import logging
 import os
 import re
+import shutil
+import signal
 import subprocess
+import sys
+import tempfile
 
 from dotenv import load_dotenv
 from smda.common.SmdaReport import SmdaReport
 from smda.Disassembler import Disassembler
 
+from mcrit.client.IdaReportProducer import IDA_MISSING_MESSAGE, produceIdaReport, removeAbandonedWorkingDirectories, workingDirectoryPrefix
 from mcrit.client.McritClient import McritClient
 from mcrit.storage.FamilyEntry import FamilyEntry
 from mcrit.storage.FunctionEntry import FunctionEntry
 from mcrit.storage.MatchingResult import MatchingResult
 from mcrit.storage.SampleEntry import SampleEntry
 
+IDA_SIG_MIN_MATCHES = 10
+
 ### Helper functionality for submissions
+
+
+def is_ida_available():
+    return importlib.util.find_spec("ida_domain") is not None
 
 
 def is_pe_or_elf(input_path):
@@ -147,27 +160,30 @@ def getSmdaReportFromFilepath(args, filepath):
         if args.executables_only and not is_pe_or_elf(filepath):
             print(f"Skipping a file not recognized as executable: {filepath}")
         else:
-            disassembler = Disassembler()
-            if get_base_addr(filename) is not None:
-                base_addr = get_base_addr(filename)
-                try:
-                    smda_report = disassembler.disassembleBuffer(readFileContent(filepath), base_addr)
-                    smda_report.filename = filename
-                except Exception:
-                    import traceback
+            base_addr = get_base_addr(filename)
+            try:
+                if args.disassembler == "ida":
+                    if base_addr is not None:
+                        print(f"NOTE: Ignoring the base address in the filename, IDA's loader decides: {filepath}")
+                    min_matches = IDA_SIG_MIN_MATCHES if args.ida_sig_min_matches is None else args.ida_sig_min_matches
+                    smda_report = produceIdaReport(filepath, args.ida_sigs, min_matches)
+                    # IDA loads a file of no known format as a raw binary instead of refusing it
+                    if not smda_report.num_functions:
+                        print(f"Skipping a file in which IDA found no functions: {filepath}")
+                        smda_report = None
+                else:
+                    disassembler = Disassembler()
+                    if base_addr is not None:
+                        smda_report = disassembler.disassembleBuffer(readFileContent(filepath), base_addr)
+                        smda_report.filename = filename
+                    else:
+                        smda_report = disassembler.disassembleFile(filepath)
+            except Exception:
+                import traceback
 
-                    print(f"ERROR: SMDA caused an exception while processing this file: {filepath}")
-                    print(traceback.format_exc())
-                    return None
-            else:
-                try:
-                    smda_report = disassembler.disassembleFile(filepath)
-                except Exception:
-                    import traceback
-
-                    print(f"ERROR: SMDA caused an exception while processing this file: {filepath}")
-                    print(traceback.format_exc())
-                    return None
+                print(f"ERROR: The disassembler caused an exception while processing this file: {filepath}")
+                print(traceback.format_exc())
+                return None
     # apply any of the forced flags: family, version, library
     if smda_report:
         if args.mode in ["file", "dir"]:
@@ -188,25 +204,42 @@ def getSmdaReportFromFilepath(args, filepath):
 
 
 def submitViaSubprocess(args, filepath):
-    command = ["python", "-m", "mcrit", "client", "submit"]
+    # a python found on PATH may lack the optional IDA dependencies this process was started with
+    command = [sys.executable, "-m", "mcrit", "client"]
     if args.server:
         command.extend(["--server", args.server])
     if args.apitoken:
         command.extend(["--apitoken", args.apitoken])
-    if args.family:
+    command.append("submit")
+    if args.family is not None:
         command.extend(["--family", args.family])
-    if args.version:
+    if args.version is not None:
         command.extend(["--version", args.version])
     if args.library:
         command.extend(["--library"])
+    if args.force_update:
+        command.extend(["--force_update"])
     if args.executables_only:
         command.extend(["--executables_only"])
     if args.output:
         command.extend(["--output", args.output])
     if args.smda:
         command.extend(["--smda"])
+    if args.disassembler != "smda":
+        command.extend(["--disassembler", args.disassembler])
+    if args.ida_sigs:
+        command.extend(["--ida-sigs", args.ida_sigs])
+    if args.ida_sig_min_matches is not None:
+        command.extend(["--ida-sig-min-matches", str(args.ida_sig_min_matches)])
     command.append(filepath)
-    console_handle = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # the child's temporary files - for IDA the working copy of the sample and its database - go to a
+    # directory removed below: a child killed at the timeout or crashing natively cannot clean up itself
+    child_temp_dir = tempfile.mkdtemp(prefix=workingDirectoryPrefix("submit"))
+    try:
+        console_handle = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(os.environ, TMPDIR=child_temp_dir))
+    except BaseException:
+        shutil.rmtree(child_temp_dir, ignore_errors=True)
+        raise
     try:
         stdout_result, stderr_result = console_handle.communicate(timeout=args.worker_timeout)
         stdout_result = stdout_result.strip().decode("utf-8")
@@ -216,7 +249,30 @@ def submitViaSubprocess(args, filepath):
             stderr_result = stderr_result.strip().decode("utf-8")
             print("STDERR logs from subprocess: ", stderr_result)
     except subprocess.TimeoutExpired:
+        # communicate() does not stop the child when its timeout expires
+        console_handle.kill()
+        console_handle.communicate()
         print(f"Processing {str(filepath)} with a spawned worker timed out during processing.")
+    finally:
+        # also when left through Ctrl-C or a termination signal: the child must not outlive this process
+        if console_handle.poll() is None:
+            console_handle.kill()
+            console_handle.wait()
+        shutil.rmtree(child_temp_dir, ignore_errors=True)
+
+
+def _exitOnTerminationSignal(signum, frame):
+    sys.exit(128 + signum)
+
+
+def installTerminationHandlers() -> None:
+    """End the CLI on SIGTERM and SIGHUP as Ctrl-C does, through the finally blocks that stop a submit's
+    child and remove its temporary files. A signal that is ignored stays ignored: that is how nohup keeps
+    a run alive past the end of its session."""
+    for signal_name in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, signal_name, None)
+        if signum is not None and signal.getsignal(signum) is not signal.SIG_IGN:
+            signal.signal(signum, _exitOnTerminationSignal)
 
 
 ### Main Processing
@@ -254,6 +310,20 @@ class McritConsole:
         client_submit.add_argument(
             "-s", "--smda", action="store_true", help="Do not disassemble, instead only submit files that are recognized as SMDA reports (only works with modes: file/dir)."
         )
+        client_submit.add_argument(
+            "--disassembler", type=str, default="smda", choices=["smda", "ida"], help="Disassembler used to produce reports for submitted files (default: smda)."
+        )
+        client_submit.add_argument(
+            "--ida-sigs",
+            type=str,
+            help="Root folder of an unpacked FLIRT signature bundle, probed per sample and applied where enough functions match (only with --disassembler ida).",
+        )
+        client_submit.add_argument(
+            "--ida-sig-min-matches",
+            type=int,
+            default=None,
+            help=f"Number of functions a FLIRT signature must name to be kept (only with --disassembler ida, default: {IDA_SIG_MIN_MATCHES}).",
+        )
         client_submit.add_argument("-w", "--worker", action="store_true", help="Spawn workers to process the submission (only in modes: dir/recursive/malpedia, default: False).")
         client_submit.add_argument("-t", "--worker-timeout", type=int, default=300, help="Timeout for workers to conclude the submission (default: 300 seconds).")
         # client query
@@ -276,6 +346,7 @@ class McritConsole:
         client_queue.add_argument("--filter", type=str, help="Filter queue entries with this term.")
 
     def run(self):
+        installTerminationHandlers()
         ARGS = self.parser.parse_args()
         # try to load .env file first
         THIS_FILE_PATH = str(os.path.abspath(__file__))
@@ -445,6 +516,32 @@ class McritConsole:
         if args.worker and args.mode not in ["dir", "recursive", "malpedia"]:
             print("Mode <worker> only works with modes: dir/recursive/malpedia.")
             return
+        if args.disassembler == "ida" and args.smda:
+            print("Disassembler <ida> is not compatible with SMDA report loading.")
+            return
+        if args.disassembler != "ida" and (args.ida_sigs is not None or args.ida_sig_min_matches is not None):
+            print("Options <ida-sigs|ida-sig-min-matches> only work with disassembler <ida>.")
+            return
+        if args.ida_sigs is not None and not os.path.isdir(args.ida_sigs):
+            print("Your <ida-sigs> is not a directory or does not exist.")
+            return
+        if args.ida_sig_min_matches is not None and args.ida_sig_min_matches < 1:
+            print("Your <ida-sig-min-matches> has to be at least 1.")
+            return
+        if args.disassembler == "ida":
+            if not is_ida_available():
+                print(IDA_MISSING_MESSAGE)
+                return
+            ida_logger = logging.getLogger("mcrit.client.IdaReportProducer")
+            ida_logger.setLevel(logging.INFO)
+            ida_logger.addHandler(logging.StreamHandler(sys.stdout))
+            # the sample copies and databases of runs killed or crashed during an analysis
+            for abandoned in removeAbandonedWorkingDirectories():
+                print(f"NOTE: Removed the temporary directory {abandoned} of an IDA analysis that ended abnormally.")
+        if args.disassembler == "ida" and args.mode in ["dir", "recursive", "malpedia"] and not args.worker:
+            # idalib holds a single database per process, and one malformed sample must not end the batch
+            args.worker = True
+            print("NOTE: Disassembler <ida> processes each file in its own subprocess, enabling <worker>.")
         # behavior according to the modes offered
         if args.mode == "file":
             self._handle_submit_file(args)
@@ -549,7 +646,6 @@ class McritConsole:
                     family_name = getFamilyName(folder_relative_path)
                     version = getSampleVersion(folder_relative_path, family_name)
                     print("Processing file: ", filepath, " as ", family_name, "|", version)
-                    continue
                     if args.worker:
                         args.family = getFamilyName(folder_relative_path)
                         args.version = getSampleVersion(folder_relative_path, args.family)
