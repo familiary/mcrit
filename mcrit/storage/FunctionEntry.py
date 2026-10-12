@@ -9,6 +9,8 @@ from mcrit.minhash.MinHash import MinHash
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
 
 if TYPE_CHECKING:  # pragma: no cover
+    from smda.common.SmdaReport import SmdaReport
+
     from mcrit.storage.SampleEntry import SampleEntry
 
 # smda publishes the fields SmdaFunction.fromDict requires since 4.4.5; releases before that read the
@@ -53,6 +55,28 @@ def smdaFunctionFromXcfg(xcfg: Optional[Dict], binary_info: Optional[BinaryInfo]
     if missing:
         raise ValueError(f"stored disassembly of the function at offset {xcfg.get('offset')} lacks {', '.join(missing)}, which SmdaFunction.fromDict requires")
     return SmdaFunction.fromDict(xcfg, binary_info=binary_info)
+
+
+def isValidPicHash(value) -> bool:
+    """Whether a value can be stored as a pichash or picblockhash: an int of 0..2**64-1.
+
+    That is what smda and picblocks compute, and all MongoDbStorage reads back (#145): it wrote a
+    negative value as "0x-000000000000005", which no reader decodes, one of 2**64 or more wider
+    than the 16 digits its ordering relies on, and an operator dict as a sub-document. A bool is
+    an int, but no pichash.
+    """
+    return type(value) is int and 0 <= value < 1 << 64
+
+
+def checkSubmittedPicHashes(smda_report: "SmdaReport") -> None:
+    """Refuse a report stating a pic_hash that cannot be stored, before any of it is written.
+
+    smda keeps the pic_hash a current report states and recomputes it only for older ones, so it
+    is whatever was submitted. A function without one is stored with 0, as FunctionEntry does.
+    """
+    for smda_function in smda_report.getFunctions():
+        if not isValidPicHash(smda_function.pic_hash or 0):
+            raise ValueError(f"the function at offset {smda_function.offset} states a pic_hash that is not an integer of 0..2**64-1")
 
 
 # Dataclass, post init
@@ -110,6 +134,11 @@ class FunctionEntry:
 
     def getMinHash(self, minhash_bits=32):
         return MinHash(function_id=self.function_id, minhash_bytes=self.minhash, minhash_bits=minhash_bits)
+
+    def hasValidPicHashes(self) -> bool:
+        """Whether the pichash and every picblockhash can be stored, see isValidPicHash; for an imported entry."""
+        blocks = self.picblockhashes
+        return isValidPicHash(self.pichash) and isinstance(blocks, list) and all(isinstance(block, dict) and isValidPicHash(block.get("hash")) for block in blocks)
 
     def toSmdaFunction(self) -> Optional[SmdaFunction]:
         """The SmdaFunction this entry's disassembly describes; None when it carries none."""
