@@ -1,7 +1,9 @@
+import ipaddress
 import json
 import logging
 import os
 import secrets
+from urllib.parse import urlsplit
 
 import falcon
 
@@ -22,6 +24,96 @@ from .utils import jsonify
 if not logging.root.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)-15s %(message)s")
 LOGGER = logging.getLogger(__name__)
+
+
+# the GET routes that schedule a job, which a web page can make a browser request with an <img> or a link
+JOB_SCHEDULING_GET_ROUTES = {
+    "/complete_minhashes",
+    "/rebuild_index",
+    "/rebuild_picblockhash_index",
+    "/rebuild_function_range_index",
+    "/rebuild_band_df_index",
+    "/band_df_cutoff_coverage",
+    "/recalculate_pichashes",
+    "/recalculate_minhashes",
+    "/matches/sample/{sample_id:int}",
+    "/matches/sample/cross/{sample_ids}",
+    "/matches/sample/{sample_id:int}/{sample_id_b:int}",
+    "/uniqueblocks/samples/{comma_separated_sample_ids}",
+    "/uniqueblocks/family/{family_id:int}",
+}
+
+
+def getAllowedHosts():
+    """Names a browser may reach the API under besides IP addresses and localhost, from MCRIT_ALLOWED_HOSTS ("*" allows any).
+
+    Read here rather than from McritConfig, which a deployment may replace by a copy that predates it.
+    """
+    return [name.strip().lower() for name in os.getenv("MCRIT_ALLOWED_HOSTS", "").split(",") if name.strip()]
+
+
+class CrossSiteRequestMiddleware:
+    """Refuse what a foreign web page can make a browser send to an API that has no token.
+
+    Without MCRIT_AUTH_TOKEN nothing else tells the analyst's tooling apart from a page the analyst
+    merely opened: a form POST to /respawn, a text/plain POST to /import or an <img> on a
+    job-scheduling GET need no CORS preflight, and DNS rebinding makes a page under the attacker's
+    name same-origin with the API. Only requests that identify themselves as a browser's are held
+    to the checks - any Sec-Fetch-* or Origin header, which a page cannot set, or a Mozilla/
+    User-Agent other than PowerShell's. Clients that are not browsers (McritClient, MCRITweb and the IDA plugin behind it,
+    curl) send none of these and pass whatever Host they name, so a container's service name needs
+    no entry in MCRIT_ALLOWED_HOSTS. A browser request is refused for a Host that is not an IP
+    address, localhost or one of MCRIT_ALLOWED_HOSTS, for being marked as sent by another
+    site, for an Origin other than the API's own, and, on the job-scheduling GETs, always: a
+    navigation to one cannot be told apart from a redirect a foreign page has set up.
+    """
+
+    def process_request(self, req, resp):
+        if McritConfig.AUTH_TOKEN not in [None, ""] or not self._isBrowser(req):
+            return
+        host = req.get_header("Host")
+        origin = req.get_header("Origin")
+        if host is not None and not self._isAllowedHost(host):
+            raise falcon.HTTPForbidden(title="Host not allowed", description=f"Host {host} is not one this instance answers to (MCRIT_ALLOWED_HOSTS).")
+        if req.get_header("Sec-Fetch-Site") in ("cross-site", "same-site") or (origin is not None and urlsplit(origin).netloc.lower() != (host or "").lower()):
+            raise falcon.HTTPForbidden(title="Cross-site request", description="Requests from other sites are refused.")
+
+    def process_resource(self, req, resp, resource, params):
+        if McritConfig.AUTH_TOKEN not in [None, ""] or not self._isBrowser(req):
+            return
+        if req.method == "GET" and req.uri_template in JOB_SCHEDULING_GET_ROUTES:
+            raise falcon.HTTPForbidden(title="Browser request", description="Jobs are not scheduled for a browser request; use McritClient or another API client.")
+
+    @staticmethod
+    def _isBrowser(req):
+        return (
+            req.get_header("Origin") is not None
+            or req.get_header("Sec-Fetch-Site") is not None
+            or req.get_header("Sec-Fetch-Mode") is not None
+            or CrossSiteRequestMiddleware._isMozillaAgent(req.user_agent or "")
+        )
+
+    @staticmethod
+    def _isMozillaAgent(user_agent):
+        # PowerShell's Invoke-WebRequest and Invoke-RestMethod (and curl, its alias in Windows PowerShell) start theirs with Mozilla/ too
+        return "Mozilla/" in user_agent and "PowerShell/" not in user_agent
+
+    @staticmethod
+    def _isAllowedHost(host):
+        allowed_hosts = getAllowedHosts()
+        if "*" in allowed_hosts:
+            return True
+        try:
+            hostname = urlsplit("//" + host).hostname
+        except ValueError:
+            return False
+        if not hostname or hostname == "localhost" or hostname in allowed_hosts:
+            return True
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            return False
+        return True
 
 
 # https://falcon.readthedocs.io/en/stable/user/quickstart.html#a-more-complex-example
@@ -113,7 +205,7 @@ def get_app():
     query_resource = QueryResource(index)
     job_resource = JobResource(index)
 
-    _app = falcon.App(middleware=[AuthMiddleware(), RepeatedParameterMiddleware()])
+    _app = falcon.App(middleware=[CrossSiteRequestMiddleware(), AuthMiddleware(), RepeatedParameterMiddleware()])
     _app.req_options.strip_url_path_trailing_slash = True
     _app.add_route("/", status_resource)
     _app.add_route("/status", status_resource, suffix="status")

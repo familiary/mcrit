@@ -71,7 +71,11 @@ and
 $ mcrit worker
 ```
 
-By default, the REST API server will be listening on [http://127.0.0.1:8000/](http://127.0.0.1:8000/).
+By default, the REST API server will be listening on [http://127.0.0.1:8000/](http://127.0.0.1:8000/), so only the host itself can reach it. This is the IPv4 loopback only: where `localhost` resolves to `::1` first, use `http://127.0.0.1:8000/` or set `MCRIT_SERVER_BIND` to `[::1]:8000`.
+To serve other hosts, e.g. from a container, set `MCRIT_SERVER_BIND` to the address to listen on (`<host>:<port>`, such as `0.0.0.0:8000`), or `BIND` in `GunicornConfig`; a value without a host (`:8000`) is read as `127.0.0.1:8000`.
+The API requires no authentication unless `MCRIT_AUTH_TOKEN` is set, in which case clients have to send that token as the `apitoken` header - without it, anyone who can reach the port can read, change and delete everything the instance holds.
+Without a token, requests that come from a web browser are also held to the address they were made to: the `Host` has to be an IP address, `localhost` or a name listed in `MCRIT_ALLOWED_HOSTS` (comma-separated, `*` allows any), cross-site requests are refused, and the GET routes that schedule a job (such as `/rebuild_index` or `/matches/sample/<id>`) are not served to a browser at all.
+API clients such as `McritClient` and MCRITweb are not affected.
 
 
 ## Interaction
