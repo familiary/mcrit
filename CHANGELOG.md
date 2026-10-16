@@ -405,6 +405,41 @@ and every new setting is off by default.
   functions deleted under it. Query samples written before this release have no count and hold
   the disassembly judgment back until the last of them has expired.
 
+### Security
+
+- **`mcrit client query -o` writes its report only under a valid job id.** The file was named after
+  the job id exactly as the server answered it, so an id such as
+  `../../.docker/config` put the server's JSON outside the `-o` directory as `.docker/config.json`,
+  overwriting any file of that name, before the report was parsed. An answer that is not a 24-character
+  hex job id, as the server issues them, now ends the query with a message and writes nothing.
+
+- **Workers no longer import modules from their working directory.** The job processes of `mcrit
+  spawningworker` (`python -m mcrit`) and the processes behind the hashing and matching pools and
+  their resource trackers (`python -c`) had the working directory first on `sys.path`, so a `mcrit/`,
+  `multiprocessing/` or similar module placed there ran in them. The job processes now start with
+  `-P`. `mcrit server`, `worker`, `spawningworker` and `singlejobworker` set `PYTHONSAFEPATH` at
+  startup, so everything they spawn inherits it, including pool processes replaced after a crash.
+  Code that uses the pools as a library gets it only while a pool is being created. A source checkout
+  that is not installed has to be on `PYTHONPATH` for the spawning worker.
+
+- **`mcrit client` escapes control characters in what other users stored.** `queue`, `search`,
+  `query` and the warnings of the `dir` and `malpedia` submit modes printed family names, versions,
+  filenames, the sha256 of a submitted report and job parameters raw, so one submission could erase
+  or hide lines, forge a match row or set the window title in another user's terminal. Control
+  characters in them now print as `\x1b`, `\n` and so on.
+
+- **`mcrit client submit --worker` no longer runs modules found in the directory it is started
+  from.** The per-file children ran as `python -m mcrit`, which puts the working directory first on
+  `sys.path`: a `json.py`, `requests/` or `mcrit/` among the files being submitted ran in every
+  child. The children now start with `-P`, and with the interpreter that runs the parent instead of
+  whatever `python` is first on `PATH`. A source checkout that is not installed has to be on
+  `PYTHONPATH` for `--worker`.
+
+- **A file name that is not valid UTF-8 no longer ends a bulk `mcrit client submit`.** The output of
+  a `--worker` child was decoded strictly, and under a locale with a strict stdout (`en_US.UTF-8`)
+  printing such a name raised `UnicodeEncodeError`. The bytes now print as escapes and the run
+  continues: `\xef` in what a `--worker` child printed, `\udcef` in the lines of the command itself.
+
 ## [1.14.0] - 2026-10-09
 
 **Minor release: one addition, fixes, and nothing to run on a deployment that keeps the defaults.**

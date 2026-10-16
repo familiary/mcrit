@@ -110,6 +110,11 @@ def main():
             is_profiling = True
         if len(sys.argv) >= 3 and "--gunicorn" in sys.argv[2:]:
             uses_gunicorn = True
+        if sys.argv[1] in ["server", "worker", "spawningworker", "singlejobworker"]:
+            # for good, before anything is spawned: the pools, the resource trackers and the replacements for
+            # crashed pool processes of these long-running commands all start as `python -c` with the working
+            # directory first on sys.path, unless they inherit this
+            os.environ["PYTHONSAFEPATH"] = "1"
         if sys.argv[1] == "server":
             runServer(profiling=is_profiling, uses_gunicorn=uses_gunicorn)
         elif sys.argv[1] == "worker":
