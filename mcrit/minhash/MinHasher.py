@@ -76,10 +76,20 @@ class MinHasher:
         return minhash
 
     def calculateMinHashesFromStorage(self, function_tuples):
+        """The MinHashes of those (function_id, smda_function) tuples that can be hashed.
+
+        A function the shinglers fail on is logged and left out (it stays unhashed), like one without
+        disassembly: its disassembly can come from a submitted report, and raising failed every other
+        function of the batch with it, on every retry - for recalculateMinHashes after dropping all.
+        """
         minhashes = []
         for function_tuple in function_tuples:
             function_id, smda_function = function_tuple
-            minhash = self._calculateMinHash(smda_function)
+            try:
+                minhash = self._calculateMinHash(smda_function)
+            except Exception as exc:
+                LOGGER.warning("Function %d could not be minhashed and is skipped: %s: %s", function_id, type(exc).__name__, exc)
+                continue
             minhash.function_id = function_id
             minhashes.append(minhash)
         return minhashes

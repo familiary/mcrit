@@ -243,6 +243,43 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   Behaviour change: a caller that relied on either listing to return every entry receives the
   first 1,000, and one that posts ids to `/functions` itself can send at most 10,000 per request; a `McritClient` from an earlier release sends all ids in one request and gets `{}` back for more than that.
 
+- A sample whose SMDA report had no timestamp (missing or empty) was stored, but reading it back
+  failed, so the sample listing, the sample itself, its family with samples, the export and every
+  matching job that reached it answered with an error, and the sample could not be deleted through
+  the API. A stored timestamp that cannot be read is now treated as no timestamp. Samples stored
+  earlier read back the same way, without a migration.
+
+- A sample whose SMDA report had no `statistics` was stored in full before submitting it failed with
+  a server error, and from then on every matching job that found a match in it failed with
+  `KeyError: 'num_functions'`. The family counters now count the functions that were stored instead
+  of the figure the report states, the matchers count a sample's functions when its statistics hold
+  none, and importing an export that holds such a sample works.
+
+- The function counter of a family could be set to any value by a report's
+  `statistics.num_functions`; a very large claim saturated it, after which every later report into
+  that family was stored without being counted or hashed. A family now counts the functions that
+  were actually stored, for submitted reports as well as for imports (the sample is counted when its
+  entry is imported and its functions as they are imported). A counter that is already off stays
+  so until `POST /recompute_family_stats` resets it from the stored functions.
+
+- A function in a submitted report whose offset is not one of its blocks, or an AArch64 prologue
+  with an operand such as `#-010`, made the fuzzy shingler raise, which failed every minhash batch
+  holding it (including `complete_minhashes`, `repair_minhashes` and `recalculate_minhashes`, the
+  last after it had already dropped all hashes). The shingler now treats such a function as having
+  no stack frame, and a function the shinglers still fail on is logged and left unhashed while the
+  rest of its batch is hashed.
+
+- The `sha256` of a submitted SMDA report is now checked to be 64 hex digits; anything else
+  (including a JSON object, which MongoDB read as a query operator and resolved to an existing
+  sample) is answered with 400 and nothing is stored. A report smda refuses as malformed is also
+  answered with 400 instead of a server error.
+
+- Functions whose report carries no PicHash are stored with PicHash 0. The vs and vs-group matchers
+  and the MongoDB sample matching treated 0 as a hash like any other and reported every such
+  function as an exact match of every other one; the in-memory storage failed sample matching with
+  `KeyError: 0`. A PicHash of 0 now never matches. Cached matching results from before are
+  recomputed on their next request.
+
 ## [1.15.0] - 2026-10-12
 
 **Minor release: a cheaper PicHash recalculation, client fixes, family actors, an optional binary

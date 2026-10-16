@@ -1292,7 +1292,8 @@ class MongoDbStorageTest(MemoryStorageTest):
         assert family is not None
         self.assertEqual("family_1", family.family_name)
         self.assertEqual(1, family.num_samples)
-        self.assertEqual(10, family.num_functions)
+        # its functions count once they are imported, not by what its statistics state
+        self.assertEqual(0, family.num_functions)
 
     def testAStatsUpdateAgainstAMissingFamilyIsLogged(self):
         self.storage.clearStorage()

@@ -4,10 +4,12 @@ import logging
 import os
 import unittest
 from copy import deepcopy
+from unittest.mock import patch
 
 from smda.common.SmdaReport import SmdaReport
 
 from mcrit.index.MinHashIndex import MinHashIndex
+from mcrit.minhash.MinHasher import MinHasher
 
 from .context import config
 
@@ -75,6 +77,35 @@ class UpdateMinHashesTest(unittest.TestCase):
         worker_single = index_single.queue._worker
         index_single._storage.addSmdaReport(self.report)
         self.assertEqual(num_updated, worker_single.updateMinHashes(None))
+
+    def testAFunctionTheShinglersFailOnStaysUnhashedAlone(self):
+        """A function whose disassembly the shinglers raise for - it can come from a submitted report -
+        failed the whole batch on every retry, after recalculateMinHashes had dropped every minhash.
+        Now only that function stays unhashed, in the pool's callable and in the serial loop."""
+        index = self._freshIndex()
+        worker = index.queue._worker
+        index._storage.addSmdaReport(self.report)
+        hashable = index._storage.getUnhashedFunctions(None)
+        failing_offset = hashable[0].offset
+        calculate = MinHasher._calculateMinHash
+
+        def calculateAllButOne(minhasher, smda_function):
+            if smda_function.offset == failing_offset:
+                raise KeyError(failing_offset)
+            return calculate(minhasher, smda_function)
+
+        # serial hashing, which the patch reaches and a process pool would not; patched rather than
+        # set, as the config objects are shared class attributes of McritConfig
+        with (
+            patch.object(worker._minhash_config, "MINHASH_POOL_INDEXING", False),
+            patch.object(MinHasher, "_calculateMinHash", calculateAllButOne),
+            patch("mcrit.Worker.LOGGER") as logger,
+        ):
+            function_tuples = [(entry.function_id, entry.toSmdaFunction()) for entry in hashable]
+            self.assertEqual(len(hashable) - 1, len(worker.minhasher.calculateMinHashesFromStorage(function_tuples)))
+            self.assertEqual(len(hashable) - 1, worker.updateMinHashes(None))
+        self.assertIn("could not be hashed", logger.warning.call_args.args[0])
+        self.assertEqual([hashable[0].function_id], [entry.function_id for entry in index._storage.getUnhashedFunctions(None)])
 
 
 if __name__ == "__main__":

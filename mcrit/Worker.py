@@ -46,7 +46,7 @@ LOGGER = logging.getLogger(__name__)
 # answered from a job computed by the same results version (#241). Bump it in any change that
 # alters what such a report holds for the same corpus and parameters - jobs made before are
 # then recomputed on their next request instead of being handed out again.
-RESULTS_VERSION = 2
+RESULTS_VERSION = 3
 
 
 class Worker(QueueRemoteCallee):
@@ -800,10 +800,13 @@ class Worker(QueueRemoteCallee):
                     progress_reporter.set_total(len(smda_functions))
                     is_stepping = True
                 for smda_function in tqdm.tqdm(smda_functions, total=len(smda_functions)):
-                    minhashes.append(self.minhasher.calculateMinHashFromStorage(smda_function))
+                    minhashes.extend(self.minhasher.calculateMinHashesFromStorage([smda_function]))
                     if is_stepping:
                         progress_reporter.step()
             LOGGER.info("Calculated minhashes for %d function entries!", len(minhashes))
+            if len(minhashes) < len(smda_functions):
+                # each one is logged with its function id by calculateMinHashesFromStorage
+                LOGGER.warning("Calculating MinHashes: %d function entries could not be hashed and stay unhashed.", len(smda_functions) - len(minhashes))
         return minhashes
 
     ##### CONFIG CHANGES ####
