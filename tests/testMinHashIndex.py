@@ -264,6 +264,77 @@ class UniqueBlocksCoverTestSuite(unittest.TestCase):
         self.assertEqual(0, result["statistics"]["yara_covers"])
         self.assertFalse(result["statistics"]["has_yara_rule"])
 
+    def testUnreachableCoverLooksAtEveryBlockOnlyOnce(self):
+        # a covers_required beyond what the blocks reach selects every block, and the cover used to
+        # rescan and resort all of them for each one it selected - cubic in their number, so one GET
+        # with covers_required=1000000000 held a worker for about an hour on a sample of 10,000 blocks
+        index = MinHashIndex(config)
+        worker = index.queue._worker
+        report = SmdaReport.fromFile(EXAMPLE_REPORT)
+        assert report is not None
+        sample_entry = index._storage.addSmdaReport(report)
+        assert sample_entry is not None
+        reads = []
+
+        class CountingEntry(dict):
+            def __getitem__(self, key):
+                if key == "samples":
+                    reads.append(key)
+                return super().__getitem__(key)
+
+        find_blocks = index._storage.getUniqueBlocks
+
+        def counted_blocks(*args, **kwargs):
+            blocks_result = find_blocks(*args, **kwargs)
+            blocks_result["unique_blocks"] = {block_hash: CountingEntry(entry) for block_hash, entry in blocks_result["unique_blocks"].items()}
+            return blocks_result
+
+        with patch.object(index._storage, "getUniqueBlocks", side_effect=counted_blocks):
+            result = worker.getUniqueBlocks([sample_entry.sample_id], covers_required=1000000000)
+        num_blocks = len(result["unique_blocks"])
+        self.assertGreater(num_blocks, 100)
+        self.assertEqual(sorted(result["unique_blocks"]), sorted(result["yara_rule"]))
+        self.assertEqual(num_blocks, len(set(result["yara_rule"])))
+        statistics = result["statistics"]
+        self.assertTrue(statistics["has_yara_rule"])
+        self.assertFalse(statistics["has_complete_yara_rule"])
+        self.assertEqual(0, statistics["num_samples_covered"])
+        self.assertEqual(num_blocks, statistics["yara_covers"])
+        # a block's samples are read when it joins the candidates and when it is taken - not once per round
+        self.assertLessEqual(len(reads), 2 * num_blocks)
+
+    def testCoverPrefersReachThenScoreThenTheLaterBlock(self):
+        index = MinHashIndex(config)
+        worker = index.queue._worker
+        report = SmdaReport.fromFile(EXAMPLE_REPORT)
+        assert report is not None
+        sample_entry = index._storage.addSmdaReport(report)
+        assert sample_entry is not None
+
+        def block(samples, score):
+            instructions = [[sample_entry.base_addr, "90", "nop", ""]]
+            return {"samples": samples, "score": score, "length": 1, "instructions": instructions, "sample_id": samples[0]}
+
+        def cover(covers_required):
+            # "b" and "c" reach two samples each at the same score, so the later one, "c", goes first
+            blocks = {"a": block([1], 90.0), "b": block([1, 2], 10.0), "c": block([2, 3], 10.0), "d": block([3], 50.0)}
+            found = {"statistics": {}, "unique_blocks": blocks}
+            with patch.object(index._storage, "getUniqueBlocks", return_value=found), patch.object(index._storage, "getSampleById", return_value=sample_entry):
+                return worker.getUniqueBlocks([1, 2, 3], covers_required=covers_required)
+
+        once = cover(1)
+        # "c" leaves sample 1 uncovered, which "a" and "b" both reach - "a" with the higher score
+        self.assertEqual(["c", "a"], once["yara_rule"])
+        self.assertTrue(once["statistics"]["has_complete_yara_rule"])
+        twice = cover(2)
+        self.assertEqual(["c", "b", "a", "d"], twice["yara_rule"])
+        self.assertTrue(twice["statistics"]["has_complete_yara_rule"])
+        self.assertEqual(2, twice["statistics"]["yara_covers"])
+        thrice = cover(3)
+        self.assertEqual(["c", "b", "a", "d"], thrice["yara_rule"])
+        self.assertFalse(thrice["statistics"]["has_complete_yara_rule"])
+        self.assertTrue(thrice["statistics"]["has_yara_rule"])
+
 
 class EscaperProvenanceTestSuite(unittest.TestCase):
     """MinHashes are derived from smda's escaped instructions, so an export has to say which

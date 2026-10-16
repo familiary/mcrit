@@ -14,7 +14,7 @@ from mcrit.client.McritClient import McritClient
 from mcrit.config.MinHashConfig import MinHashConfig
 from mcrit.config.StorageConfig import StorageConfig
 from mcrit.index.MatchingParameters import MATCHING_KNOBS, MATCHING_PRESETS, applyMatchingPreset, resolveMatchingParams
-from mcrit.index.MinHashIndex import MinHashIndex
+from mcrit.index.MinHashIndex import MAX_CROSS_COMPARE_SAMPLES, MinHashIndex
 from mcrit.matchers.MatcherSample import MatcherSample
 from mcrit.matchers.MatcherVs import MatcherVs
 from mcrit.matchers.MatcherVsGroup import MatcherVsGroup
@@ -605,6 +605,103 @@ class ForwardingTest(unittest.TestCase):
                     MinHashIndex.getMatchesCross(index, [1, 2], sample_group_only=sample_group_only, **KNOBS)
                 index.getMatchesForSample.assert_not_called()
                 index.getMatchesForSampleVsGroup.assert_not_called()
+
+    def test_cross_matching_compares_a_repeated_sample_once(self):
+        """Each vs-group child loads every other sample named, so a repeated id was loaded once per repetition."""
+        index = MagicMock()
+        MinHashIndex.getMatchesCross(index, [1, 2, 2, 3, 2, 1], sample_group_only=True)
+        children = [(call.args[0], call.args[1]) for call in index.getMatchesForSampleVsGroup.call_args_list]
+        self.assertEqual([(1, [2, 3]), (2, [1, 3]), (3, [1, 2])], children)
+        index = MagicMock()
+        MinHashIndex.getMatchesCross(index, [1, 2, 2, 1])
+        self.assertEqual([1, 2], [call.args[0] for call in index.getMatchesForSample.call_args_list])
+
+    def test_a_group_match_loads_a_repeated_sample_once(self):
+        mcrit_config = configured()
+        mcrit_config.MINHASH_CONFIG.MINHASH_POOL_INDEXING = False
+        mcrit_config.MINHASH_CONFIG.MINHASH_POOL_MATCHING = False
+        index = MinHashIndex(config=mcrit_config)
+        worker = index.queue._worker
+        sample_ids = [index._storage.addSmdaReport(SmdaReport.fromFile(f"tests/{name}")).sample_id for name in MatchingInfoTest.REPORTS]
+        for sample_id in sample_ids:
+            worker.updateMinHashesForSample(sample_id)
+        once = worker.getMatchesForSampleVsGroup(sample_ids[0], sample_ids[1:])
+        with patch.object(index._storage, "getFunctionsBySampleId", wraps=index._storage.getFunctionsBySampleId) as loads:
+            repeated = worker.getMatchesForSampleVsGroup(sample_ids[0], [sample_ids[1]] * 10 + sample_ids[1:])
+        loaded = [call.args[0] for call in loads.call_args_list]
+        self.assertEqual([1, 1], [loaded.count(other_id) for other_id in sample_ids[1:]])
+        self.assertEqual(once["matches"], repeated["matches"])
+
+    def test_a_cross_compare_takes_a_bounded_number_of_samples(self):
+        too_many = list(range(MAX_CROSS_COMPARE_SAMPLES + 1))
+        index = MagicMock()
+        with self.assertRaises(ValueError):
+            MinHashIndex.getMatchesCross(index, too_many, sample_group_only=True)
+        index.getMatchesForSampleVsGroup.assert_not_called()
+        index.combineMatchesToCross.assert_not_called()
+        # a repetition is no other sample
+        MinHashIndex.getMatchesCross(index, too_many[:-1] + too_many[:-1])
+        self.assertEqual(MAX_CROSS_COMPARE_SAMPLES, index.getMatchesForSample.call_count)
+        index = MagicMock()
+        index.config = configured()
+        app = falcon.App()
+        app.add_route("/matches/sample/cross/{sample_ids}", MatchResource(index), suffix="sample_cross")
+        client = falcon.testing.TestClient(app)
+        response = client.simulate_get("/matches/sample/cross/" + ",".join(str(sample_id) for sample_id in too_many), query_string="sample_group_only=true")
+        self.assertEqual(falcon.HTTP_400, response.status)
+        index.getMatchesCross.assert_not_called()
+        client.simulate_get("/matches/sample/cross/" + ",".join(str(sample_id) for sample_id in too_many[:-1] * 2))
+        index.getMatchesCross.assert_called_once()
+
+    def test_a_group_match_never_loads_the_disassembly_of_a_stored_sample(self):
+        """The sizes of the own sample are read for the summaries; its disassembly is what a function weighs."""
+        mcrit_config = configured()
+        mcrit_config.MINHASH_CONFIG.MINHASH_POOL_INDEXING = False
+        mcrit_config.MINHASH_CONFIG.MINHASH_POOL_MATCHING = False
+        index = MinHashIndex(config=mcrit_config)
+        worker = index.queue._worker
+        sample_ids = [index._storage.addSmdaReport(SmdaReport.fromFile(f"tests/{name}")).sample_id for name in MatchingInfoTest.REPORTS]
+        for sample_id in sample_ids:
+            worker.updateMinHashesForSample(sample_id)
+        with patch.object(index._storage, "getFunctionsBySampleId", wraps=index._storage.getFunctionsBySampleId) as loads:
+            worker.getMatchesForSampleVsGroup(sample_ids[0], sample_ids[1:])
+        # the own sample, read again for the summaries, and every other sample: none with its disassembly
+        self.assertGreaterEqual(len(loads.call_args_list), len(sample_ids) + 1)
+        self.assertEqual([], [call for call in loads.call_args_list if call.kwargs.get("with_xcfg", True)])
+
+    def test_a_group_match_holds_only_what_it_reads_of_the_other_samples(self):
+        """Each child of a cross compare is matched against every other sample named, and held all of them with their disassembly."""
+        mcrit_config = configured()
+        mcrit_config.MINHASH_CONFIG.MINHASH_POOL_INDEXING = False
+        mcrit_config.MINHASH_CONFIG.MINHASH_POOL_MATCHING = False
+        index = MinHashIndex(config=mcrit_config)
+        worker = index.queue._worker
+        storage = index._storage
+        sample_ids = [storage.addSmdaReport(SmdaReport.fromFile(f"tests/{name}")).sample_id for name in MatchingInfoTest.REPORTS]
+        for sample_id in sample_ids:
+            worker.updateMinHashesForSample(sample_id)
+        load = storage.getFunctionsBySampleId
+        with patch.object(storage, "getFunctionsBySampleId", side_effect=lambda sample_id, with_xcfg=True: load(sample_id)):
+            with_disassembly = worker.getMatchesForSampleVsGroup(sample_ids[0], sample_ids[1:])
+        matchers = []
+        original_match = MatcherVsGroup.getMatchesForSample
+
+        def observing_match(matcher, sample_id, other_sample_ids):
+            matchers.append(matcher)
+            return original_match(matcher, sample_id, other_sample_ids)
+
+        with patch.object(MatcherVsGroup, "getMatchesForSample", observing_match):
+            without_disassembly = worker.getMatchesForSampleVsGroup(sample_ids[0], sample_ids[1:])
+        [matcher] = matchers
+        self.assertTrue(matcher._function_entries)
+        self.assertTrue(all(function_entry.xcfg is None for function_entry in matcher._function_entries))
+        # of the other samples, their function ids and the holders of an own PicHash
+        self.assertEqual({function_entry.function_id for sample_id in sample_ids[1:] for function_entry in load(sample_id)}, matcher._other_function_ids)
+        own_pichashes = {function_entry.pichash for function_entry in matcher._function_entries}
+        self.assertTrue(set(matcher._other_pichash_holders) <= own_pichashes)
+        self.assertEqual(with_disassembly["matches"], without_disassembly["matches"])
+        # the stored functions keep theirs
+        self.assertTrue(all(function_entry.xcfg for function_entry in load(sample_ids[1])))
 
     def test_cross_matching_keeps_the_samples_it_names(self):
         """End to end: a configured shortlist of 1 used to zero the pairs a cross compare exists for."""

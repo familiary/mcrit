@@ -903,7 +903,8 @@ class MatcherInterface:
             # rely on dynamically created function entries
             own_sample_function_entries = self._function_entries
         else:
-            own_sample_function_entries = self._storage.getFunctionsBySampleId(own_sample_info["sample_id"])
+            # sizes only: the disassembly is not read here
+            own_sample_function_entries = self._storage.getFunctionsBySampleId(own_sample_info["sample_id"], with_xcfg=False)
         for function_entry in own_sample_function_entries:
             if self._isMatchableFunction(function_entry):
                 own_sample_num_matchable_bytes += function_entry.binweight

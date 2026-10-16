@@ -10,7 +10,7 @@ import uuid
 from collections import defaultdict
 from copy import copy, deepcopy
 from itertools import zip_longest
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 from packaging import version as packaging_version
 from picblocks.blockhasher import BlockHasher
@@ -819,7 +819,7 @@ class MemoryStorage(StorageInterface):
         return None
 
     # TODO does this need to be more efficient?
-    def getFunctionsBySampleId(self, sample_id: int) -> Optional[List["FunctionEntry"]]:
+    def getFunctionsBySampleId(self, sample_id: int, with_xcfg: bool = True) -> Optional[List["FunctionEntry"]]:
         if sample_id in self._samples or sample_id in self._query_samples:
             function_ids = self._sample_id_to_function_ids[sample_id]
             function_entries = []
@@ -830,8 +830,18 @@ class MemoryStorage(StorageInterface):
                     function_entry = self._functions[function_id]
                 function_entries.append(function_entry)
             # TODO is deepcopy necessary?
-            return deepcopy(function_entries)
+            # without disassembly: the memo hands each xcfg over as None instead of copying it
+            memo = {} if with_xcfg else {id(entry.xcfg): None for entry in function_entries if entry.xcfg is not None}
+            return deepcopy(function_entries, memo)
         return None
+
+    def getFunctionsBySampleIdInBatches(self, sample_id: int, batch_size: int = 1000) -> Iterator[List["FunctionEntry"]]:
+        if sample_id not in self._samples and sample_id not in self._query_samples:
+            return
+        functions = self._query_functions if sample_id < 0 else self._functions
+        function_ids = self._sample_id_to_function_ids[sample_id]
+        for start in range(0, len(function_ids), batch_size):
+            yield deepcopy([functions[function_id] for function_id in function_ids[start : start + batch_size]])
 
     def getFunctionIdsBySampleId(self, sample_id: int) -> Optional[List["int"]]:
         function_ids = None

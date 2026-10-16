@@ -177,6 +177,19 @@ class MongoRebuildPathsTest(unittest.TestCase):
     def tearDown(self):
         self.storage.clearStorage()
 
+    def test_functions_load_without_their_disassembly_on_request(self):
+        sample_id = self.sample_entry.sample_id
+        with_disassembly = self.storage.getFunctionsBySampleId(sample_id)
+        without = self.storage.getFunctionsBySampleId(sample_id, with_xcfg=False)
+        self.assertTrue(with_disassembly and all(function_entry.xcfg for function_entry in with_disassembly))
+        self.assertTrue(all(function_entry.xcfg is None for function_entry in without))
+        stripped = [dict(function_entry.toDict(), xcfg=None) for function_entry in with_disassembly]
+        self.assertEqual(stripped, [dict(function_entry.toDict(), xcfg=None) for function_entry in without])
+        # a document from before the disassembly moved out of it carries it inline
+        db = self.storage._getDb()
+        db.functions.update_one({"function_id": without[0].function_id}, {"$set": {"_xcfg": json.dumps(with_disassembly[0].xcfg)}})
+        self.assertIsNone(self.storage.getFunctionsBySampleId(sample_id, with_xcfg=False)[0].xcfg)
+
     def test_a_missing_blob_is_skipped_by_minhashing(self):
         db = self.storage._getDb()
         unhashed = self.storage.getUnhashedFunctions()

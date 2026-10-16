@@ -130,10 +130,11 @@ class StorageConfig(ConfigInterface):
     # one. Measured directly, a document holds about 1.35 million ids while they fit in 32 bits
     # and about 1.05 million once they need BSON int64. On a 7,244-sample real corpus the longest
     # posting list across all 20 bands held 36,183 ids, which puts the wall near 270,000 samples
-    # if it grows linearly. Past it the $push does not slow down, it
-    # fails ("BSONObj size ... is invalid"), and indexing stops for any sample holding a function
-    # whose band hash is already at the cap. Sharding does not move this: a document cannot span
-    # shards.
+    # if it grows linearly - and far sooner for one function submitted over and over, since every
+    # copy adds a posting to the same hash in each band. Past it the $push does not slow down, it
+    # is refused: the hash takes no further postings, which are left out with an error record and
+    # a warning naming the hash, so a function holding it is no longer found through that band.
+    # Sharding does not move this: a document cannot span shards.
     #
     # 100,000 leaves a wide margin under the cap even if postings grow heavier than measured, and
     # keeps a single document small enough to be cheap to ship. It must stay comfortably above

@@ -1,7 +1,7 @@
 import datetime
 import logging
 import random
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Protocol, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Protocol, Set, Tuple, Union
 
 from packaging import version
 
@@ -407,14 +407,29 @@ class StorageInterface:
         assert smda_report is not None
         return RebuiltSmdaReport(smda_report, extras_missing=smda_extras is None, num_functions_without_disassembly=num_functions_without_disassembly)
 
-    def getFunctionsBySampleId(self, sample_id: int) -> Optional[List["FunctionEntry"]]:
+    def getFunctionsBySampleId(self, sample_id: int, with_xcfg: bool = True) -> Optional[List["FunctionEntry"]]:
         """For a given sample_id, get all corresponding FunctionEntries.
 
         Args:
             sample_id: a sample_id
+            with_xcfg: False leaves each entry's disassembly (xcfg) out - most of what a function
+                weighs, and nothing matching reads
 
         Returns:
             A list of FunctionEntries or None, if sample_id does not exist
+        """
+        raise NotImplementedError
+
+    def getFunctionsBySampleIdInBatches(self, sample_id: int, batch_size: int = 1000) -> Iterator[List["FunctionEntry"]]:
+        """getFunctionsBySampleId one batch at a time, for a caller that should not hold all entries of a large sample at
+        once (the export).
+
+        Args:
+            sample_id: a sample_id
+            batch_size: the number of FunctionEntries per batch
+
+        Returns:
+            An iterator over lists of FunctionEntries, empty if sample_id does not exist
         """
         raise NotImplementedError
 
