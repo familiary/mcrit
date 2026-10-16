@@ -3,10 +3,12 @@
 import json
 import logging
 import os
+import random
 import unittest
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, Dict, List, cast
+from unittest.mock import patch
 
 from smda.common.SmdaReport import SmdaReport
 
@@ -825,6 +827,231 @@ class PairBudgetBatchingTestSuite(unittest.TestCase):
             batches = [len(groups) for groups in MatcherInterface._iterCandidateGroupBatches(cast(MatcherInterface, stub))]
             self.assertEqual(num_functions, sum(batches))
             self.assertLessEqual(max(batches), batch_size, f"batch size {batch_size} stopped bounding the batch")
+
+
+class PicHashCopiesTestSuite(unittest.TestCase):
+    """Copies of one function share a PicHash. Pairing each own copy with each copy of a sample made
+    m copies matched against n copies in one sample m*n entries, and m*(m-1) self matches -
+    gigabytes for a few thousand copies in one report."""
+
+    OWN_SAMPLE_ID = 7
+    BODY = [
+        ("b801000000", "mov", "eax, 1"),
+        ("bb02000000", "mov", "ebx, 2"),
+        ("b903000000", "mov", "ecx, 3"),
+        ("ba04000000", "mov", "edx, 4"),
+        ("01d8", "add", "eax, ebx"),
+        ("01c8", "add", "eax, ecx"),
+        ("01d0", "add", "eax, edx"),
+        ("31db", "xor", "ebx, ebx"),
+        ("31c9", "xor", "ecx, ecx"),
+        ("31d2", "xor", "edx, edx"),
+        ("40", "inc", "eax"),
+        ("c3", "ret", ""),
+    ]
+
+    def _harmonize(self, own_function_ids, foreign_holders=(), pichash_size=10):
+        own_entries = [SimpleNamespace(function_id=function_id, num_instructions=12) for function_id in own_function_ids]
+        stub = SimpleNamespace(_function_entries=own_entries, _pichash_size=pichash_size)
+        group = {(1, self.OWN_SAMPLE_ID, function_id) for function_id in own_function_ids}
+        group.update((2, sample_id, function_id) for sample_id, function_id in foreign_holders)
+        return MatcherInterface._harmonizePicHashMatches(cast(MatcherInterface, stub), {0x1234: group})
+
+    def _inSample(self, matches, sample_id):
+        return [match_ids for match_ids in matches if match_ids[1] == sample_id]
+
+    def testCopiesArePairedLinearly(self):
+        own_function_ids = list(range(100, 1100))
+        holders = {8: list(range(5000, 6000)), 9: [6000, 6001, 6002], 10: [7000]}
+        matches = self._harmonize(own_function_ids, [(sample_id, function_id) for sample_id, function_ids in holders.items() for function_id in function_ids])
+        self.assertTrue(all(strength == (100, True, False) for strength in matches.values()))
+        for sample_id, function_ids in [*holders.items(), (self.OWN_SAMPLE_ID, own_function_ids)]:
+            pairs = self._inSample(matches, sample_id)
+            # every own copy matches every sample holding the code, and every copy there is matched
+            self.assertEqual(set(own_function_ids), {match_ids[0] for match_ids in pairs})
+            self.assertEqual(set(function_ids), {match_ids[2] for match_ids in pairs})
+            if sample_id != self.OWN_SAMPLE_ID:
+                # each own copy with the first copy of the sample, as MinHash matching would pick it
+                self.assertEqual(len(own_function_ids) + len(function_ids) - 1, len(pairs))
+                self.assertTrue(all((own_function_id, sample_id, function_ids[0]) in matches for own_function_id in own_function_ids))
+        self_matches = self._inSample(matches, self.OWN_SAMPLE_ID)
+        self.assertEqual(len(own_function_ids), len(self_matches))
+        self.assertTrue(all(match_ids[0] != match_ids[2] for match_ids in self_matches))
+
+    def testSingleCopiesKeepEveryPair(self):
+        # one own copy matches every copy a sample holds, and every own copy matches a single one
+        self.assertEqual({(100, 8, 5000), (100, 8, 5001), (100, 8, 5002)}, set(self._harmonize([100], [(8, 5000), (8, 5001), (8, 5002)])))
+        self.assertEqual({(100, 8, 5000), (101, 8, 5000)}, set(self._inSample(self._harmonize([100, 101], [(8, 5000)]), 8)))
+        self.assertEqual({(100, self.OWN_SAMPLE_ID, 101), (101, self.OWN_SAMPLE_ID, 100)}, set(self._harmonize([100, 101])))
+        # a PicHash held by no own function matches nothing, even at pichash_size 0
+        self.assertEqual({}, self._harmonize([], [(8, 5000), (8, 5001)], pichash_size=0))
+
+    def _report(self, name, copies):
+        xcfg = {}
+        for index in range(copies):
+            offset = 0x401000 + 0x40 * index
+            instructions, cursor = [], offset
+            for hexbytes, mnemonic, operands in self.BODY:
+                instructions.append([cursor, hexbytes, mnemonic, operands])
+                cursor += len(hexbytes) // 2
+            metadata = {"binweight": cursor - offset, "characteristics": None, "confidence": None, "function_name": "", "strongly_connected_components": [[offset]], "tfidf": None}
+            xcfg[str(offset)] = {"offset": offset, "blocks": {str(offset): instructions}, "apirefs": {}, "blockrefs": {}, "inrefs": [], "outrefs": {}, "metadata": metadata}
+        statistics = ["num_api_calls", "num_basic_blocks", "num_failed_functions", "num_failed_instructions", "num_function_calls", "num_functions", "num_instructions"]
+        statistics += ["num_leaf_functions", "num_recursive_functions"]
+        return SmdaReport.fromDict(
+            {
+                "architecture": "intel",
+                "base_addr": 0x400000,
+                "binary_size": 0x10000,
+                "bitness": 32,
+                "code_areas": [],
+                "confidence_threshold": 0.0,
+                "disassembly_errors": {},
+                "execution_time": 0.0,
+                "identified_alignment": 0,
+                "message": "Analysis finished regularly.",
+                "metadata": {"family": name, "filename": name, "version": "", "is_library": False, "binweight": 0},
+                "sha256": name * 64,
+                "smda_version": "1.0.0",
+                "statistics": dict.fromkeys(statistics, 0),
+                "status": "ok",
+                "timestamp": "2026-01-01T00-00-00",
+                "xcfg": xcfg,
+            }
+        )
+
+    def testReportCountsAreThoseOfEveryPair(self):
+        index = MinHashIndex(config=deepcopy(config))
+        worker = index.queue._worker
+        sample_a = index._storage.addSmdaReport(self._report("a", 30)).sample_id
+        sample_b = index._storage.addSmdaReport(self._report("b", 20)).sample_id
+        for sample_id in (sample_a, sample_b):
+            worker.updateMinHashesForSample(sample_id)
+        matches = MatcherSample(worker).getMatchesForSample(sample_a)["matches"]
+        # every copy in a matches the first copy in b, the other copies in b are spread over them: 49 matches
+        # listed where each with each listed 600 - and the counts stay those of every pair
+        matched = [[function_match[2] for function_match in function["matches"]] for function in matches["functions"]]
+        self.assertEqual(49, sum(len(function_ids) for function_ids in matched))
+        self.assertEqual({min(matched[0])}, {function_ids[0] for function_ids in matched})
+        self.assertEqual(20, len({function_id for function_ids in matched for function_id in function_ids}))
+        for aggregation in matches["aggregation"].values():
+            self.assertEqual((30, 20, 30), (aggregation["num_own_functions_matched"], aggregation["num_foreign_functions_matched"], aggregation["num_self_matches"]))
+        [sample_summary] = matches["samples"]
+        self.assertEqual({"minhashes": 30, "pichashes": 30, "combined": 30, "library": 0}, sample_summary["matched"]["functions"])
+        self.assertEqual(100.0, sample_summary["matched"]["percent"]["unweighted"])
+
+
+class PicHashCopiesShortlistTestSuite(unittest.TestCase):
+    """The shortlist votes by the pairs of copies the PicHash stage used to list, so listing fewer of them
+    does not change which samples get exact matching."""
+
+    POOL = [
+        ("b801000000", "mov", "eax, 1"),
+        ("bb02000000", "mov", "ebx, 2"),
+        ("b903000000", "mov", "ecx, 3"),
+        ("ba04000000", "mov", "edx, 4"),
+        ("01d8", "add", "eax, ebx"),
+        ("01c8", "add", "eax, ecx"),
+        ("01d0", "add", "eax, edx"),
+        ("31db", "xor", "ebx, ebx"),
+        ("31c9", "xor", "ecx, ecx"),
+        ("31d2", "xor", "edx, edx"),
+        ("40", "inc", "eax"),
+        ("43", "inc", "ebx"),
+        ("41", "inc", "ecx"),
+        ("42", "inc", "edx"),
+        ("29d8", "sub", "eax, ebx"),
+        ("29c8", "sub", "eax, ecx"),
+    ]
+
+    def _report(self, name, codes, is_library=False, family=None):
+        """One function per entry of codes: the same code, the same function, the same PicHash."""
+        xcfg = {}
+        for index, (code, variant) in enumerate(codes):
+            permutation = random.Random(code * 7919 + 13).sample(range(16), 14)
+            if variant:
+                # one instruction changed: another PicHash, a similar MinHash
+                unused = [position for position in range(16) if position not in permutation]
+                permutation[7] = (permutation[7] + 1) % 16 if (permutation[7] + 1) % 16 not in permutation else unused[0]
+            offset = 0x401000 + 0x80 * index
+            instructions, cursor = [], offset
+            for hexbytes, mnemonic, operands in [self.POOL[position] for position in permutation] + [("c3", "ret", "")]:
+                instructions.append([cursor, hexbytes, mnemonic, operands])
+                cursor += len(hexbytes) // 2
+            metadata = {"binweight": cursor - offset, "characteristics": None, "confidence": None, "function_name": "", "strongly_connected_components": [[offset]], "tfidf": None}
+            xcfg[str(offset)] = {"offset": offset, "blocks": {str(offset): instructions}, "apirefs": {}, "blockrefs": {}, "inrefs": [], "outrefs": {}, "metadata": metadata}
+        statistics = dict.fromkeys(["num_api_calls", "num_basic_blocks", "num_failed_functions", "num_failed_instructions", "num_function_calls", "num_instructions"], 0)
+        statistics.update(dict.fromkeys(["num_leaf_functions", "num_recursive_functions"], 0))
+        statistics["num_functions"] = len(codes)
+        return SmdaReport.fromDict(
+            {
+                "architecture": "intel",
+                "base_addr": 0x400000,
+                "binary_size": 0x10000,
+                "bitness": 32,
+                "code_areas": [],
+                "confidence_threshold": 0.0,
+                "disassembly_errors": {},
+                "execution_time": 0.0,
+                "identified_alignment": 0,
+                "message": "Analysis finished regularly.",
+                "metadata": {"family": family or name, "filename": name, "version": "", "is_library": is_library, "binweight": 0},
+                "sha256": (name * 64)[:64],
+                "smda_version": "1.0.0",
+                "statistics": statistics,
+                "status": "ok",
+                "timestamp": "2026-01-01T00-00-00",
+                "xcfg": xcfg,
+            }
+        )
+
+    def testShortlistRanksCopiesAsItDidWhenEveryCopyWasPaired(self):
+        def copies(code, number=1, variant=False):
+            return [(code, variant)] * number
+
+        corpus = [
+            ("own", copies(1, 3) + copies(2) + copies(3, 2) + [(code, False) for code in range(10, 16)] + copies(4, 4), False, None),
+            ("s1", copies(1, 2) + copies(3) + copies(10) + copies(11) + copies(4, 2), False, "fam"),
+            ("s2", copies(1) + copies(3, 3) + [(code, False) for code in range(12, 16)] + copies(4, 5) + copies(11, variant=True), False, "fam"),
+            ("lib", copies(2, 2) + copies(3, 2) + copies(4, 3), True, None),
+            ("s3", copies(1, 4) + copies(13, 2, variant=True) + copies(14), False, "other"),
+        ]
+        shortlist_config = deepcopy(config)
+        shortlist_config.MINHASH_CONFIG.MINHASH_MATCHING_SHORTLIST_SIZE = 1
+        shortlist_config.MINHASH_CONFIG.MINHASH_POOL_MATCHING = False
+        shortlist_config.MINHASH_CONFIG.MINHASH_POOL_INDEXING = False
+        index = MinHashIndex(config=shortlist_config)
+        worker = index.queue._worker
+        sample_ids = {}
+        for name, codes, is_library, family in corpus:
+            sample_ids[name] = index._storage.addSmdaReport(self._report(name, codes, is_library, family)).sample_id
+            worker.updateMinHashesForSample(sample_ids[name])
+        ranked = []
+        rank_shortlist = MatcherInterface._rankShortlist
+
+        def spy(matcher, votes, shortlist_size):
+            shortlist = rank_shortlist(matcher, votes, shortlist_size)
+            ranked.append((dict(votes), set(shortlist)))
+            return shortlist
+
+        with patch.object(MatcherInterface, "_rankShortlist", spy):
+            matches = MatcherSample(worker).getMatchesForSample(sample_ids["lib"])["matches"]
+        # the votes main's pairing of every copy with every copy gave, and its shortlist of one: sample 2,
+        # not sample 0 that wins the tie once the votes are counted per listed pair
+        self.assertEqual([({0: 79, 1: 39, 2: 91, 4: 7}, {2})], ranked)
+        summaries = {sample["sample_id"]: sample["matched"] for sample in matches["samples"]}
+        self.assertEqual({0, 1, 2}, set(summaries))
+        self.assertEqual({"minhashes": 7, "pichashes": 5, "combined": 7, "library": 0}, summaries[2]["functions"])
+        self.assertEqual(100.0, summaries[2]["percent"]["unweighted"])
+
+    def testVotesCountEveryPairOfCopies(self):
+        own = [SimpleNamespace(function_id=function_id, num_instructions=12) for function_id in (1, 2, 3)]
+        stub = SimpleNamespace(_function_entries=own, _pichash_size=10, _pichash_vote_entries=None)
+        group = {(1, 7, 1), (1, 7, 2), (1, 7, 3), (2, 8, 20), (2, 8, 21), (2, 9, 30)}
+        listed = MatcherInterface._harmonizePicHashMatches(cast(MatcherInterface, stub), {0x1234: group})
+        # 3 own copies against 2 and 1 copies, and each own copy with the 2 others: 6 + 3 + 6 pairs
+        self.assertEqual({8: 6, 9: 3, 7: 6}, dict(stub._pichash_vote_entries))
+        self.assertLess(len(listed), sum(stub._pichash_vote_entries.values()))
 
 
 if __name__ == "__main__":

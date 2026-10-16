@@ -405,6 +405,29 @@ and every new setting is off by default.
   functions deleted under it. Query samples written before this release have no count and hold
   the disassembly judgment back until the last of them has expired.
 
+### Security
+
+- **Matching copies of one function no longer pairs every copy with every other.** Copies of one
+  function share a PicHash. The PicHash stage paired each own copy with every copy a sample holds
+  and, as self matches, with every other own copy, so m own copies against n copies cost m*n plus
+  m*(m-1) entries: 2,000 copies in a 1.6 MB `POST /query` took +1 GiB. Now each own copy is matched
+  with the first copy (lowest function id) a sample holds, that sample's other copies are each
+  matched with one own copy, and each own copy is self matched with the next own copy. Every own
+  function still matches every sample holding the code and every copy of it is matched, so counts,
+  percentages and sample summaries are unchanged. What changes is the per-function match lists in a
+  report, where both sides hold several copies. Example: own functions A, B, C share a PicHash, and
+  sample X holds x1 and x2 with it. Before, A, B and C each listed x1 and x2 (6 matches) and each
+  listed the other two as self matches (6). Now the lists hold A-x1, B-x1, C-x1, B-x2 (4), and A-B,
+  B-C, C-A as self matches (3); A-x2, C-x2 and the self matches A-C, B-A, C-B are no longer listed.
+  Functions that occur once per sample are listed exactly as before. The shortlist
+  (`MINHASH_MATCHING_SHORTLIST_SIZE`) still votes by the pairs it would have had, so it picks the
+  same samples. In MCRITweb, the function table of a result counts matched functions, MinHash and
+  PicHash matches per own function from these lists, so copies of one function can now show
+  different counts: A, B and C showed 2, 2 and 2 matched functions in X and now show 1, 2 and 1;
+  the table filtered to one sample lists one row per remaining pair. What remains linear
+  is m own copies against s samples holding the code, which still list m*s matches. `RESULTS_VERSION`
+  goes to 3, so earlier cached results are recomputed on their next request.
+
 ## [1.14.0] - 2026-10-09
 
 **Minor release: one addition, fixes, and nothing to run on a deployment that keeps the defaults.**
