@@ -1175,9 +1175,11 @@ class StorageInterface:
         raise NotImplementedError
 
     def createBandhashProjection(self, minhash):
-        """Calculate a projection for index permutation based on a given minhash
+        """Calculate a projection for index permutation from the configuration
         Args:
-            minhash: the MinHash used as reference
+            minhash: unused - the projection depends on the configuration alone. It used to be drawn
+                from the length of this minhash, so whichever minhash a process banded first (an
+                imported one included) decided the band keys of every later one.
         Returns:
             a dict containing signature indices used for bandhashing by band id
         """
@@ -1188,7 +1190,7 @@ class StorageInterface:
             band_index = 0
             for band_size, num_bands in self._storage_config.STORAGE_BANDS.items():
                 for _ in range(num_bands):
-                    index_sequence = [index for index in range(len(minhash.getMinHashInt()))]
+                    index_sequence = [index for index in range(self._minhash_config.MINHASH_SIGNATURE_LENGTH)]
                     random.shuffle(index_sequence)
                     band_projection[band_index] = index_sequence[:band_size]
                     band_index += 1
@@ -1258,3 +1260,10 @@ class StorageInterface:
             hashed_band_data = MinHash.hashData(band_data, 0)
             band_hashes[band_index] = hashed_band_data
         return band_hashes
+
+    def _hasBandableLength(self, minhash_bytes: bytes) -> bool:
+        """Whether a stored minhash can have band entries. Imports stored minhashes unchecked, and one
+        shorter than the configured signature, or not a whole number of >8-bit entries, never had any:
+        reading or banding it raises, so deleting or repairing its sample has to skip it."""
+        entry_size = 1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4
+        return len(minhash_bytes) % entry_size == 0 and len(minhash_bytes) >= entry_size * self._minhash_config.MINHASH_SIGNATURE_LENGTH

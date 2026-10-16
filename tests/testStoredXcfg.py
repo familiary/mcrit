@@ -89,6 +89,51 @@ class RebuildPathsTest(unittest.TestCase):
             self.assertEqual(num_hashable - 1, self.worker.updateMinHashesForSample(self.sample_entry.sample_id))
         self.assertIn("no stored disassembly", logger.warning.call_args.args[0])
 
+    def _breakTwoHashableFunctions(self):
+        """what an import can store: an xcfg of only its offset, which smda refuses to rebuild, and a
+        complete one whose offset is no block, on which a shingler fails after the rebuild"""
+        hashable = self.storage.getUnhashedFunctions(None)
+        incomplete, offset_no_block = hashable[0], hashable[1]
+        self.storage._functions[incomplete.function_id].xcfg = {"offset": incomplete.offset}
+        self.storage._functions[offset_no_block.function_id].xcfg = {**offset_no_block.xcfg, "offset": offset_no_block.offset + 1}
+        return len(hashable), {incomplete.function_id, offset_no_block.function_id}
+
+    def test_minhashing_skips_a_function_it_cannot_rebuild_or_hash(self):
+        num_hashable, broken = self._breakTwoHashableFunctions()
+        for pool in (False, True):
+            self.worker._minhash_config.MINHASH_POOL_INDEXING = pool
+            with patch("mcrit.Worker.LOGGER") as logger:
+                minhashes = self.worker.calculateMinHashes(self.storage.getUnhashedFunctions(None))
+            self.assertEqual(num_hashable - 2, len(minhashes), pool)
+            self.assertFalse(broken.intersection(minhash.function_id for minhash in minhashes), pool)
+            self.assertIn("cannot be rebuilt", logger.warning.call_args.args[0])
+        # recalculating every minhash, which drops them first, keeps all the others
+        self.assertEqual(num_hashable - 2, self.worker.recalculateMinHashes())
+        self.assertEqual(num_hashable - 2, sum(1 for entry in self.storage.getFunctions(0, 0) if entry.minhash))
+
+    def test_repairing_minhashes_leaves_a_sample_with_an_unhashable_function_alone(self):
+        self.worker._minhash_config.MINHASH_POOL_INDEXING = False
+        self.assertGreater(self.worker.updateMinHashes(None), 0)
+        hashed = [entry for entry in self.storage.getFunctions(0, 0) if entry.minhash]
+        broken = hashed[0]
+        minhashes_before = {entry.function_id: entry.minhash for entry in hashed}
+        self.storage._functions[broken.function_id].xcfg = {"offset": broken.offset}
+        self.storage.setMinHashVersionForSamples("4.0.0", [self.sample_entry.sample_id])
+        threshold = self.worker.getMinHashCompatibilityThreshold()
+        report = self.worker.repairMinHashes()
+        self.assertEqual((0, 1, 0, 0), (report["num_samples_repaired"], report["num_samples_skipped"], report["num_functions_dropped"], report["num_functions_rehashed"]))
+        # its minhashes stay, and the sample stays flagged so that it is tried again
+        self.assertEqual(minhashes_before, {entry.function_id: entry.minhash for entry in self.storage.getFunctions(0, 0) if entry.minhash})
+        self.assertEqual([self.sample_entry.sample_id], self.storage.getSamplesWithStaleMinHashes(threshold))
+
+    def test_recalculating_minhashes_does_not_record_a_sample_with_an_unhashable_function_as_current(self):
+        self.worker._minhash_config.MINHASH_POOL_INDEXING = False
+        threshold = self.worker.getMinHashCompatibilityThreshold()
+        self.storage.setMinHashVersionForSamples("4.0.0", [self.sample_entry.sample_id])
+        self._breakTwoHashableFunctions()
+        self.worker.recalculateMinHashes()
+        self.assertEqual([self.sample_entry.sample_id], self.storage.getSamplesWithStaleMinHashes(threshold))
+
     def test_link_hunt_clustering_skips_a_function_without_disassembly(self):
         entries = deepcopy(self.function_entries)
         entries[0].xcfg = {}
@@ -211,6 +256,27 @@ class MongoRebuildPathsTest(unittest.TestCase):
         db.xcfg.update_one({"_id": emptied}, {"$set": {"_xcfg": "{}"}})
         result = self.storage.recalculateAllPicHashes()
         self.assertEqual(sum(block_hash_counts.values()) - block_hash_counts[emptied], result["picblockhashes_updatable"])
+
+    def test_pichash_recalculation_skips_a_function_it_cannot_rehash(self):
+        db = self.storage._getDb()
+        sample_id = self.sample_entry.sample_id
+        db.samples.update_one({"sample_id": sample_id}, {"$unset": {"pichash_smda_version": ""}})
+        function_ids = [document["function_id"] for document in db.functions.find({}, {"function_id": 1, "_id": 0})]
+        # an xcfg of only its offset, as an import stores it
+        db.xcfg.update_one({"_id": function_ids[0]}, {"$set": {"_xcfg": json.dumps({"offset": 0})}})
+        with patch("mcrit.storage.MongoDbStorage.LOGGER") as logger:
+            result = self.storage.recalculateAllPicHashes()
+        self.assertEqual((1, 1), (result["outdated_samples"], result["xcfg_missing"]))
+        skipped = [call.args for call in logger.warning.call_args_list if "cannot be rehashed" in call.args[0]]
+        self.assertEqual([(function_ids[0], sample_id)], [args[1:3] for args in skipped])
+        # not stamped, so it is not selected again until smda changes
+        sample_document = db.samples.find_one({"sample_id": sample_id})
+        self.assertNotIn("pichash_smda_version", sample_document)
+        self.assertIn("pichash_unrehashable_smda_version", sample_document)
+        # sample metadata no function rehashes with, as an export without binary_size has it
+        db.samples.update_one({"sample_id": sample_id}, {"$set": {"binary_size": None}, "$unset": {"pichash_unrehashable_smda_version": ""}})
+        result = self.storage.recalculateAllPicHashes()
+        self.assertEqual((1, len(function_ids)), (result["outdated_samples"], result["xcfg_missing"]))
 
     def test_unique_blocks_of_a_sample_without_disassembly_carry_no_instructions(self):
         sample_id = self.sample_entry.sample_id

@@ -326,51 +326,77 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 LOGGER.warning("Dropping %d invalid actor name(s) of imported family %s.", len(actors or []) - len(valid_actors), exported_family_id)
             actors = FamilyEntry.normalizeActors(valid_actors)
             if local_family is not None and actors:
-                merged = list(local_family.actors) + [actor for actor in actors if actor not in local_family.actors]
+                # and to the API's cap, as tags are below: the first that fit are added
+                merged, num_dropped = FamilyEntry.mergeActors(local_family.actors, actors)
+                if num_dropped:
+                    LOGGER.warning("Family %d would be attributed to more than %d actors, dropping %d imported actors.", remapped_family_id, FamilyEntry.MAX_ACTORS, num_dropped)
                 if merged != local_family.actors:
                     storage.modifyFamily(remapped_family_id, {"actors": merged})
         LOGGER.info("Family remapping created: %d families, %d samples.", len(family_id_remapping), len(export_data["sample_entries"]))
         # iterate samples
         index = 0
         function_entries_to_import = []
+        # imported minhashes are stored and banded as they are, so each has to be one this instance
+        # could have computed: one of another length is banded beside the code it was copied from
+        # and then fails every matching job that draws it as a candidate, or does not fit the band
+        # projection at all. It is dropped rather than failing the import - imported samples record
+        # no minhash version, so the next minhash repair rehashes them from their disassembly
+        signature_bytes = self._minhash_config.MINHASH_SIGNATURE_LENGTH * (1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4)
+        num_minhashes_dropped = 0
+        # a first pass reads everything the export holds - inflates and parses each sample's content,
+        # builds its sample and function entries - before anything is stored, so that an import that
+        # is refused or malformed stores nothing, not the samples before the one that failed
+        prepared_samples = []
+        for sample_sha256, sample_entry_dict in export_data["sample_entries"].items():
+            # check if sample is already present, and skip if yes
+            if storage.getSampleBySha256(sample_sha256):
+                LOGGER.info(f"Sample with SHA256 {sample_sha256} already present in database, skipping...")
+                import_report["num_samples_skipped"] += 1
+                import_report["num_functions_skipped"] += sample_entry_dict["statistics"]["num_functions"]
+                continue
+            function_entry_dicts = export_data["function_entries"].get(sample_sha256)
+            # decompress function_entries if necessary
+            if function_entry_dicts is not None and is_compressed:
+                function_entry_dicts = json.loads(decompress_decode(function_entry_dicts))
+            sample_entry = SampleEntry.fromDict(sample_entry_dict)
+            # adjust family_id in sample_entry using our remapping
+            sample_entry.family_id = family_id_remapping[sample_entry.family_id]
+            function_entries = []
+            for function_entry_dict in (function_entry_dicts or {}).values():
+                function_entry = FunctionEntry.fromDict(function_entry_dict)
+                if function_entry.minhash and len(function_entry.minhash) != signature_bytes:
+                    function_entry.minhash = b""
+                    function_entry.minhash_shingle_composition = {}
+                    num_minhashes_dropped += 1
+                function_entries.append(function_entry)
+            prepared_samples.append((sample_sha256, sample_entry_dict, sample_entry, function_entries))
+        if num_minhashes_dropped:
+            LOGGER.warning("Dropped %d imported minhashes that are not %d bytes long, the next minhash repair recalculates them.", num_minhashes_dropped, signature_bytes)
         imported_sample_entries = []
-        # every sample is written before any function, so one that fails - a later entry that does not
-        # read, a function insert MongoDB refuses - would leave the samples before it without functions,
-        # and a corrected import would skip them as present already: they are removed again instead
+        # every sample is written before any function, so one that fails - a function insert MongoDB
+        # refuses - would leave the samples before it without functions, and a corrected import would
+        # skip them as present already: they are removed again instead
         try:
-            for sample_sha256, sample_entry_dict in export_data["sample_entries"].items():
+            for sample_sha256, sample_entry_dict, sample_entry, function_entries in prepared_samples:
                 index += 1
-                # check if sample is already present, and skip if yes
-                if storage.getSampleBySha256(sample_sha256):
-                    LOGGER.info(f"Sample with SHA256 {sample_sha256} already present in database, skipping...")
-                    import_report["num_samples_skipped"] += 1
-                    import_report["num_functions_skipped"] += sample_entry_dict["statistics"]["num_functions"]
-                    continue
-                sample_entry = SampleEntry.fromDict(sample_entry_dict)
-                # adjust family_id in sample_entry using our remapping
-                sample_entry.family_id = family_id_remapping[sample_entry.family_id]
-                # add sample_entry to storage and receive new sample_id
-                remapped_sample_entry = storage.importSampleEntry(sample_entry)
+                # add sample_entry to storage and receive new sample_id; None when its sha256 is known
+                # here after all - stated apart from its key, or added by another writer since the check
+                # above. Its functions must not follow: they would land on the sample_id the export
+                # carries, and as it is not this import's, it is not removed should the import fail later
+                remapped_sample_entry = storage.importSampleEntry(sample_entry) if sample_entry.sha256 == sample_sha256 else None
                 if remapped_sample_entry is None:
-                    # another writer stored the same sample since the check above: it is theirs, so this
-                    # import neither attaches functions to it nor removes it should it fail later
+                    LOGGER.warning("Sample with SHA256 %s was not added (entry states SHA256 %r), skipping it and its functions...", sample_sha256, sample_entry.sha256)
                     import_report["num_samples_skipped"] += 1
                     import_report["num_functions_skipped"] += sample_entry_dict["statistics"]["num_functions"]
                     continue
                 import_report["num_samples_imported"] += 1
                 imported_sample_entries.append(remapped_sample_entry)
-                if sample_sha256 in export_data["function_entries"]:
-                    function_entries = export_data["function_entries"][sample_sha256]
-                    # decompress function_entries if necessary
-                    if is_compressed:
-                        function_entries = json.loads(decompress_decode(function_entries))
-                    # iterate functions and add them, adjusting family_id and sample_id
-                    for old_function_id, function_entry_dict in function_entries.items():
-                        function_entry = FunctionEntry.fromDict(function_entry_dict)
-                        function_entry.sample_id = remapped_sample_entry.sample_id
-                        function_entry.family_id = remapped_sample_entry.family_id
-                        function_entries_to_import.append(function_entry)
-                        import_report["num_functions_imported"] += 1
+                # adjusting family_id and sample_id of the functions
+                for function_entry in function_entries:
+                    function_entry.sample_id = remapped_sample_entry.sample_id
+                    function_entry.family_id = remapped_sample_entry.family_id
+                    function_entries_to_import.append(function_entry)
+                    import_report["num_functions_imported"] += 1
                 LOGGER.info("Sample %d with SHA256 %s added...", index, sample_sha256)
 
             adjusted_function_entries = storage.importFunctionEntries(function_entries_to_import)

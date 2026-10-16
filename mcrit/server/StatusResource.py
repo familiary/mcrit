@@ -68,8 +68,15 @@ class StatusResource:
             resp.status = falcon.HTTP_400
             db_log_msg(self.index, req, "StatusResource.on_post_import - failed - no POST body.")
             return
-        import_data = json.loads(req.stream.read())
-        import_report = self.index.addImportData(import_data)
+        try:
+            import_data = json.loads(req.stream.read())
+            import_report = self.index.addImportData(import_data)
+        except ValueError as error:
+            # a body that is no JSON, or compressed content that would inflate beyond any export
+            resp.data = jsonify({"status": "failed", "data": {"message": f"Import rejected: {error}"}})
+            resp.status = falcon.HTTP_400
+            db_log_msg(self.index, req, "StatusResource.on_post_import - failed - import rejected.")
+            return
         resp.data = jsonify({"status": "successful", "data": import_report})
         db_log_msg(self.index, req, "StatusResource.on_post_import - success.")
         return

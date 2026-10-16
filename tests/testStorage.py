@@ -789,6 +789,33 @@ class MemoryStorageTest(TestCase):
         candidates_after = self.storage.getCandidatesForMinHashes({1000: minhash_c})
         self.assertEqual(candidates, candidates_after)
 
+    def testRebuildMinhashBandIndexLeavesOutMinHashesOfAnotherLength(self):
+        """The rebuild empties every band first, so a stored minhash it cannot band - imports stored
+        them at any length - must not end it there, leaving the index empty on every run."""
+        self.storage.clearStorage()
+        smda_report = SmdaReport.fromFile(self.example_file_path)
+        assert smda_report is not None
+        self.storage.addSmdaReport(smda_report)
+        minhashes = [MinHash(function_id=function_id, minhash_signature=[0x30 + function_id + index for index in range(10)], minhash_bits=8) for function_id in [0, 2, 3, 5]]
+        self.storage.addMinHashes(minhashes)
+        # stored as an import does, without banding: one too short for the projection, one too long
+        odd_entries = []
+        for minhash_bytes in (bytes(3), bytes(range(11))):
+            function_entry = self.storage.getFunctionById(1)
+            assert function_entry is not None
+            function_entry.minhash = minhash_bytes
+            odd_entries.append(function_entry)
+        odd_entries = self.storage.importFunctionEntries(odd_entries)
+        assert odd_entries is not None
+
+        self.storage.rebuildMinhashBandIndex()
+
+        for minhash in minhashes:
+            self.assertIn(minhash.function_id, self.storage.getCandidatesForMinHash(minhash))
+        # the long one shares its first ten entries with this signature, and is not a candidate of it
+        candidates = self.storage.getCandidatesForMinHash(MinHash(function_id=1000, minhash_signature=list(range(10)), minhash_bits=8))
+        self.assertNotIn(odd_entries[1].function_id, candidates)
+
     def testMatchingCache(self):
         cache = self.storage.createMatchingCache([])
         self.assertTrue(hasattr(cache, "getMinHashByFunctionId"))
@@ -1668,6 +1695,13 @@ class MongoDbStorageTest(MemoryStorageTest):
         rebuild_result = self.storage.rebuildMinhashBandIndex()
         self.assertEqual(len(minhashes), rebuild_result["minhash_functions_indexed"])
         self.assertEqual(bands_before, dumpBands())
+
+    def testRebuildMinhashBandIndexLeavesOutAFunctionWithoutMinhashField(self):
+        """a function document without the field (an upsert racing a deletion) has nothing to band"""
+        self._storageWithBandedSample()
+        self.storage._getDb().functions.update_one({"function_id": 1}, {"$unset": {"minhash": ""}})
+        rebuild_result = self.storage.rebuildMinhashBandIndex()
+        self.assertEqual(6, rebuild_result["minhash_functions_indexed"])
 
     def _storageWithBandedSample(self):
         self.storage.clearStorage()

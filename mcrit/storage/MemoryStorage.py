@@ -217,16 +217,15 @@ class MemoryStorage(StorageInterface):
             return True
         for function_id in function_ids:
             function_entry = self._functions[function_id]
-            minhash = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
             # remove function
             del self._functions[function_id]
             # remove pichash entries
             if function_entry.pichash:
                 self._pichashes[function_entry.pichash].remove((function_entry.family_id, sample_id, function_id))
-            # remove minhash entries, if necessary
-            if not minhash or not minhash.hasMinHash():
+            # remove minhash entries, if necessary - one that cannot have been banded is not read at all
+            if not self._hasBandableLength(function_entry.minhash):
                 continue
-            band_hashes = self.getBandHashesForMinHash(minhash)
+            band_hashes = self.getBandHashesForMinHash(function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS))
             for band_number, band_hash in sorted(band_hashes.items()):
                 if band_hash not in self._bands[band_number]:
                     continue
@@ -330,8 +329,13 @@ class MemoryStorage(StorageInterface):
             new_num_functions = new_family_info.num_functions + old_family_info.num_functions
             new_num_lib_samples = new_family_info.num_library_samples + old_family_info.num_library_samples
             # the attribution moves with the samples: a rename onto an existing family merges
-            # both actor lists (a review of #57 caught the rename dropping them)
-            merged_actors = FamilyEntry.normalizeActors(list(new_family_info.actors or []) + list(old_family_info.actors or []))
+            # both actor lists (a review of #57 caught the rename dropping them), up to MAX_ACTORS
+            # as an import does - uncapped, renaming many families into one grew it without bound
+            merged_actors, num_dropped = FamilyEntry.mergeActors(new_family_info.actors, old_family_info.actors)
+            if num_dropped:
+                LOGGER.warning(
+                    "Family %d would be attributed to more than %d actors, dropping %d actors of merged family %d.", new_family_id, FamilyEntry.MAX_ACTORS, num_dropped, family_id
+                )
             self._families[new_family_id].actors = merged_actors
             # update family_entry
             if family_id == 0:
@@ -430,11 +434,14 @@ class MemoryStorage(StorageInterface):
         num_hashed = 0
         for function_id in self._sample_id_to_function_ids[sample_id]:
             function_entry = self._functions[function_id]
-            minhash = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
-            if not minhash or not minhash.hasMinHash():
+            if not function_entry.minhash:
                 continue
             num_hashed += 1
-            for band_number, band_hash in sorted(self.getBandHashesForMinHash(minhash).items()):
+            # as in deleteSample, one that cannot have been banded is not read
+            band_hashes = {}
+            if self._hasBandableLength(function_entry.minhash):
+                band_hashes = self.getBandHashesForMinHash(function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS))
+            for band_number, band_hash in sorted(band_hashes.items()):
                 if band_hash in self._bands[band_number]:
                     self._bands[band_number][band_hash] = [fid for fid in self._bands[band_number][band_hash] if fid != function_id]
                     if not self._bands[band_number][band_hash]:
@@ -448,6 +455,7 @@ class MemoryStorage(StorageInterface):
     def deleteRehashableMinHashes(self, progress_reporter=None) -> Set[int]:
         self._bands = {band_number: {} for band_number in self._bands}
         kept_sample_ids: Set[int] = set()
+        signature_bytes = self._minhash_config.MINHASH_SIGNATURE_LENGTH * (1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4)
         for function_entry in self._functions.values():
             minhash = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
             if not minhash or not minhash.hasMinHash():
@@ -456,8 +464,10 @@ class MemoryStorage(StorageInterface):
                 function_entry.minhash = b""
                 function_entry.minhash_shingle_composition = {}
             else:
-                # no disassembly to compute it from again: kept, and banded again
-                self.addMinHash(minhash)
+                # no disassembly to compute it from again: kept, and banded again - unless it is of
+                # another length than the configured signature, which does not fit the band projection
+                if len(function_entry.minhash) == signature_bytes:
+                    self.addMinHash(minhash)
                 kept_sample_ids.add(function_entry.sample_id)
         return kept_sample_ids
 
@@ -579,7 +589,8 @@ class MemoryStorage(StorageInterface):
             self._sample_by_sha256[sample_entry.sha256] = sample_id
             self._updateFamilyStats(sample_entry.family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))
             return sample_entry
-        # the entry still carries the id it had in the export, which here may well be another sample's
+        # not this entry's sample: the entry still carries the id it had in the export, which here may
+        # well be another sample's, so the caller must not attach the entry's functions to its sample_id
         LOGGER.warning("Sample %s already existed, skipping.", sample_entry.sha256)
         return None
 
@@ -1226,11 +1237,18 @@ class MemoryStorage(StorageInterface):
         # sum of all minhashes will eventually exceed available memory on a given system.
         # in this case we can start doing batches in our database interation already
         minhashes = []
-        # get all minhash objects from all functions
+        # get all minhash objects from all functions - as in MongoDbStorage, leaving out any of another
+        # length than the configured signatures, which would fail the rebuild after the bands were reset
+        signature_bytes = self._minhash_config.MINHASH_SIGNATURE_LENGTH * (1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4)
+        num_skipped = 0
         for function_id, function_entry in self._functions.items():
-            if function_entry.minhash:
+            if function_entry.minhash and len(function_entry.minhash) != signature_bytes:
+                num_skipped += 1
+            elif function_entry.minhash:
                 minhash_obj = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
                 minhashes.append(minhash_obj)
+        if num_skipped:
+            LOGGER.warning("Left %d functions out of the band index, their minhashes are not %d bytes long; recalculating minhashes indexes them.", num_skipped, signature_bytes)
         # drop band collections
         # recreate indices for band collections
         for band_id in range(self._storage_config.STORAGE_NUM_BANDS):
