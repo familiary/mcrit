@@ -25,6 +25,12 @@ def runSingleJobWorker(job_id, profiling=False):
         single_job_worker.run()
 
 
+def normalizeBind(bind: str) -> str:
+    """A bind without a host (":8000") means every interface to gunicorn and is refused by waitress: read it as loopback."""
+    bind = bind.strip()
+    return "127.0.0.1" + bind if bind.startswith(":") else bind
+
+
 def runServer(profiling=False, uses_gunicorn=False):
     import platform
 
@@ -43,6 +49,10 @@ def runServer(profiling=False, uses_gunicorn=False):
     except Exception:
         pass
 
+    bind = normalizeBind(GunicornConfig().BIND)
+    if bind != GunicornConfig().BIND.strip():
+        print(f"[!] The configured bind address has no host, listening on {bind} only. Use 0.0.0.0:<port> to serve other hosts.")
+
     def buildGunicornServer(wsgi_app):
         assert BaseApplication is not None
         gunicorn_base: Any = BaseApplication
@@ -57,7 +67,7 @@ def runServer(profiling=False, uses_gunicorn=False):
                     return
                 for key, value in GunicornConfig().toDict().items():
                     try:
-                        self.cfg.set(key.lower(), value)
+                        self.cfg.set(key.lower(), bind if key == "BIND" else value)
                     except AttributeError:
                         continue
 
@@ -90,7 +100,7 @@ def runServer(profiling=False, uses_gunicorn=False):
     else:
         print("[!] Could not determine platform, gunicorn not available or activated. Defaulting to waitress deployment.")
     # TODO consider allowing an argument to pass an configuration for initial setup of the instance
-    serve(wrapped_app, listen="*:8000")
+    serve(wrapped_app, listen=bind)
 
 
 def runClient():

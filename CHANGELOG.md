@@ -15,6 +15,37 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Security
+
+- **Behaviour change: `mcrit server` listens on `127.0.0.1:8000` by default**, as the README always
+  said, instead of on every interface. With `MCRIT_AUTH_TOKEN` unset, also the default, the old bind
+  answered anyone who could route to port 8000: `POST /respawn`, `DELETE /jobs` and `GET /export`
+  included. The default is the IPv4 loopback only: where `localhost` resolves to `::1` first, use
+  `http://127.0.0.1:8000` or set `MCRIT_SERVER_BIND=[::1]:8000`. `MCRIT_SERVER_BIND` (`<host>:<port>`) now sets the address for waitress and gunicorn
+  alike; waitress used to ignore `GunicornConfig.BIND`. A bind without a host, such as `:8000`, is
+  read as `127.0.0.1:8000` with a notice, where gunicorn used to take it as every interface. A
+  server that other hosts have to reach, for example in a container, needs
+  `MCRIT_SERVER_BIND=0.0.0.0:8000` (or `BIND` set in its `GunicornConfig.py`), and a
+  `MCRIT_AUTH_TOKEN` unless the network keeps everyone else out; without that such a deployment
+  shows as connection refused from every other host after the upgrade.
+
+- **Behaviour change: an instance without `MCRIT_AUTH_TOKEN` refuses what a foreign web page makes a
+  browser send**, with a 403. A page the analyst merely opened could wipe the instance with a form
+  `POST /respawn`, add samples with a `text/plain` `POST /import`, queue jobs with an `<img>` on a
+  job-scheduling `GET`, and after DNS rebinding read everything. Requests that come from a browser
+  (they carry `Origin` or `Sec-Fetch-*` headers, or a `Mozilla/` User-Agent other than PowerShell's) are now refused for a
+  `Host` other than an IP address, `localhost` or a name in the comma-separated
+  `MCRIT_ALLOWED_HOSTS` (`*` allows any), for being marked `cross-site` or `same-site`, or for an
+  `Origin` other than the API's own. The `GET` routes that schedule a job (the `/rebuild_*`,
+  `/recalculate_*`, `/complete_minhashes` and `/band_df_cutoff_coverage` routes,
+  `/matches/sample/...` and `/uniqueblocks/...`) are no longer served to a browser at all; call them
+  with `McritClient`, curl or another API client. Requests that are not from a browser, such as
+  `McritClient`, MCRITweb and the IDA plugin, are unaffected whatever name they use for the server,
+  and nothing is checked when `MCRIT_AUTH_TOKEN` is set. A browser reaching an instance under a name
+  (a domain, or a reverse proxy passing its own) needs that name in `MCRIT_ALLOWED_HOSTS`; a
+  single-label name listed there can be rebound by anyone who can resolve it on the analyst's
+  network.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct
