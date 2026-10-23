@@ -86,7 +86,7 @@ class McritBadRequest(McritRequestError):
 
 
 class McritNotFound(McritRequestError):
-    """404: the sample, family, function or job the request named does not exist."""
+    """404: the sample, family, function, job or result the request named does not exist."""
 
 
 class McritGone(McritRequestError):
@@ -1073,6 +1073,7 @@ class McritClient:
     def deleteJob(self, job_id):
         """
         Delete the Job for a given <job_id>
+        An unknown <job_id> is a 404: None by default (it used to answer {'num_deleted': 0}), McritNotFound with raise_client_errors
         Supported by mcritweb API pass-through
         """
         response = self._session.delete(f"{self.mcrit_server}/jobs/{job_id}", headers=self.headers, timeout=self.timeout)
@@ -1083,6 +1084,7 @@ class McritClient:
     def getJobData(self, job_id):
         """
         Get the Job for a given <job_id>
+        An unknown <job_id> is a 404: None by default, as before, McritNotFound with raise_client_errors
         Supported by mcritweb API pass-through
         """
         response = self._session.get(f"{self.mcrit_server}/jobs/{job_id}", headers=self.headers, timeout=self.timeout)
@@ -1095,6 +1097,8 @@ class McritClient:
     def getResultForJob(self, job_id, compact=False):
         """
         Get the Result for Job with a given <job_id>
+        None while the job has no result (pending, failed, terminated, or its result was removed); an unknown <job_id> is a 404,
+        which is also None by default but McritNotFound with raise_client_errors
         Supported by mcritweb API pass-through
         """
         query_string = "?compact=True" if compact else ""
@@ -1106,6 +1110,7 @@ class McritClient:
     def getResult(self, result_id, compact=False):
         """
         Get the Result for a given <result_id>
+        An unknown <result_id> is a 404: None by default, as before, McritNotFound with raise_client_errors
         Supported by mcritweb API pass-through
         """
         query_string = "?compact=True" if compact else ""
@@ -1117,6 +1122,7 @@ class McritClient:
     def getJobForResult(self, result_id):
         """
         Get the Job for the Result with a given <result_id>
+        An unknown <result_id>, or a result whose job is gone, is a 404: None by default, as before, McritNotFound with raise_client_errors
         Supported by mcritweb API pass-through
         """
         response = self._session.get(f"{self.mcrit_server}/results/{result_id}/job", headers=self.headers, timeout=self.timeout)
@@ -1127,6 +1133,11 @@ class McritClient:
             return Job(data, None)
 
     def awaitResult(self, job_id, sleep_time=2, compact=False):
+        """
+        Wait for the Job with a given <job_id> and answer its result
+        An unknown <job_id>, or a job deleted while waiting, raises JobTerminatedError by default; with raise_client_errors the
+        server's 404 raises McritNotFound instead, as it does for a finished job whose result is removed before it is read
+        """
         if job_id is None:
             return None
         job = self.getJobData(job_id)

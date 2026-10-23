@@ -15,6 +15,23 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Changed
+
+- **Behaviour change: unknown job and result ids answer 404 on the job and result routes (#291).**
+  `GET /jobs/{id}`, `GET /jobs/{id}/result`, `GET /results/{id}`, `GET /results/{id}/job` and
+  `DELETE /jobs/{id}` used to answer 200 with `data: null` (or `num_deleted: 0`) for an id that
+  does not exist; they now answer 404 with `{"status": "failed", "data": {"message": ...}}`.
+  Malformed ids are still 400. A job that exists but has no result yet still answers 200 with
+  `data: null`, as does a stored JSON `null` result. A result whose job is gone is still served
+  in full by `/results/{id}` (also with `compact=true`), and `/results/{id}/job` answers 404 for
+  it. With the default client, `deleteJob` on an unknown id now returns `None` instead of
+  `{'num_deleted': 0}`. With `raise_client_errors=True`, `deleteJob`, `getJobData`,
+  `getResultForJob`, `getResult` and `getJobForResult` raise `McritNotFound` where they returned
+  a value, and `awaitResult` raises it instead of `JobTerminatedError` for an unknown job, and
+  instead of returning `None` when a finished job's result is removed before it is read; the
+  default client is unchanged there. MCRITweb's `/api` passthrough relays these 404s to its API
+  users; its UI is unaffected.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

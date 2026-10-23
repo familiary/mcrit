@@ -1,4 +1,5 @@
 import datetime
+import json
 import re
 from typing import Optional
 
@@ -7,8 +8,6 @@ import falcon
 from mcrit.index.MinHashIndex import MinHashIndex
 from mcrit.queue.LocalQueue import Job
 from mcrit.server.utils import db_log_msg, jsonify, timing
-
-# TODO these should also return status and data in their json response
 
 
 def _csv_items(value):
@@ -59,6 +58,11 @@ def _parseJobDate(value) -> Optional[datetime.datetime]:
 class JobResource:
     def __init__(self, index: MinHashIndex):
         self.index = index
+
+    def _not_found(self, req, resp, route: str, message: str, reason: str):
+        resp.status = falcon.HTTP_404
+        resp.data = jsonify({"status": "failed", "data": {"message": message}})
+        db_log_msg(self.index, req, f"JobResource.{route} - failed - {reason}.")
 
     @staticmethod
     def _selection(req):
@@ -157,8 +161,9 @@ class JobResource:
             db_log_msg(self.index, req, "JobResource.on_get - failed - invalid job_id.")
             return
         data = self.index.getJobData(job_id)
-        # TODO throw 404 if job_id is unknown
-        # resp.status = falcon.HTTP_404
+        if data is None:
+            self._not_found(req, resp, "on_get", "We don't have a job with that id.", f"unknown job_id: {job_id}")
+            return
         resp.data = jsonify({"status": "successful", "data": data})
         db_log_msg(self.index, req, "JobResource.on_get - success.")
 
@@ -171,8 +176,9 @@ class JobResource:
             db_log_msg(self.index, req, "JobResource.on_delete - failed - invalid job_id.")
             return
         result = self.index.deleteJob(job_id)
-        # TODO throw 404 if job_id is unknown
-        # resp.status = falcon.HTTP_404
+        if result == 0:
+            self._not_found(req, resp, "on_delete", "We don't have a job with that id.", f"unknown job_id: {job_id}")
+            return
         resp.data = jsonify({"status": "successful", "data": {"num_deleted": result}})
         db_log_msg(self.index, req, "JobResource.on_delete - success.")
 
@@ -209,12 +215,18 @@ class JobResource:
             resp.data = jsonify({"status": "failed", "data": {"message": "Valid ResultIDs are hexstrings with 24 characters."}})
             db_log_msg(self.index, req, "JobResource.on_get_results - failed - invalid result_id.")
             return
-        job_id = self.index.getJobIdForResult(result_id)
-        job_data = self.index.getJobData(job_id)
+        # the bytes also tell an unknown result from a stored JSON null, which getResult cannot
+        result_bytes = self.index.getResultBytes(result_id)
+        if result_bytes is None:
+            self._not_found(req, resp, "on_get_results", "We don't have a result with that id.", f"unknown result_id: {result_id}")
+            return
         compact = self._wants_compact(req)
-        # TODO throw 404 if job_id is unknown
-        # resp.status = falcon.HTTP_404
-        self._respond_with_result(resp, job_data, compact, None if compact else self.index.getResultBytes(result_id), lambda: self.index.getResult(result_id))
+        job_data = None
+        if compact:
+            # only the compact check needs the job; a result can outlive it, and is then served in full
+            job_id = self.index.getJobIdForResult(result_id)
+            job_data = self.index.getJobData(job_id) if job_id is not None else None
+        self._respond_with_result(resp, job_data, compact, result_bytes, lambda: json.loads(result_bytes))
         db_log_msg(self.index, req, "JobResource.on_get_results - success.")
 
     @timing
@@ -226,9 +238,10 @@ class JobResource:
             db_log_msg(self.index, req, "JobResource.on_get_job_result - failed - invalid job_id.")
             return
         job_data = self.index.getJobData(job_id)
+        if job_data is None:
+            self._not_found(req, resp, "on_get_job_result", "We don't have a job with that id.", f"unknown job_id: {job_id}")
+            return
         compact = self._wants_compact(req)
-        # TODO throw 404 if job_id is unknown
-        # resp.status = falcon.HTTP_404
         self._respond_with_result(resp, job_data, compact, None if compact else self.index.getResultBytesForJob(job_id), lambda: self.index.getResultForJob(job_id))
         db_log_msg(self.index, req, "JobResource.on_get_job_result - success.")
 
@@ -238,11 +251,16 @@ class JobResource:
         if result_id is None:
             resp.status = falcon.HTTP_400
             resp.data = jsonify({"status": "failed", "data": {"message": "Valid ResultIDs are hexstrings with 24 characters."}})
-            db_log_msg(self.index, req, "JobResource.on_get_job_result - failed - invalid result_id.")
+            db_log_msg(self.index, req, "JobResource.on_get_result_job - failed - invalid result_id.")
             return
         job_id = self.index.getJobIdForResult(result_id)
-        data = self.index.getJobData(job_id)
-        # TODO throw 404 if job_id is unknown
-        # resp.status = falcon.HTTP_404
+        data = self.index.getJobData(job_id) if job_id is not None else None
+        if data is None:
+            # every stored result names its job, so a job id without job data means the job is gone
+            if job_id is None:
+                self._not_found(req, resp, "on_get_result_job", "We don't have a result with that id.", f"unknown result_id: {result_id}")
+            else:
+                self._not_found(req, resp, "on_get_result_job", "We don't have the job for that result id.", f"no job for result_id: {result_id}")
+            return
         resp.data = jsonify({"status": "successful", "data": data})
         db_log_msg(self.index, req, "JobResource.on_get_result_job - success.")
