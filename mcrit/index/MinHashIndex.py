@@ -227,12 +227,13 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         return exported_data
 
     def _prepareImportedSamples(self, export_data, present_sha256s, signature_bytes):
-        """Read every sample of an export - inflate and parse the content of those not in present_sha256s,
-        build their sample and function entries - and check the families they are filed under, without
-        touching the storage. Entries keep the export's family_id. Returns the family names and the
-        family actors by family_id, a (sha256, sample entry, number of functions, function entries)
-        per new sample, and the number of samples and of functions skipped as present."""
-        is_compressed = export_data["content"]["is_compressed"]
+        """Read and check every sample of an export - inflate and parse the content of those not in
+        present_sha256s, build their sample and function entries - and the families they are filed
+        under, without touching the storage. The entries are checked and let go one sample at a time:
+        the write pass reads each sample again with _prepareImportedSample, so memory holds one
+        sample's functions, not the export's. Returns the family names and the family actors by
+        family_id, a (sha256, number of functions) per new sample, and the number of samples and of
+        functions skipped as present."""
         # family ids parsed once here, so that the families are written from what was checked
         family_names = {}
         for family_id, family_name in export_data["family_mapping"].items():
@@ -252,7 +253,7 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         num_minhashes_dropped = 0
         num_samples_skipped = 0
         num_functions_skipped = 0
-        prepared_samples = []
+        samples_to_import = []
         for sample_sha256, sample_entry_dict in export_data["sample_entries"].items():
             # read for every sample, present or not: the import report counts the functions, and the
             # escaper comparison collects and sorts the architectures. None, or none at all, is an
@@ -268,34 +269,44 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 num_samples_skipped += 1
                 num_functions_skipped += num_functions
                 continue
-            # exported as a bool; the family statistics count it as 0 or 1
-            if sample_entry_dict["is_library"] not in (True, False):
-                raise ImportRejected(f"sample {sample_sha256} states whether it is a library as something other than true or false")
-            function_entry_dicts = export_data["function_entries"].get(sample_sha256)
-            # decompress function_entries if necessary
-            if function_entry_dicts is not None and is_compressed:
-                function_entry_dicts = json.loads(decompress_decode(function_entry_dicts))
-            sample_entry = SampleEntry.fromDict(sample_entry_dict)
-            if sample_entry.family_id not in family_names:
-                raise ImportRejected(f"sample {sample_sha256} names family {sample_entry.family_id}, which the export does not hold")
-            # a sample without a family is stored with "" as local ones are, not with null
-            if sample_entry.family is None:
-                sample_entry.family = family_names[sample_entry.family_id]
-            function_entries = []
-            for function_entry_dict in (function_entry_dicts or {}).values():
-                function_entry = FunctionEntry.fromDict(function_entry_dict)
-                # the storage keys its pichash index by it
-                if function_entry.pichash is not None and (not isinstance(function_entry.pichash, int) or isinstance(function_entry.pichash, bool)):
-                    raise ImportRejected(f"sample {sample_sha256} holds a function whose pichash is no number")
-                if function_entry.minhash and len(function_entry.minhash) != signature_bytes:
-                    function_entry.minhash = b""
-                    function_entry.minhash_shingle_composition = {}
-                    num_minhashes_dropped += 1
-                function_entries.append(function_entry)
-            prepared_samples.append((sample_sha256, sample_entry, num_functions, function_entries))
+            _, _, num_dropped = self._prepareImportedSample(export_data, sample_sha256, family_names, signature_bytes)
+            num_minhashes_dropped += num_dropped
+            samples_to_import.append((sample_sha256, num_functions))
         if num_minhashes_dropped:
             LOGGER.warning("Dropped %d imported minhashes that are not %d bytes long, the next minhash repair recalculates them.", num_minhashes_dropped, signature_bytes)
-        return family_names, family_actors, prepared_samples, num_samples_skipped, num_functions_skipped
+        return family_names, family_actors, samples_to_import, num_samples_skipped, num_functions_skipped
+
+    def _prepareImportedSample(self, export_data, sample_sha256, family_names, signature_bytes):
+        """Inflate and parse the content of one sample of an export, and build its sample and function
+        entries; the entries keep the export's family_id. Returns the sample entry, the function entries
+        and the number of minhashes dropped for their length."""
+        sample_entry_dict = export_data["sample_entries"][sample_sha256]
+        # exported as a bool; the family statistics count it as 0 or 1
+        if sample_entry_dict["is_library"] not in (True, False):
+            raise ImportRejected(f"sample {sample_sha256} states whether it is a library as something other than true or false")
+        function_entry_dicts = export_data["function_entries"].get(sample_sha256)
+        # decompress function_entries if necessary
+        if function_entry_dicts is not None and export_data["content"]["is_compressed"]:
+            function_entry_dicts = json.loads(decompress_decode(function_entry_dicts))
+        sample_entry = SampleEntry.fromDict(sample_entry_dict)
+        if sample_entry.family_id not in family_names:
+            raise ImportRejected(f"sample {sample_sha256} names family {sample_entry.family_id}, which the export does not hold")
+        # a sample without a family is stored with "" as local ones are, not with null
+        if sample_entry.family is None:
+            sample_entry.family = family_names[sample_entry.family_id]
+        num_minhashes_dropped = 0
+        function_entries = []
+        for function_entry_dict in (function_entry_dicts or {}).values():
+            function_entry = FunctionEntry.fromDict(function_entry_dict)
+            # the storage keys its pichash index by it
+            if function_entry.pichash is not None and (not isinstance(function_entry.pichash, int) or isinstance(function_entry.pichash, bool)):
+                raise ImportRejected(f"sample {sample_sha256} holds a function whose pichash is no number")
+            if function_entry.minhash and len(function_entry.minhash) != signature_bytes:
+                function_entry.minhash = b""
+                function_entry.minhash_shingle_composition = {}
+                num_minhashes_dropped += 1
+            function_entries.append(function_entry)
+        return sample_entry, function_entries, num_minhashes_dropped
 
     def addImportData(self, export_data):
         storage = self.getStorage()
@@ -332,9 +343,10 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         present_sha256s = storage.getPresentSha256s(export_data["sample_entries"])
         # a first pass reads everything the export holds - inflates and parses each sample's content,
         # builds its sample and function entries - before anything is stored, so that an import that
-        # is refused or malformed stores nothing, not the samples before the one that failed
+        # is refused or malformed stores nothing, not the samples before the one that failed. It keeps
+        # none of the entries; the write pass below reads each sample once more
         try:
-            family_names, family_actors, prepared_samples, num_samples_skipped, num_functions_skipped = self._prepareImportedSamples(export_data, present_sha256s, signature_bytes)
+            family_names, family_actors, samples_to_import, num_samples_skipped, num_functions_skipped = self._prepareImportedSamples(export_data, present_sha256s, signature_bytes)
         except ImportRejected:
             raise
         except (KeyError, TypeError, ValueError, AttributeError, RecursionError) as error:
@@ -424,14 +436,20 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             family_id_remapping[exported_family_id] = remapped_family_id
         LOGGER.info("Family remapping created: %d families, %d samples.", len(family_id_remapping), len(export_data["sample_entries"]))
         index = 0
-        function_entries_to_import = []
+        num_functions_added = 0
+        # the minhashes are banded once every function is stored, as before; until then only their
+        # function ids and bytes are kept, about 100 bytes per function, a small part of its entry
+        minhashes_to_import = []
         imported_sample_entries = []
-        # every sample is written before any function, so one that fails - a function insert MongoDB
-        # refuses - would leave the samples before it without functions, and a corrected import would
-        # skip them as present already: they are removed again instead
+        # every sample is written before its functions, and its functions before the next sample is
+        # read, so one that fails - a function insert MongoDB refuses - would leave it and the samples
+        # before it behind, and a corrected import would skip them as present already: they are
+        # removed again instead
         try:
-            for sample_sha256, sample_entry, num_functions, function_entries in prepared_samples:
+            for sample_sha256, num_functions in samples_to_import:
                 index += 1
+                # read again, as the first pass did: it kept no more than the sha256 to bound memory
+                sample_entry, function_entries, _ = self._prepareImportedSample(export_data, sample_sha256, family_names, signature_bytes)
                 sample_entry.family_id = family_id_remapping[sample_entry.family_id]
                 # add sample_entry to storage and receive new sample_id; None when its sha256 is known
                 # here after all - stated apart from its key, or added by another writer since the check
@@ -449,11 +467,14 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 for function_entry in function_entries:
                     function_entry.sample_id = remapped_sample_entry.sample_id
                     function_entry.family_id = remapped_sample_entry.family_id
-                    function_entries_to_import.append(function_entry)
-                    import_report["num_functions_imported"] += 1
+                import_report["num_functions_imported"] += len(function_entries)
+                adjusted_function_entries = storage.importFunctionEntries(function_entries) if function_entries else []
+                num_functions_added += len(adjusted_function_entries)
+                # we can only index once our imported function_entries had their function_id adjusted to our DB
+                hashed = [function_entry for function_entry in adjusted_function_entries if function_entry.minhash]
+                if hashed:
+                    minhashes_to_import.append(([function_entry.function_id for function_entry in hashed], [function_entry.minhash for function_entry in hashed]))
                 LOGGER.info("Sample %d with SHA256 %s added...", index, sample_sha256)
-
-            adjusted_function_entries = storage.importFunctionEntries(function_entries_to_import)
         except Exception:
             LOGGER.error("Import failed, removing the %d samples it had added.", len(imported_sample_entries))
             for imported_sample_entry in imported_sample_entries:
@@ -463,17 +484,20 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 except Exception:
                     LOGGER.exception("Could not remove sample %s of the failed import.", imported_sample_entry.sha256)
             raise
-        LOGGER.info(f"{len(adjusted_function_entries)} functions added")
-        # we can only start indexing once our imported function_entries had their function_id adjusted to our DB
-        minhashes_to_import = []
-        for function_entry in adjusted_function_entries:
-            # delaying minhash insertion speeds up the procedure dramatically
-            if function_entry.minhash:
-                minhash = MinHash(function_entry.function_id, function_entry.minhash, minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
-                minhashes_to_import.append(minhash)
-        # ensure that their minhashes / pichashes are added to the respective indices
-        storage.addMinHashes(minhashes_to_import)
-        LOGGER.info(f"{len(minhashes_to_import)} Minhashes added")
+        LOGGER.info(f"{num_functions_added} functions added")
+        # ensure that their minhashes / pichashes are added to the respective indices. Delaying minhash
+        # insertion speeds up the procedure dramatically, and so does doing it in one call: a band hash
+        # shared across samples is one update for all of them, where banding sample by sample took 2.5
+        # times as long. It is the one step that still grows with the export, by 1.1-1.4 kB a function
+        minhashes = [
+            MinHash(function_id, minhash, minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
+            for function_ids, minhash_bytes in minhashes_to_import
+            for function_id, minhash in zip(function_ids, minhash_bytes)
+        ]
+        del minhashes_to_import
+        storage.addMinHashes(minhashes)
+        num_minhashes_added = len(minhashes)
+        LOGGER.info(f"{num_minhashes_added} Minhashes added")
         # actors of imported families are merged into what this instance already knows (#57), once the
         # import is complete: they are metadata on top of it, so one that cannot be stored is logged and
         # the import still succeeds - a failure here neither undoes it nor leaves it half done

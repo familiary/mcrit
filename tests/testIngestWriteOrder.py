@@ -276,6 +276,34 @@ class IngestWriteOrderMongoTest(IngestWriteOrderMixin):
         report = target.addImportData(export_data)
         self.assertEqual(2, report["num_samples_imported"])
 
+    def test_an_import_failing_at_a_later_sample_takes_back_what_the_earlier_ones_indexed(self):
+        # an import writes sample by sample, so the first sample's functions are stored, counted and
+        # given a range by the time the second sample's insert is refused
+        export_data = self._export_of("example_report.smda", "example_report_2.smda")
+        target = self._index()
+        storage = target.getStorage()
+        original = storage._dbInsertMany
+        function_inserts = []
+
+        def refusing_the_second(collection, data):
+            if collection == "functions" and data:
+                function_inserts.append(len(data))
+                if len(function_inserts) == 2:
+                    raise ValueError("Database insert failed.")
+            return original(collection, data)
+
+        with mock.patch.object(storage, "_dbInsertMany", refusing_the_second):
+            with self.assertRaises(ValueError):
+                target.addImportData(export_data)
+        self.assertEqual(2, len(function_inserts))
+        database = storage._getDb()
+        for collection in ("samples", "functions", "xcfg", storage._FUNCTION_RANGE_COLLECTION, storage._PICHASH_COUNT_COLLECTION, storage._PICBLOCKHASH_INDEX_COLLECTION):
+            self.assertEqual(0, database[collection].count_documents({}), collection)
+        self.assertEqual(0, database.families.count_documents({"num_samples": {"$ne": 0}}))
+        report = target.addImportData(export_data)
+        self.assertEqual(2, report["num_samples_imported"])
+        self.assertEqual(sum(entry["statistics"]["num_functions"] for entry in export_data["sample_entries"].values()), database.functions.count_documents({}))
+
 
 if __name__ == "__main__":
     unittest.main()

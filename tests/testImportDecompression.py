@@ -3,15 +3,19 @@ import io
 import json
 import logging
 import os
+import random
 import unittest
 import zipfile
+from typing import Any, List
+from unittest.mock import patch
 
 import falcon
 import falcon.testing
 from smda.common.SmdaReport import SmdaReport
 
+import mcrit.libs.utility as utility
 from mcrit.index.MinHashIndex import MinHashIndex
-from mcrit.libs.utility import MAX_DECOMPRESSION_RATIO, MIN_DECOMPRESSED_SIZE, compress_encode, decompress_decode
+from mcrit.libs.utility import MAX_DECOMPRESSION_RATIO, MIN_DECOMPRESSED_SIZE, b85decode, compress_encode, decompress_decode
 from mcrit.server.StatusResource import StatusResource
 
 from .context import config
@@ -61,6 +65,41 @@ def encrypted(encoded):
     data[6] |= 1
     data[bytes(data).rfind(b"PK\x01\x02") + 8] |= 1
     return base64.b85encode(bytes(data)).decode()
+
+
+class B85DecodeTestSuite(unittest.TestCase):
+    """decompress_decode decodes base85 with numpy: base64.b85decode, in pure Python, took longer than
+    the inflating and parsing of an import together"""
+
+    def _decodedOrRaised(self, decode, data):
+        try:
+            return decode(data)
+        except Exception as error:
+            return (type(error), str(error))
+
+    def testDecodesWhatTheStandardLibraryDecodes(self):
+        rng = random.Random(85)
+        for length in list(range(0, 41)) + [4097, 123457]:
+            raw = rng.randbytes(length)
+            encoded = base64.b85encode(raw)
+            self.assertEqual(raw, b85decode(encoded))
+            self.assertEqual(raw, b85decode(encoded.decode()))
+            self.assertEqual(raw, b85decode(bytearray(encoded)))
+        # chunk boundaries, with the last chunk full and partial
+        with patch.object(utility, "_B85_GROUPS_PER_CHUNK", 3):
+            for length in range(0, 41):
+                raw = rng.randbytes(length)
+                self.assertEqual(raw, b85decode(base64.b85encode(raw)))
+
+    def testRefusesWhatTheStandardLibraryRefuses(self):
+        alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~"
+        rng = random.Random(58)
+        # any string over the alphabet, of any length: a group beyond 32 bits, or a dangling character
+        candidates: List[Any] = ["".join(rng.choice(alphabet) for _ in range(length)) for length in range(1, 30) for _ in range(5)]
+        candidates += ["~~~~~", "{{{{{", 'ab"cd', "abc de", "\u00e91234", b"ab,cd", 12, None, ["x"]]
+        for data in candidates:
+            with self.subTest(data=data):
+                self.assertEqual(self._decodedOrRaised(base64.b85decode, data), self._decodedOrRaised(b85decode, data))
 
 
 class DecompressionLimitTestSuite(unittest.TestCase):
@@ -208,6 +247,30 @@ class ImportDecompressionTestSuite(unittest.TestCase):
             self.assertEqual(falcon.HTTP_200, response.status)
             self.assertEqual(2, json.loads(response.data)["data"]["num_samples_imported"])
             self.assertEqual(clean["content"]["num_functions"], len(index.getStorage().getFunctions(0, 0)))
+
+    def testEachSampleIsWrittenBeforeTheNextIsRead(self):
+        # every sample is read twice - checked, then let go, then read again to be written - so that
+        # memory holds one sample's functions at a time instead of the whole export's
+        export = self._twoSampleExport()
+        first_sha256, second_sha256 = list(export["sample_entries"])
+        index = MinHashIndex(config)
+        storage = index.getStorage()
+        prepare = index._prepareImportedSample
+        reads = []
+
+        def recording(export_data, sample_sha256, *args):
+            reads.append((sample_sha256, len(storage.getFunctions(0, 0))))
+            return prepare(export_data, sample_sha256, *args)
+
+        with (
+            patch.object(index, "_prepareImportedSample", side_effect=recording),
+            patch.object(storage, "importFunctionEntries", wraps=storage.importFunctionEntries) as import_functions,
+        ):
+            response = self._post_import(index, json.dumps(export))
+        self.assertEqual(falcon.HTTP_200, response.status)
+        num_first = export["sample_entries"][first_sha256]["statistics"]["num_functions"]
+        self.assertEqual([(first_sha256, 0), (second_sha256, 0), (first_sha256, 0), (second_sha256, num_first)], reads)
+        self.assertEqual([num_first, export["sample_entries"][second_sha256]["statistics"]["num_functions"]], [len(call.args[0]) for call in import_functions.call_args_list])
 
     def testBodyThatIsNoJsonIsAnsweredAsBadInput(self):
         # b"\xff\xfe{}" is UTF-16 to json.loads, b"\x80{}" no Unicode at all; too deep a nesting is a RecursionError

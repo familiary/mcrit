@@ -43,6 +43,25 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   stored, so a failure no longer changes them, and an error merging them is logged rather than
   failing an import that is otherwise complete.
 
+- **`POST /import` holds one sample's functions at a time, not the export's.** It kept every
+  sample's parsed functions until the last was written, then built MinHash objects, band postings
+  and MongoDB updates for all of them at once: on a synthetic export of 300 samples x 700 functions
+  (35 MB compressed, minhashes drawn from 20,000 distinct ones) the server peaked at 4.1 GB RSS.
+  The validation pass still reads the whole export before the first write, as #266 requires, but
+  now lets go of each sample's entries once checked; the write pass reads each sample again and
+  stores it before the next. Only each banded function's id and minhash bytes are kept until the
+  minhashes are banded, in one call as before, so that a band hash shared across samples stays one
+  update. MongoDB storage now bands one band at a time from a matrix of band hashes and writes its
+  minhash and band updates 10,000 at a time, with the same documents as result. base85 is decoded
+  with numpy, 13 times faster than `base64.b85decode`. Same export: 4.1 GB to 0.54 GB peak and
+  143 s to 115 s; with 210,000 distinct minhashes 4.1 GB to 0.62 GB and 414 s to 361 s, nearly
+  all of it band upserts; the validation pass alone 1.7 GB and 13 s to 0.27 GB and 6 s. Banding is
+  the one step that still grows with the export, by 1.1 to 1.4 kB per function. An uncompressed
+  export is parsed whole by `json.loads` before any of this: 406 MB of JSON still peaks at
+  2.5 GB (4.6 GB before). Should a sample fail to store, its rollback now also takes back the
+  pichash counts and function ranges of the samples stored before it. `_addToPicBlockHashIndex`
+  grouped its documents by sample with one scan per sample, which was quadratic in a batch.
+
 - **Memory storage: deleting a sample left its PicHashes behind.** `deleteSample` and
   `discardImportedSample` emptied a PicHash's set of matches but kept the key, so `isPicHash` stayed
   true and `num_pichashes` counted hashes no function carried. The key is now removed with its last

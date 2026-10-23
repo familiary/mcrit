@@ -1793,6 +1793,29 @@ class MongoDbStorageTest(MemoryStorageTest):
         self.assertEqual(len(minhashes), rebuild_result["minhash_functions_indexed"])
         self.assertEqual(bands_before, dumpBands())
 
+    def testAddingMinHashesInSlicesWritesWhatOneBatchWrites(self):
+        # addMinHashes bands one band at a time and writes its updates in slices, so that banding an
+        # import does not hold every band's postings at once; posting order and df come out the same
+        def addAndDump(batch_size):
+            self.storage.clearStorage()
+            self.storage.addSmdaReport(SmdaReport.fromFile(self.example_file_path))
+            # functions 2 and 3 share their signature, and with it every band hash
+            signatures = {0: [1] * 10, 2: [7] * 10, 3: [7] * 10, 5: list(range(10)), 7: [7] * 9 + [8], 8: [0x30] * 10}
+            minhashes = [MinHash(function_id=function_id, minhash_signature=signature, minhash_bits=8) for function_id, signature in signatures.items()]
+            with patch.object(MongoDbStorage, "_MINHASH_UPDATE_BATCH", batch_size):
+                self.storage.addMinHashes(minhashes)
+            database = self.storage._getDb()
+            bands = {
+                band_id: sorted((document["band_hash"], document["function_ids"], document["df"]) for document in database["band_%d" % band_id].find({}, {"_id": 0}))
+                for band_id in range(self._storage_config.STORAGE_NUM_BANDS)
+            }
+            functions = sorted((document["function_id"], document["minhash"]) for document in database.functions.find({}, {"_id": 0, "function_id": 1, "minhash": 1}))
+            return bands, functions
+
+        whole = addAndDump(10000)
+        self.assertTrue(all(any(function_ids[:2] == [2, 3] for _, function_ids, _ in band) for band in whole[0].values()))
+        self.assertEqual(whole, addAndDump(1))
+
     def testRebuildMinhashBandIndexLeavesOutAFunctionWithoutMinhashField(self):
         """a function document without the field (an upsert racing a deletion) has nothing to band"""
         self._storageWithBandedSample()
