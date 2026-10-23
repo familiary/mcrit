@@ -3248,16 +3248,31 @@ class MongoDbStorage(StorageInterface):
                 entries[entry.sample_id] = entry
         return entries
 
-    # TODO add types
-    def getStats(self, with_pichash=True) -> Dict:
-        # we will have to work around using .aggregate(), as a collection with unique pic hashes will easily exceed 16M
-        # https://stackoverflow.com/questions/20348093/mongodb-aggregation-how-to-get-total-records-count
+    def _countDistinctPicHashes(self) -> int:
+        """How many distinct pichashes the stored functions carry.
+
+        While the pichash count index is complete it holds one document per distinct hash, so
+        counting those is the answer, and it reads one small document per hash instead of grouping
+        every function. Only documents with `df > 0` are counted: a sample delete decrements first
+        and removes the documents that reach 0 afterwards (_removeSampleFromPicHashCounts), so a
+        `df <= 0` document is a hash no function holds any more - in between, or for good when
+        the delete died between the two steps. Otherwise the count falls back to the grouping.
+        """
+        if self.isPicHashCountIndexComplete():
+            return self._getDb()[self._PICHASH_COUNT_COLLECTION].count_documents({"df": {"$gt": 0}})
+        # a collection with unique pic hashes will easily exceed 16M, hence the $count rather than
+        # a list of groups; a function without a pichash is not a hash, as in the count index
+        num_unique_pichashes = 0
+        pipeline = [{"$match": {"_pichash": {"$ne": None}}}, {"$group": {"_id": "$_pichash"}}, {"$count": "Total"}]
+        for result in self._getDb().functions.aggregate(pipeline, allowDiskUse=True):
+            num_unique_pichashes = result["Total"]
+        return num_unique_pichashes
+
+    def getStats(self, with_pichash: bool = True) -> Dict[str, Union[int, str, None]]:
         # None signals "not computed", so that consumers can distinguish it from an actual count of 0
         num_unique_pichashes = None
         if with_pichash:
-            num_unique_pichashes = 0
-            for result in self._getDb().functions.aggregate([{"$group": {"_id": "$_pichash"}}, {"$count": "Total"}]):
-                num_unique_pichashes = result["Total"]
+            num_unique_pichashes = self._countDistinctPicHashes()
         # use family statistics to derive relevant values
         stats = {
             "db_state": self._getDbState(),

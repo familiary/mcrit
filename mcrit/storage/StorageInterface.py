@@ -776,7 +776,7 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    def getStats(self, with_pichash=True) -> Dict[str, Union[int, Dict[int, int]]]:
+    def getStats(self, with_pichash: bool = True) -> Dict[str, Any]:
         """Get statistics for the stored data, as a dict with counts per type of entry.
 
         Args:

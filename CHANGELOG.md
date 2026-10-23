@@ -15,6 +15,18 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+- **`GET /status?with_pichash=True` counts the distinct pichashes from the pichash count index**
+  while that index is complete, instead of a `$group` over the whole functions collection on every
+  call. Measured on a synthetic corpus of 2,000,000 functions with 569,898 distinct pichashes on a
+  local mongod 8.0, median of 5: 1.21 s before, 0.18 s after. The cost now follows the number of
+  distinct hashes, not the number of functions.
+  - Only count documents with `df > 0` are counted, so a hash a sample delete has decremented to 0
+    is not, also when the delete died before removing that document.
+  - An incomplete index, for instance after `recalculatePicHashes` until `rebuildPicHashCountIndex`
+    has run, falls back to the grouping as before.
+  - A function without a pichash is no longer counted as one more distinct hash by the grouping, so
+    the two answers agree. On a corpus where every function has a pichash nothing changes.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct
