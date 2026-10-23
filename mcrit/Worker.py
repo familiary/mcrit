@@ -46,7 +46,7 @@ LOGGER = logging.getLogger(__name__)
 # answered from a job computed by the same results version (#241). Bump it in any change that
 # alters what such a report holds for the same corpus and parameters - jobs made before are
 # then recomputed on their next request instead of being handed out again.
-RESULTS_VERSION = 2
+RESULTS_VERSION = 3
 
 
 class Worker(QueueRemoteCallee):

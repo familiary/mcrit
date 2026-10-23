@@ -138,6 +138,9 @@ class MatcherInterface:
         self._shortlist_unavailable = shortlist_unavailable
         # why a requested shortlist was not applied, for the report
         self._shortlist_fallback: Optional[str] = None
+        # per sample, how many entries the PicHash matches would list with every copy paired with every
+        # other (set by _harmonizePicHashMatches); the shortlist votes by it, whatever is listed
+        self._pichash_vote_entries: Counter = Counter()
         self._additional_setup()
         self._sample_to_lib_info: Dict[int, bool]
         # NOTE: query matchers seed this with a sentinel entry for the query sample itself
@@ -269,8 +272,10 @@ class MatcherInterface:
             votes = Counter(dict(zip(voted_samples.tolist(), vote_counts.tolist())))
         # an exact match is worth more than a band collision; the weight only has to be big
         # enough that a pichash-only sample outranks a sample carried by a single band hit
-        for _own_function_id, foreign_sample_id, _foreign_function_id in pichash_matches or {}:
-            votes[foreign_sample_id] += self._PICHASH_SHORTLIST_VOTE_WEIGHT
+        # (counted per pair of copies, as it always was, though the matches list fewer of them)
+        if pichash_matches:
+            for foreign_sample_id, num_entries in self._pichash_vote_entries.items():
+                votes[foreign_sample_id] += self._PICHASH_SHORTLIST_VOTE_WEIGHT * num_entries
         # the query's own sample must never be shortlisted away - self-matches are how a
         # sample-vs-corpus result reports its own functions
         votes.pop(self._sample_id, None)
@@ -702,6 +707,7 @@ class MatcherInterface:
         # Query, VS, Sample
         # all use this version
         pichash_match_mapping: HarmonizedMatches = {}
+        self._pichash_vote_entries = Counter()
         cached_function_id_to_sample_id: Dict[int, int] = {}
         # all_own_function_ids = {entry.function_id for entry in self._function_entries}
         sample_function_id_to_size = {entry.function_id: entry.num_instructions for entry in self._function_entries}
@@ -720,19 +726,32 @@ class MatcherInterface:
             if function_size < self._pichash_size:
                 continue
             # eval matches for this set of tuples
-            if len(pichash_tuples) > 1:
-                for own_function_id in current_own_function_ids:
-                    for foreign_function_id in current_foreign_function_ids:
-                        foreign_sample_id = cached_function_id_to_sample_id[foreign_function_id]
-                        foreign_tuple = (foreign_sample_id, foreign_function_id)
-                        pichash_match_mapping[(own_function_id, *foreign_tuple)] = (100, True, False)
-                    # include self matches
-                    for own_function_id_2 in current_own_function_ids:
-                        if own_function_id == own_function_id_2:
-                            continue
-                        foreign_sample_id = cached_function_id_to_sample_id[own_function_id_2]
-                        foreign_tuple = (foreign_sample_id, own_function_id_2)
-                        pichash_match_mapping[(own_function_id, *foreign_tuple)] = (100, True, False)
+            if len(pichash_tuples) > 1 and current_own_function_ids:
+                # Each own copy of the function is paired with the first copy a sample holds (the lowest function
+                # id, which MinHash matching keeps when the signatures of the copies are equal) and the other
+                # copies there are spread over the own ones: every own function still matches every sample
+                # holding the code and every copy is matched, which is all the summaries count. Pairing each
+                # copy with each made m own copies against n copies in one sample cost m*n entries, and
+                # m*(m-1) self matches - gigabytes for a few thousand copies in one report. The shortlist
+                # still votes by the entries that would have been listed, so it ranks as it did.
+                own_function_ids = sorted(current_own_function_ids)
+                holders_by_sample: Dict[int, List[int]] = {}
+                for foreign_function_id in sorted(current_foreign_function_ids):
+                    holders_by_sample.setdefault(cached_function_id_to_sample_id[foreign_function_id], []).append(foreign_function_id)
+                for sample_id, holder_ids in holders_by_sample.items():
+                    self._pichash_vote_entries[sample_id] += len(own_function_ids) * len(holder_ids)
+                if len(own_function_ids) > 1:
+                    for own_function_id in own_function_ids:
+                        self._pichash_vote_entries[cached_function_id_to_sample_id[own_function_id]] += len(own_function_ids) - 1
+                pairs: List[Tuple[int, int]] = []
+                for holder_ids in holders_by_sample.values():
+                    pairs.extend((own_function_id, holder_ids[0]) for own_function_id in own_function_ids)
+                    pairs.extend((own_function_ids[index % len(own_function_ids)], holder_ids[index]) for index in range(1, len(holder_ids)))
+                # include self matches: each own function with the next one of the group
+                if len(own_function_ids) > 1:
+                    pairs.extend(zip(own_function_ids, own_function_ids[1:] + own_function_ids[:1]))
+                for own_function_id, partner_id in pairs:
+                    pichash_match_mapping[(own_function_id, cached_function_id_to_sample_id[partner_id], partner_id)] = (100, True, False)
         return pichash_match_mapping
 
     def _harmonizeMinHashMatches(self, sample_id, minhash_matches: MinhashMatches) -> HarmonizedMatches:
