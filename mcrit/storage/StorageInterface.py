@@ -1,6 +1,7 @@
 import datetime
 import logging
 import random
+import re
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Protocol, Set, Tuple, Union
 
 from packaging import version
@@ -43,6 +44,14 @@ BAND_DF_REFERENCE_CUTOFFS = (50, 100, 200, 500, 1000)
 # The largest cutoff a coverage report can be asked about: it is compared against df inside a
 # MongoDB aggregation, and BSON integers are signed 64-bit, so a larger one cannot be encoded.
 BAND_DF_CUTOFF_MAX = 2**63 - 1
+
+
+_SHA256_PATTERN = re.compile("[0-9a-fA-F]{64}")
+
+
+def isSha256(value) -> bool:
+    """Whether value has the shape of a SHA256, 64 hex digits"""
+    return isinstance(value, str) and _SHA256_PATTERN.fullmatch(value) is not None
 
 
 class BinaryStream(Protocol):
@@ -165,6 +174,19 @@ class StorageInterface:
 
         Returns:
             A SampleEntry with the specified SHA256 or None, if no such SampleEntry exists.
+        """
+        raise NotImplementedError
+
+    def getPresentSha256s(self, sha256s: Iterable[str]) -> Set[str]:
+        """Which of the given SHA256 values a stored sample (not a query sample) has, in as few round
+        trips as the storage allows - an import checks every sample of an export at once.
+
+        Args:
+            sha256s: The SHA256 values to look up. Any that is not 64 hex digits matches nothing and
+                is not looked up, so that no value can make a lookup too large to send.
+
+        Returns:
+            The subset of sha256s that samples are stored under.
         """
         raise NotImplementedError
 
@@ -1175,9 +1197,11 @@ class StorageInterface:
         raise NotImplementedError
 
     def createBandhashProjection(self, minhash):
-        """Calculate a projection for index permutation based on a given minhash
+        """Calculate a projection for index permutation from the configuration
         Args:
-            minhash: the MinHash used as reference
+            minhash: unused - the projection depends on the configuration alone. It used to be drawn
+                from the length of this minhash, so whichever minhash a process banded first (an
+                imported one included) decided the band keys of every later one.
         Returns:
             a dict containing signature indices used for bandhashing by band id
         """
@@ -1188,7 +1212,7 @@ class StorageInterface:
             band_index = 0
             for band_size, num_bands in self._storage_config.STORAGE_BANDS.items():
                 for _ in range(num_bands):
-                    index_sequence = [index for index in range(len(minhash.getMinHashInt()))]
+                    index_sequence = [index for index in range(self._minhash_config.MINHASH_SIGNATURE_LENGTH)]
                     random.shuffle(index_sequence)
                     band_projection[band_index] = index_sequence[:band_size]
                     band_index += 1
@@ -1258,3 +1282,10 @@ class StorageInterface:
             hashed_band_data = MinHash.hashData(band_data, 0)
             band_hashes[band_index] = hashed_band_data
         return band_hashes
+
+    def _hasBandableLength(self, minhash_bytes: bytes) -> bool:
+        """Whether a stored minhash can have band entries. Imports stored minhashes unchecked, and one
+        shorter than the configured signature, or not a whole number of >8-bit entries, never had any:
+        reading or banding it raises, so deleting or repairing its sample has to skip it."""
+        entry_size = 1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4
+        return len(minhash_bytes) % entry_size == 0 and len(minhash_bytes) >= entry_size * self._minhash_config.MINHASH_SIGNATURE_LENGTH

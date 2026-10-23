@@ -9,7 +9,6 @@ import re
 import uuid
 from collections import defaultdict
 from copy import copy, deepcopy
-from itertools import zip_longest
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from packaging import version as packaging_version
@@ -24,7 +23,7 @@ from mcrit.storage.FunctionEntry import FunctionEntry
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
 from mcrit.storage.MatchingCache import MatchingCache, StorageBackedMatchingCache
 from mcrit.storage.SampleEntry import TIMESTAMP_FORMAT, SampleEntry
-from mcrit.storage.StorageInterface import BinaryStream, StorageInterface
+from mcrit.storage.StorageInterface import BinaryStream, StorageInterface, isSha256
 
 if TYPE_CHECKING:  # pragma: no cover
     from smda.common.SmdaFunction import SmdaFunction
@@ -217,16 +216,18 @@ class MemoryStorage(StorageInterface):
             return True
         for function_id in function_ids:
             function_entry = self._functions[function_id]
-            minhash = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
             # remove function
             del self._functions[function_id]
             # remove pichash entries
             if function_entry.pichash:
-                self._pichashes[function_entry.pichash].remove((function_entry.family_id, sample_id, function_id))
-            # remove minhash entries, if necessary
-            if not minhash or not minhash.hasMinHash():
+                matches = self._pichashes[function_entry.pichash]
+                matches.remove((function_entry.family_id, sample_id, function_id))
+                if not matches:
+                    del self._pichashes[function_entry.pichash]
+            # remove minhash entries, if necessary - one that cannot have been banded is not read at all
+            if not self._hasBandableLength(function_entry.minhash):
                 continue
-            band_hashes = self.getBandHashesForMinHash(minhash)
+            band_hashes = self.getBandHashesForMinHash(function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS))
             for band_number, band_hash in sorted(band_hashes.items()):
                 if band_hash not in self._bands[band_number]:
                     continue
@@ -330,8 +331,13 @@ class MemoryStorage(StorageInterface):
             new_num_functions = new_family_info.num_functions + old_family_info.num_functions
             new_num_lib_samples = new_family_info.num_library_samples + old_family_info.num_library_samples
             # the attribution moves with the samples: a rename onto an existing family merges
-            # both actor lists (a review of #57 caught the rename dropping them)
-            merged_actors = FamilyEntry.normalizeActors(list(new_family_info.actors or []) + list(old_family_info.actors or []))
+            # both actor lists (a review of #57 caught the rename dropping them), up to MAX_ACTORS
+            # as an import does - uncapped, renaming many families into one grew it without bound
+            merged_actors, num_dropped = FamilyEntry.mergeActors(new_family_info.actors, old_family_info.actors)
+            if num_dropped:
+                LOGGER.warning(
+                    "Family %d would be attributed to more than %d actors, dropping %d actors of merged family %d.", new_family_id, FamilyEntry.MAX_ACTORS, num_dropped, family_id
+                )
             self._families[new_family_id].actors = merged_actors
             # update family_entry
             if family_id == 0:
@@ -430,11 +436,14 @@ class MemoryStorage(StorageInterface):
         num_hashed = 0
         for function_id in self._sample_id_to_function_ids[sample_id]:
             function_entry = self._functions[function_id]
-            minhash = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
-            if not minhash or not minhash.hasMinHash():
+            if not function_entry.minhash:
                 continue
             num_hashed += 1
-            for band_number, band_hash in sorted(self.getBandHashesForMinHash(minhash).items()):
+            # as in deleteSample, one that cannot have been banded is not read
+            band_hashes = {}
+            if self._hasBandableLength(function_entry.minhash):
+                band_hashes = self.getBandHashesForMinHash(function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS))
+            for band_number, band_hash in sorted(band_hashes.items()):
                 if band_hash in self._bands[band_number]:
                     self._bands[band_number][band_hash] = [fid for fid in self._bands[band_number][band_hash] if fid != function_id]
                     if not self._bands[band_number][band_hash]:
@@ -448,6 +457,7 @@ class MemoryStorage(StorageInterface):
     def deleteRehashableMinHashes(self, progress_reporter=None) -> Set[int]:
         self._bands = {band_number: {} for band_number in self._bands}
         kept_sample_ids: Set[int] = set()
+        signature_bytes = self._minhash_config.MINHASH_SIGNATURE_LENGTH * (1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4)
         for function_entry in self._functions.values():
             minhash = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
             if not minhash or not minhash.hasMinHash():
@@ -456,8 +466,10 @@ class MemoryStorage(StorageInterface):
                 function_entry.minhash = b""
                 function_entry.minhash_shingle_composition = {}
             else:
-                # no disassembly to compute it from again: kept, and banded again
-                self.addMinHash(minhash)
+                # no disassembly to compute it from again: kept, and banded again - unless it is of
+                # another length than the configured signature, which does not fit the band projection
+                if len(function_entry.minhash) == signature_bytes:
+                    self.addMinHash(minhash)
                 kept_sample_ids.add(function_entry.sample_id)
         return kept_sample_ids
 
@@ -579,7 +591,8 @@ class MemoryStorage(StorageInterface):
             self._sample_by_sha256[sample_entry.sha256] = sample_id
             self._updateFamilyStats(sample_entry.family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))
             return sample_entry
-        # the entry still carries the id it had in the export, which here may well be another sample's
+        # not this entry's sample: the entry still carries the id it had in the export, which here may
+        # well be another sample's, so the caller must not attach the entry's functions to its sample_id
         LOGGER.warning("Sample %s already existed, skipping.", sample_entry.sha256)
         return None
 
@@ -592,7 +605,11 @@ class MemoryStorage(StorageInterface):
         for function_id in self._sample_id_to_function_ids.pop(sample_id, []):
             function_entry = self._functions.pop(function_id, None)
             if function_entry is not None and function_entry.pichash:
-                self._pichashes.get(function_entry.pichash, set()).discard((function_entry.family_id, sample_id, function_id))
+                matches = self._pichashes.get(function_entry.pichash)
+                if matches is not None:
+                    matches.discard((function_entry.family_id, sample_id, function_id))
+                    if not matches:
+                        del self._pichashes[function_entry.pichash]
         del self._samples[sample_id]
         self._sample_by_sha256.pop(sample_entry.sha256, None)
         # the mirror of importSampleEntry's increment; the family stays, as in MongoDbStorage
@@ -871,6 +888,9 @@ class MemoryStorage(StorageInterface):
             if entry is not None:
                 entries[sample_id] = entry
         return entries
+
+    def getPresentSha256s(self, sha256s: Iterable[str]) -> Set[str]:
+        return {sha256 for sha256 in sha256s if isSha256(sha256) and sha256 in self._sample_by_sha256}
 
     def getSampleBySha256(self, sha256: str, is_query=False) -> Optional["SampleEntry"]:
         sample_entry = None
@@ -1222,30 +1242,36 @@ class MemoryStorage(StorageInterface):
         }
 
     def rebuildMinhashBandIndex(self, progress_reporter=None):
-        # TODO while minhashes are considerably small, there is a still chance that the
-        # sum of all minhashes will eventually exceed available memory on a given system.
-        # in this case we can start doing batches in our database interation already
-        minhashes = []
-        # get all minhash objects from all functions
-        for function_id, function_entry in self._functions.items():
-            if function_entry.minhash:
-                minhash_obj = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
-                minhashes.append(minhash_obj)
+        # Collect the entries first, for the progress total, without constructing MinHash objects; the
+        # bands are then fed from this snapshot, not from the dict a concurrent writer may change. As in
+        # MongoDbStorage, leave out any minhash of another length than the configured signature, which
+        # would fail the rebuild after the bands were reset. Not _hasBandableLength: that also admits a
+        # longer one.
+        signature_bytes = self._minhash_config.MINHASH_SIGNATURE_LENGTH * (1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4)
+        num_skipped = 0
+        bandable_entries = []
+        for function_entry in list(self._functions.values()):
+            if function_entry.minhash and len(function_entry.minhash) != signature_bytes:
+                num_skipped += 1
+            elif function_entry.minhash:
+                bandable_entries.append(function_entry)
+        num_minhashes = len(bandable_entries)
+        if num_skipped:
+            LOGGER.warning("Left %d functions out of the band index, their minhashes are not %d bytes long; recalculating minhashes indexes them.", num_skipped, signature_bytes)
         # drop band collections
         # recreate indices for band collections
         for band_id in range(self._storage_config.STORAGE_NUM_BANDS):
             self._bands[band_id] = {}
-        # re-add minhashes in batches
-        batch_size = self._minhash_config.MINHASH_BAND_REBUILD_WORK_PACKAGE_SIZE
+        # re-add minhashes in batches, decoding one work package at a time
+        batch_size = max(1, self._minhash_config.MINHASH_BAND_REBUILD_WORK_PACKAGE_SIZE)
         if progress_reporter:
-            progress_reporter.set_total((len(minhashes) // batch_size) + 1)
-        for minhash_batch in zip_longest(*[iter(minhashes)] * batch_size):
-            minhash_batch = [mh for mh in minhash_batch if mh is not None]
-            for mh in minhash_batch:
+            progress_reporter.set_total((num_minhashes + batch_size - 1) // batch_size)
+        for offset in range(0, num_minhashes, batch_size):
+            for mh in [entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS) for entry in bandable_entries[offset : offset + batch_size]]:
                 self._addMinHashToBands(mh)
             if progress_reporter:
                 progress_reporter.step()
-        return len(minhashes)
+        return num_minhashes
 
     ##### helpers for search ######
 

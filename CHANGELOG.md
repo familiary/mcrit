@@ -15,6 +15,95 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **`POST /import` answers 400 for an export it refuses, and stores nothing of it (#266).** An
+  export of another shingler or MinHash configuration, or of a version that is too old, was answered
+  with 200 and `data: null`, which a client could not tell from success (`McritClient` with
+  `raise_client_errors=True` now raises `McritBadRequest` where it returned `None`). A missing or
+  non-text version was a 500, and any text sorting above `"0.0.0"` was accepted, `latest` and
+  `0.0.0rc1` included, because versions were compared as strings; they are now compared by PEP 440
+  ordering. All of these are answered with 400 ("Import rejected: ..."), as is an export whose
+  structure cannot be read: a section missing or no mapping; a sample, present here already or not,
+  whose function count is not a count or whose architecture is neither text nor null; a field
+  missing from the entry of a sample to be stored, or its `is_library` not a boolean; a family id
+  that is no number, or that names two families; a family name other than text or null; family
+  actors that are not a list; a function whose pichash is no number; content that does not inflate
+  (corrupt, truncated, encrypted) or parse; JSON nested too deeply. A refused export stores nothing,
+  its families included, which a malformed export used to leave behind. Function fields are checked
+  only as far as building the entries needs, so some malformed ones still fail while storing, with a
+  500. `MinHashIndex.addImportData` raises `ImportRejected`, a `ValueError`, where it returned
+  `None`.
+
+- **`POST /import`: what an accepted export changes.** A sample whose family the export names null,
+  as older versions export a report without a family, used to land in a family named null and now
+  goes to the default family. An error while storing, a failed MongoDB insert say, is still a 500
+  and as before removes the samples the import had added, but may leave the families it added for
+  them. The actors of families the import found are merged last and only once everything else is
+  stored, so a failure no longer changes them, and an error merging them is logged rather than
+  failing an import that is otherwise complete.
+
+- **Memory storage: deleting a sample left its PicHashes behind.** `deleteSample` and
+  `discardImportedSample` emptied a PicHash's set of matches but kept the key, so `isPicHash` stayed
+  true and `num_pichashes` counted hashes no function carried. The key is now removed with its last
+  match. MongoDB storage is not affected.
+
+- **Memory storage: `/rebuild_index` held every MinHash of the corpus in one list.** The bands are
+  now rebuilt one work package at a time, with the same result, and the progress total is exactly
+  the number of work packages (it was one too many when the count divided evenly).
+
+### Security
+
+- `POST /import` no longer attaches functions to a sample it did not create. An export entry whose
+  own `sha256` differed from its key, or named a sample already present (including one added by a
+  second import running at the same time), was reported as imported and its functions were stored
+  under the sample id of the exporting instance, on whatever local sample held that id or on none.
+  `importSampleEntry` now returns None for a known sha256, as its interface documents, and the
+  import skips such a sample together with its functions and counts it as skipped. Functions
+  attached by earlier imports are not detached; a sample whose `statistics.num_functions` is lower
+  than its number of functions is worth checking.
+
+- `POST /import` drops imported minhashes whose length is not the configured signature length. Such
+  a minhash used to be stored and banded next to the code it was copied from, and every matching job
+  that drew it as a candidate then failed. The function is still imported, without a minhash, and a
+  minhash repair computes it again. Minhashes of a wrong length stored by earlier imports keep
+  failing matching jobs until `/repair_minhashes` rehashes their sample, if it has disassembly.
+
+- The band projection for the `random` band strategy is derived from the configured signature length
+  instead of from the first minhash a process happens to band. An imported minhash of another length
+  could previously change the band hashes of everything that process wrote afterwards, or make every
+  later banding fail. For correctly configured instances the projection is unchanged.
+
+- A single imported function that cannot be rebuilt from its stored disassembly (for example an
+  `xcfg` holding only an offset) no longer fails `/complete_minhashes`, `/repair_minhashes`,
+  `/recalculate_minhashes` and `/recalculate_pichashes` on every run. Such a function is skipped
+  with a warning naming it, like one without disassembly. `/recalculate_pichashes` does not stamp
+  its sample as rehashed. `/repair_minhashes` leaves a sample with such a function alone, keeping
+  its minhashes and its stale mark, and counts it as skipped. `/recalculate_minhashes` does not
+  record such a sample as current, so a later repair tries it again.
+
+- Deleting a sample or family, and `/repair_minhashes`, no longer fail on a stored minhash shorter
+  than the configured signature (or not a whole number of entries), as an earlier import could have
+  stored. It never had band entries and is skipped with a warning; before, the sample could not be
+  deleted through the API and every repair run stopped at it.
+
+- `/rebuild_index` no longer stops half way after having emptied the band collections when it meets
+  a function without a minhash field or with a minhash of the wrong length. Those functions are left
+  out with a warning and the rest is indexed.
+
+- `POST /import` limits what it decompresses. Compressed sample content is accepted only as deflate
+  (or stored) data and only up to 20 times its encoded size, or 8 MiB if that is more; anything
+  else is answered with 400 instead of growing the server by gigabytes. Exports of the live corpus
+  inflate to 4 times their encoded size at the median and 11.6 at most. A body that is not JSON is
+  now answered with 400 instead of 500. An export that compresses better than that has to be
+  imported uncompressed. The whole export is read before any sample is stored, so a refused import
+  leaves no sample or function behind.
+
+- A family is attributed to at most 64 actors. `PUT /families/{id}` answers 400 for a longer list,
+  and an import or a family rename that merges into another family adds the first actors that fit
+  and logs a warning for the rest. Deduplication of actor names now takes linear time instead of
+  quadratic. Families already holding more actors keep them.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct
