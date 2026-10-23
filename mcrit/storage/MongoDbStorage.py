@@ -23,7 +23,7 @@ from gridfs.errors import FileExists
 from packaging import version
 from picblocks.blockhasher import BlockHasher
 from pymongo import MongoClient, UpdateMany, UpdateOne
-from pymongo.errors import BulkWriteError, DocumentTooLarge, ExecutionTimeout
+from pymongo.errors import BulkWriteError, DocumentTooLarge, ExecutionTimeout, OperationFailure
 from smda.common.BinaryInfo import BinaryInfo
 from smda.common.SmdaFunction import SmdaFunction
 from smda.SmdaConfig import SmdaConfig
@@ -101,26 +101,97 @@ class MongoSearchTranspiler(BaseVisitor):
         return {"$and": conditions}
 
     def visitAndNode(self, node: AndNode):
-        visited_children = [self.visit(child) for child in node.children]
+        visited_children = [self.visit(child) for child in self._dedupe(node.children)]
         return self._and_query(*visited_children)
 
     def visitOrNode(self, node: OrNode):
-        visited_children = [self.visit(child) for child in node.children]
+        visited_children = [self.visit(child) for child in self._dedupe(node.children)]
         return self._or_query(*visited_children)
+
+    # how many (value, term) pairs one query may test against its known values, about 0.4 s of
+    # Python on 50-character labels (0.75 us a test): the terms past that are left to the regex
+    _MAX_VALUE_TESTS = 500_000
 
     def __init__(self, known_values: Optional[Dict[str, List[Any]]] = None) -> None:
         super().__init__()
         self.known_values = known_values or {}
+        # the $in / $nin lists of one query share _DISTINCT_VALUES_MAX_BYTES, so a query stays well
+        # inside MongoDB's 16 MiB however many terms it has; a term past the budget is a regex
+        self._list_bytes_left = MongoDbStorage._DISTINCT_VALUES_MAX_BYTES
+        self._value_tests_left = self._MAX_VALUE_TESTS
+        self._matching: Dict[Tuple[str, str, str], Optional[List[str]]] = {}
+        # the known fields of which a condition was left to the regex all the same
+        self.unlisted_fields: Set[str] = set()
+
+    @staticmethod
+    def _dedupe(children: List[NodeType]) -> List[NodeType]:
+        # "a b a" is "a b" in both an and and an or: the same condition is transpiled once
+        seen = set()
+        unique = []
+        for child in children:
+            if isinstance(child, SearchConditionNode):
+                key = (child.field, child.operator, repr(child.value))
+                if key in seen:
+                    continue
+                seen.add(key)
+            unique.append(child)
+        return unique
+
+    @staticmethod
+    def _may_match(term: str, value: str) -> bool:
+        # A superset of what MongoDB's case-insensitive regex matches: its folding (PCRE's) differs
+        # from Python's for a few characters, such as the dotted capital I, which Python's re folds
+        # to "i" and PCRE does not. The $regex the $in is paired with decides.
+        return term.lower() in value.lower() or term.upper() in value.upper() or term.casefold() in value.casefold()
+
+    @staticmethod
+    def _is_exact(field: str, operator: str) -> bool:
+        # A "?" on the labels is answered by the probe (the regex) or through the listing, so the two
+        # have to agree exactly. The names keep the $in of what Python's re matches, which is all
+        # their (bounded) index scan needs.
+        return operator == "?" and field in MongoDbStorage._DISTINCT_VALUES_IN_ARRAYS
+
+    def _matching_values(self, field: str, operator: str, term: str) -> Optional[List[str]]:
+        key = (field, operator, term)
+        if key not in self._matching:
+            self._matching[key] = self._scan_matching_values(field, operator, term)
+        return self._matching[key]
+
+    def _scan_matching_values(self, field: str, operator: str, term: str) -> Optional[List[str]]:
+        values = self.known_values[field]
+        if len(values) > self._value_tests_left:
+            return None
+        self._value_tests_left -= len(values)
+        pattern = re.compile(re.escape(term), re.IGNORECASE)
+        if self._is_exact(field, operator):
+            matching = [value for value in values if isinstance(value, str) and (pattern.search(value) or self._may_match(term, value))]
+        else:
+            matching = [value for value in values if isinstance(value, str) and pattern.search(value)]
+        size = sum(len(value.encode("utf-8")) for value in matching)
+        if size > self._list_bytes_left:
+            return None
+        self._list_bytes_left -= size
+        return matching
 
     def _substring_condition_from_known_values(self, node: SearchConditionNode) -> Optional[Dict[str, Any]]:
         # an empty search term matches everything, so the regex is left alone there
-        if not node.operator.endswith("?") or node.field not in self.known_values or not node.value:
+        if node.operator not in ("?", "!?") or node.field not in self.known_values or not node.value:
             return None
-        pattern = re.compile(re.escape(node.value), re.IGNORECASE)
-        matching = [value for value in self.known_values[node.field] if isinstance(value, str) and pattern.search(value)]
+        if node.operator == "!?" and node.field in MongoDbStorage._DISTINCT_VALUES_IN_ARRAYS:
+            # a negated label term stays the regex: its $nin would examine every document all the
+            # same, and could not be paired with the regex to keep MongoDB's case folding
+            return None
+        matching = self._matching_values(node.field, node.operator, node.value)
+        if matching is None:
+            self.unlisted_fields.add(node.field)
+            return None
         if node.operator == "!?":
             return {node.field: {"$nin": matching}}
-        return {node.field: {"$in": matching}}
+        if not self._is_exact(node.field, node.operator):
+            return {node.field: {"$in": matching}}
+        # the $in of every value the regex may match bounds the index scan, and the regex itself
+        # keeps exactly MongoDB's matches, as the probe and the unlisted search find them
+        return {node.field: {"$in": matching, "$regex": re.compile(re.escape(node.value), re.IGNORECASE)}}
 
     def visitSearchConditionNode(self, node: SearchConditionNode):
         condition_from_known_values = self._substring_condition_from_known_values(node)
@@ -171,14 +242,36 @@ class MongoSearchTranspiler(BaseVisitor):
         return condition
 
 
-def _hasSubstringCondition(tree: NodeType, field: str) -> bool:
+def _conditionFields(tree: NodeType) -> Set[str]:
+    """The fields the (resolved) tree has conditions on."""
+    if isinstance(tree, SearchConditionNode):
+        return {tree.field}
+    if isinstance(tree, (AndNode, OrNode)):
+        return set().union(*(_conditionFields(child) for child in tree.children))
+    if isinstance(tree, NotNode):
+        return _conditionFields(tree.child)
+    return set()
+
+
+def _substringTerms(tree: NodeType, field: str, operator: str) -> Set[str]:
+    """The distinct terms of the (resolved) tree's substring conditions on the field."""
+    if isinstance(tree, SearchConditionNode):
+        return {tree.value} if tree.field == field and tree.operator == operator else set()
+    if isinstance(tree, (AndNode, OrNode)):
+        return set().union(*(_substringTerms(child, field, operator) for child in tree.children))
+    if isinstance(tree, NotNode):
+        return _substringTerms(tree.child, field, operator)
+    return set()
+
+
+def _hasSubstringCondition(tree: NodeType, field: str, operators: Tuple[str, ...] = ("?", "!?")) -> bool:
     """True when the (resolved) tree holds a substring condition on the field."""
     if isinstance(tree, SearchConditionNode):
-        return tree.field == field and tree.operator.endswith("?")
+        return tree.field == field and tree.operator in operators
     if isinstance(tree, (AndNode, OrNode)):
-        return any(_hasSubstringCondition(child, field) for child in tree.children)
+        return any(_hasSubstringCondition(child, field, operators) for child in tree.children)
     if isinstance(tree, NotNode):
-        return _hasSubstringCondition(tree.child, field)
+        return _hasSubstringCondition(tree.child, field, operators)
     return False
 
 
@@ -200,6 +293,30 @@ class MongoDbStorage(StorageInterface):
     # deletions bring it back under, the cost is the regex - today's behaviour - until the verdict
     # expires and the scan runs again.
     _OVER_CAP_TTL = 3600
+    # Fields inside an array of documents (the function labels, searched as
+    # "function_labels.function_label:?term") are listed with the distinct command instead: a $group
+    # would group by the whole array, and the $unwind it needs first reads every document, where
+    # distinct is answered from the multikey index alone (DISTINCT_SCAN). It cannot stop at the cap,
+    # and these fields are not held to it either: the regex they would fall back to cannot be
+    # checked against the keys of a multikey index, so it fetches every labelled function, and
+    # MongoDB preferred walking all of them by function_id (a search without results over a million
+    # functions: 1.4 s, every document examined). Listing 150,000 distinct labels there took 0.6 s,
+    # and the listing is paid on every search with such a term, never cached: 36-42 ms for 7,500
+    # labels, 130-190 ms for 48,600 over 250,000 functions. Its bounds are the search time limit and
+    # the 16 MiB a distinct can answer, past which the labels fall back to the regex after all; the
+    # $in stays within _DISTINCT_VALUES_MAX_BYTES because the transpiler only uses the matching
+    # values up to that size.
+    _DISTINCT_VALUES_IN_ARRAYS = ("function_labels.function_label",)
+    # A search of nothing but label conditions with a "?" among them is first tried as the regex
+    # walking the sort order, for this long: a term that many labels match fills its page within a
+    # few milliseconds that way (5-35 ms over 250,000 functions), where listing the labels costs
+    # 30-250 ms. Only a probe that runs out lists them, and the probe's and the listing's time count
+    # against the search time limit, so a rare term costs this much more than before, never more
+    # than the limit.
+    _LABEL_PROBE_TIME_MS = 50
+    # an inline `_xcfg` (a corpus migrate_xcfg_split has not run on) is left on the server: a search
+    # result carries no disassembly, as it never did once the blobs were split out
+    _FUNCTION_SEARCH_PROJECTION = {"_id": 0, "_xcfg": 0}
     # Inverted index over picblockhashes: {_id: <block hash>, sample_ids: [<sample_id>, ...]}.
     # getUniqueBlocks only ever asks "does this block hash occur outside the requested samples?",
     # so the sample list is all it needs - deliberately not function ids or offsets, which would
@@ -260,6 +377,10 @@ class MongoDbStorage(StorageInterface):
         self._database_lock = threading.Lock()
         # (collection, field) -> time.monotonic() at which it was found over the distinct-values cap
         self._over_cap_since: Dict[Tuple[str, str], float] = {}
+        # (collection, field) -> (how many distinct values its last listing found, time.monotonic()
+        # of it), for the fields of _DISTINCT_VALUES_IN_ARRAYS: a search with too many terms to test
+        # against that many values skips the listing for _OVER_CAP_TTL seconds
+        self._distinct_count_since: Dict[Tuple[str, str], Tuple[int, float]] = {}
 
     def _getDb(self):
         # because of gunicorn and forking workers, we want to delay creation of MongoClient until actual usage and avoid it within __init__()
@@ -367,6 +488,9 @@ class MongoDbStorage(StorageInterface):
         self._getDb()["functions"].create_index("sample_id")
         self._getDb()["functions"].create_index("family_id")
         self._getDb()["functions"].create_index("function_name")
+        # the qualified label search (findFunctionByString); sparse, as only named or labelled functions carry
+        # labels, and a query for label values never asks for the functions without one
+        self._getDb()["functions"].create_index("function_labels.function_label", sparse=True)
         self._getDb()["functions"].create_index("_pichash")
         self._getDb()["functions"].create_index("_picblockhashes.hash")
         # Searches sorted by a field other than the id (fkie-cad/mcritweb#59): the search cursor sorts by that
@@ -1556,6 +1680,7 @@ class MongoDbStorage(StorageInterface):
             self._getDb()[c].drop()
         # an emptied corpus is under every cap again; other processes simply wait out the TTL
         self._over_cap_since.clear()
+        self._distinct_count_since.clear()
         self._ensureIndexAndUnknownFamily()
 
     def getSampleBySha256(self, sha256: str, is_query=False) -> Optional["SampleEntry"]:
@@ -3814,28 +3939,48 @@ class MongoDbStorage(StorageInterface):
         sort_list = [(key, 1 if direction ^ is_backward_search else -1) for key, direction in full_cursor.sort_by_list]
         return sort_list
 
-    def _getDistinctValues(self, collection: str, field: str) -> Optional[List[Any]]:
+    def _getDistinctValues(self, collection: str, field: str, max_time_ms: Optional[int] = None) -> Optional[List[Any]]:
         """All distinct values of the field, or None when there are more than _DISTINCT_VALUES_CAP
         of them, they exceed _DISTINCT_VALUES_MAX_BYTES in total or the scan runs out of the search time
-        limit (STORAGE_MONGODB_SEARCH_MAX_TIME_MS). A None is remembered for
-        _OVER_CAP_TTL seconds, so a large corpus pays for the capped scan once, not per search."""
-        found_over_cap = self._over_cap_since.get((collection, field))
-        if found_over_cap is not None and time.monotonic() - found_over_cap < self._OVER_CAP_TTL:
+        limit (STORAGE_MONGODB_SEARCH_MAX_TIME_MS); a field of _DISTINCT_VALUES_IN_ARRAYS only stops
+        at the time limit and the 16 MiB a distinct can answer. A None is remembered for
+        _OVER_CAP_TTL seconds, so a large corpus pays for the capped scan once, not per search.
+        max_time_ms replaces the search time limit for a scan that has only part of it; running out
+        of that is the same verdict: the listing is too slow for the limit searches have."""
+        if self._isOverCap(collection, field):
             return None
         try:
-            values = self._scanDistinctValues(collection, field)
+            values = self._scanDistinctValues(collection, field, max_time_ms or self._getSearchMaxTimeMS())
         except ExecutionTimeout:
             # the same verdict as too many values: the search matches the names in the database instead
             values = None
         if values is None:
             self._over_cap_since[(collection, field)] = time.monotonic()
+        elif field in self._DISTINCT_VALUES_IN_ARRAYS:
+            self._distinct_count_since[(collection, field)] = (len(values), time.monotonic())
         return values
 
-    def _scanDistinctValues(self, collection: str, field: str) -> Optional[List[Any]]:
+    def _lastDistinctCount(self, collection: str, field: str) -> Optional[int]:
+        count, since = self._distinct_count_since.get((collection, field), (None, 0.0))
+        return count if count is not None and time.monotonic() - since < self._OVER_CAP_TTL else None
+
+    def _isOverCap(self, collection: str, field: str) -> bool:
+        found_over_cap = self._over_cap_since.get((collection, field))
+        return found_over_cap is not None and time.monotonic() - found_over_cap < self._OVER_CAP_TTL
+
+    def _scanDistinctValues(self, collection: str, field: str, max_time_ms: Optional[int]) -> Optional[List[Any]]:
+        if field in self._DISTINCT_VALUES_IN_ARRAYS:
+            try:
+                return self._getDb()[collection].distinct(field, maxTimeMS=max_time_ms or 0)
+            except OperationFailure as failure:
+                # 17217: "distinct too big, 16mb cap"
+                if failure.code == 17217:
+                    return None
+                raise
         pipeline = [{"$group": {"_id": "$" + field}}, {"$limit": self._DISTINCT_VALUES_CAP + 1}]
         values = []
         total_bytes = 0
-        for document in self._getDb()[collection].aggregate(pipeline, maxTimeMS=self._getSearchMaxTimeMS() or 0):
+        for document in self._getDb()[collection].aggregate(pipeline, maxTimeMS=max_time_ms or 0):
             value = document["_id"]
             if isinstance(value, str):
                 total_bytes += len(value.encode("utf-8"))
@@ -3854,6 +3999,12 @@ class MongoDbStorage(StorageInterface):
         the distinct values that match, when the collection has few enough of them (see
         MongoSearchTranspiler.known_values).
         """
+        full_tree = self._resolve_search_tree(search_fields, search_tree, cursor, conditional_search_fields)
+        known_values = self._list_known_values(full_tree, distinct_fields or {})
+        query = MongoSearchTranspiler(known_values).visit(full_tree)
+        return query
+
+    def _resolve_search_tree(self, search_fields: List[str], search_tree: NodeType, cursor: Optional[FullSearchCursor], conditional_search_fields=None) -> NodeType:
         # checked here as well as when the sort list is built, because this runs first: paging by an
         # unsortable field would otherwise fail in the transpiler, blaming the range operator that
         # the cursor tree happens to use instead of naming the field that cannot be sorted by
@@ -3864,15 +4015,20 @@ class MongoDbStorage(StorageInterface):
             full_tree = search_tree
         full_tree = SearchFieldResolver(search_fields, conditional_search_fields=conditional_search_fields).visit(full_tree)
         full_tree = FilterSingleElementLists().visit(full_tree)
-        full_tree = PropagateNot().visit(full_tree)
+        return PropagateNot().visit(full_tree)
+
+    def _list_known_values(self, full_tree: NodeType, distinct_fields: Dict[str, str], max_time_ms: Optional[int] = None) -> Dict[str, List[Any]]:
+        """Lists each field once, however many conditions of the tree it serves."""
         known_values = {}
-        for field, collection in (distinct_fields or {}).items():
-            if _hasSubstringCondition(full_tree, field):
-                values = self._getDistinctValues(collection, field)
+        for field, collection in distinct_fields.items():
+            # the labels are listed for a "?" only: their listing is paid on every search, and the $nin a
+            # "!?" would become needs every document examined just like the regex it replaces
+            operators = ("?",) if field in self._DISTINCT_VALUES_IN_ARRAYS else ("?", "!?")
+            if _hasSubstringCondition(full_tree, field, operators):
+                values = self._getDistinctValues(collection, field, max_time_ms)
                 if values is not None:
                     known_values[field] = values
-        query = MongoSearchTranspiler(known_values).visit(full_tree)
-        return query
+        return known_values
 
     ##### search ####
 
@@ -3883,11 +4039,14 @@ class MongoDbStorage(StorageInterface):
 
     @contextlib.contextmanager
     def _searchTimeLimit(self):
-        """Answers a search that ran out of its time limit as a ValueError, which the REST layer turns into a 400."""
+        """Answers a search that ran out of its time limit, or whose query grew past what MongoDB
+        accepts, as a ValueError, which the REST layer turns into a 400."""
         try:
             yield
         except ExecutionTimeout as timeout:
             raise ValueError("The search took too long and was stopped. Narrow the search term.") from timeout
+        except DocumentTooLarge as too_large:
+            raise ValueError("The search is too large. Use fewer search terms.") from too_large
 
     def findFamilyByString(self, search_tree: NodeType, cursor: Optional[FullSearchCursor] = None, max_num_results: int = 100) -> Dict[int, "FamilyEntry"]:
         result_dict = {}
@@ -3917,14 +4076,93 @@ class MongoDbStorage(StorageInterface):
                 result_dict[entry.sample_id] = entry
         return result_dict
 
+    @staticmethod
+    def _remainingMS(deadline: Optional[float]) -> Optional[int]:
+        """What is left of a search's time limit, None for no limit; a search past it is stopped."""
+        if deadline is None:
+            return None
+        remaining_ms = round((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            raise ExecutionTimeout("the search used up its time limit")
+        return remaining_ms
+
+    def _canProbe(self, sort_list, max_time_ms: Optional[int]) -> bool:
+        if not sort_list or self._isOverCap("functions", "function_labels.function_label"):
+            return False
+        return max_time_ms is None or max_time_ms > self._LABEL_PROBE_TIME_MS
+
+    def _probeFunctionSearch(self, query: Dict, sort_list, max_num_results: int, max_time_ms: Optional[int]) -> Optional[List[Dict]]:
+        """The page the regex finds within _LABEL_PROBE_TIME_MS, None when it does not, or when there
+        is no point in a probe: the labels are over the cap, so the search is the regex anyway, or
+        the search's own limit leaves no room for it.
+
+        The probe walks the index of the sort order - (field, function_id) for every sortable field -
+        by hint: left to plan it, MongoDB first tries the label index, whose regex fetches every
+        labelled function, and a probe that runs out while planning never caches the plan, so every
+        later probe would run out the same way (~400 ms of planning against ~20 ms of walking).
+        """
+        if not self._canProbe(sort_list, max_time_ms):
+            return None
+        hint = [(field, 1) for field, _ in sort_list]
+        try:
+            return list(
+                self._getDb().functions.find(query, self._FUNCTION_SEARCH_PROJECTION, sort=sort_list, limit=max_num_results, max_time_ms=self._LABEL_PROBE_TIME_MS, hint=hint)
+            )
+        except OperationFailure:
+            # out of time - or a database without the index to hint, which the listing serves as well
+            return None
+
+    def _findFunctionsByLabels(self, full_tree: NodeType, sort_list, max_num_results: int) -> List[Dict]:
+        """A search of label conditions alone: the regex is probed, then the labels are listed. Both
+        count against the search time limit, and the final query gets what is left of it."""
+        max_time_ms = self._getSearchMaxTimeMS()
+        deadline = None if max_time_ms is None else time.monotonic() + max_time_ms / 1000
+        if self._canProbe(sort_list, max_time_ms):
+            function_documents = self._probeFunctionSearch(MongoSearchTranspiler().visit(full_tree), sort_list, max_num_results, max_time_ms)
+            if function_documents is not None:
+                return function_documents
+        field = "function_labels.function_label"
+        # too many terms to test against every label: the transpiler would leave them to the regex
+        value_tests = len(_substringTerms(full_tree, field, "?"))
+        last_count = self._lastDistinctCount("functions", field)
+        if last_count is not None and value_tests * last_count > MongoSearchTranspiler._MAX_VALUE_TESTS:
+            known_values = {}
+        else:
+            # the listing gets half of what is left, so that the query keeps the other half even when
+            # the listing runs out of its share: then the search is the regex, as it is for the next
+            # _OVER_CAP_TTL seconds
+            remaining_ms = self._remainingMS(deadline)
+            listing_ms = None if remaining_ms is None else max(1, remaining_ms // 2)
+            known_values = self._list_known_values(full_tree, {field: "functions"}, listing_ms)
+            if value_tests * len(known_values.get(field, [])) > MongoSearchTranspiler._MAX_VALUE_TESTS:
+                known_values = {}
+        transpiler = MongoSearchTranspiler(known_values)
+        query = transpiler.visit(full_tree)
+        if transpiler.unlisted_fields:
+            # Some terms were left to the regex (past the query's byte budget): in an $or with listed
+            # ones, MongoDB would scan the label index once per regex (3.3 s against 0.9 s for 400 terms
+            # over 50,000 functions). The regex alone walks the documents once.
+            query = MongoSearchTranspiler().visit(full_tree)
+        return list(self._getDb().functions.find(query, self._FUNCTION_SEARCH_PROJECTION, sort=sort_list, limit=max_num_results, max_time_ms=self._remainingMS(deadline)))
+
     def findFunctionByString(self, search_tree: NodeType, cursor: Optional[FullSearchCursor] = None, max_num_results: int = 100) -> Dict[int, "FunctionEntry"]:
         result_dict = {}
         with self._searchTimeLimit():
-            # TODO also search through function labels once we have implemented them
-            search_fields = ["function_name"]
-            query = self._get_search_query(search_fields, search_tree, cursor, distinct_fields={"function_name": "functions"})
+            # a plain term matches the name only: or-ing in the labels cost a sort by name its bounded
+            # index path. The labels are searched with the qualified field "function_labels.function_label".
+            full_tree = self._resolve_search_tree(["function_name"], search_tree, cursor)
             sort_list = self._get_sort_list_from_cursor(cursor)
-            for function_document in self._getDb().functions.find(query, {"_id": 0}, sort=sort_list, limit=max_num_results, max_time_ms=self._getSearchMaxTimeMS()):
+            search_fields = _conditionFields(self._resolve_search_tree(["function_name"], search_tree, None))
+            if search_fields == {"function_labels.function_label"} and _hasSubstringCondition(full_tree, "function_labels.function_label", ("?",)):
+                function_documents = self._findFunctionsByLabels(full_tree, sort_list, max_num_results)
+            else:
+                # any other search is the query it always was: a hint or a listing would cost a
+                # condition on another field the plan MongoDB picks for it
+                query = self._get_search_query(["function_name"], search_tree, cursor, distinct_fields={"function_name": "functions"})
+                function_documents = self._getDb().functions.find(
+                    query, self._FUNCTION_SEARCH_PROJECTION, sort=sort_list, limit=max_num_results, max_time_ms=self._getSearchMaxTimeMS()
+                )
+            for function_document in function_documents:
                 self._decodeFunction(function_document)
                 entry = FunctionEntry.fromDict(function_document)
                 result_dict[entry.function_id] = entry

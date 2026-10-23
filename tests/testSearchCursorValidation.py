@@ -18,6 +18,7 @@ from mcrit.config.StorageConfig import StorageConfig
 from mcrit.index.MinHashIndex import MinHashIndex
 from mcrit.index.SearchCursor import FullSearchCursor, MinimalSearchCursor
 from mcrit.server.StatusResource import StatusResource
+from mcrit.storage import MongoDbStorage as mongo_db_storage_module
 from mcrit.storage.MongoDbStorage import MongoDbStorage
 from mcrit.storage.StorageFactory import StorageFactory
 
@@ -245,6 +246,10 @@ class MongoSearchCursorTestSuite(MemorySearchCursorTestSuite):
         "samples": ("on_get_search_samples", "query=a"),
         # a substring term on the function name also runs the scan of the distinct names
         "functions": ("on_get_search_functions", "query=sub"),
+        # and one on the labels the distinct of the labels
+        "function_labels": ("on_get_search_functions", "query=function_labels.function_label:%3Fsub"),
+        # with a condition on another field it is the plain query: neither probed nor listed for
+        "function_labels_in_sample": ("on_get_search_functions", "query=sample_id:0%20function_labels.function_label:%3Fsub"),
     }
 
     def _route(self, route):
@@ -257,7 +262,7 @@ class MongoSearchCursorTestSuite(MemorySearchCursorTestSuite):
 
     def _calls_of_search(self, route, storage_config=None):
         storage = self.index.getStorage()
-        calls = {"find": [], "aggregate": []}
+        calls = {"find": [], "aggregate": [], "distinct": []}
         real = {name: getattr(pymongo.collection.Collection, name) for name in calls}
 
         def spy_on(name):
@@ -271,7 +276,11 @@ class MongoSearchCursorTestSuite(MemorySearchCursorTestSuite):
         if storage_config is not None:
             storage._storage_config = storage_config
         try:
-            with mock.patch.object(pymongo.collection.Collection, "find", spy_on("find")), mock.patch.object(pymongo.collection.Collection, "aggregate", spy_on("aggregate")):
+            with (
+                mock.patch.object(pymongo.collection.Collection, "find", spy_on("find")),
+                mock.patch.object(pymongo.collection.Collection, "aggregate", spy_on("aggregate")),
+                mock.patch.object(pymongo.collection.Collection, "distinct", spy_on("distinct")),
+            ):
                 status, _ = self._route(route)
         finally:
             storage._storage_config = saved
@@ -279,12 +288,14 @@ class MongoSearchCursorTestSuite(MemorySearchCursorTestSuite):
         return calls
 
     def testSearchQueriesCarryTheTimeLimit(self):
-        for route in self.ROUTES:
+        # a label search is probed first, see testLabelSearchCarriesTheTimeLimit
+        for route in [route for route in self.ROUTES if route != "function_labels"]:
             with self.subTest(route=route):
                 calls = self._calls_of_search(route)
                 self.assertEqual([30000], [kwargs["max_time_ms"] for kwargs in calls["find"]])
                 if route == "functions":
                     self.assertEqual([30000], [kwargs["maxTimeMS"] for kwargs in calls["aggregate"]])
+                    self.assertEqual([], calls["distinct"])
                 limited = StorageConfig(STORAGE_METHOD=StorageFactory.STORAGE_METHOD_MONGODB)
                 limited.STORAGE_MONGODB_SEARCH_MAX_TIME_MS = 1234
                 self.index.getStorage()._over_cap_since.clear()
@@ -292,12 +303,83 @@ class MongoSearchCursorTestSuite(MemorySearchCursorTestSuite):
                 self.assertEqual([1234], [kwargs["max_time_ms"] for kwargs in calls["find"]])
                 if route == "functions":
                     self.assertEqual([1234], [kwargs["maxTimeMS"] for kwargs in calls["aggregate"]])
+                    self.assertEqual([], calls["distinct"])
                 limited.STORAGE_MONGODB_SEARCH_MAX_TIME_MS = 0
                 self.index.getStorage()._over_cap_since.clear()
                 calls = self._calls_of_search(route, limited)
                 self.assertEqual([None], [kwargs["max_time_ms"] for kwargs in calls["find"]])
                 if route == "functions":
                     self.assertEqual([0], [kwargs["maxTimeMS"] for kwargs in calls["aggregate"]])
+                    self.assertEqual([], calls["distinct"])
+
+    def _calls_of_label_search(self, search_max_time_ms, probe_ms=None, listing_ms=0):
+        """The time limits a label search hands MongoDB, on a simulated clock: the probe answers, or
+        runs out after probe_ms, and the listing of the labels takes listing_ms."""
+        storage = self.index.getStorage()
+        storage._over_cap_since.clear()
+        clock = [1000.0]
+        calls = {"find": [], "distinct": []}
+        real_find, real_distinct = pymongo.collection.Collection.find, pymongo.collection.Collection.distinct
+
+        def find(collection, *args, **kwargs):
+            calls["find"].append(kwargs["max_time_ms"])
+            if "hint" in kwargs and probe_ms is not None:
+                clock[0] += probe_ms / 1000
+                raise pymongo.errors.ExecutionTimeout("operation exceeded time limit")
+            return real_find(collection, *args, **kwargs)
+
+        def distinct(collection, *args, **kwargs):
+            calls["distinct"].append(kwargs["maxTimeMS"])
+            if 0 < kwargs["maxTimeMS"] <= listing_ms:
+                # MongoDB stops it at its limit
+                clock[0] += kwargs["maxTimeMS"] / 1000
+                raise pymongo.errors.ExecutionTimeout("operation exceeded time limit")
+            clock[0] += listing_ms / 1000
+            return real_distinct(collection, *args, **kwargs)
+
+        limited = StorageConfig(STORAGE_METHOD=StorageFactory.STORAGE_METHOD_MONGODB)
+        limited.STORAGE_MONGODB_SEARCH_MAX_TIME_MS = search_max_time_ms
+        saved = storage._storage_config
+        storage._storage_config = limited
+        try:
+            with (
+                mock.patch.object(pymongo.collection.Collection, "find", find),
+                mock.patch.object(pymongo.collection.Collection, "distinct", distinct),
+                mock.patch.object(mongo_db_storage_module, "time", types.SimpleNamespace(monotonic=lambda: clock[0])),
+            ):
+                status, payload = self._route("function_labels")
+        finally:
+            storage._storage_config = saved
+        return status, calls, payload
+
+    def testLabelSearchCarriesTheTimeLimit(self):
+        probe = MongoDbStorage._LABEL_PROBE_TIME_MS
+        # the probe answers within its own short limit, and nothing is listed
+        status, calls, probed = self._calls_of_label_search(30000)
+        self.assertEqual(falcon.HTTP_200, status)
+        self.assertEqual({"find": [probe], "distinct": []}, calls)
+        # a probe that runs out is not the search running out: the labels are listed with half of what
+        # the probe left of the limit, and the query that follows gets what the listing left
+        status, calls, listed = self._calls_of_label_search(30000, probe_ms=probe + 3, listing_ms=200)
+        self.assertEqual(falcon.HTTP_200, status)
+        self.assertEqual(probe, calls["find"][0])
+        self.assertAlmostEqual((30000 - probe - 3) / 2, calls["distinct"][0], delta=1)
+        self.assertAlmostEqual(30000 - probe - 3 - 200, calls["find"][1], delta=1)
+        self.assertEqual(probed["data"]["search_results"], listed["data"]["search_results"])
+        # no limit stays no limit
+        status, calls, _ = self._calls_of_label_search(0, probe_ms=probe + 3)
+        self.assertEqual({"find": [probe, None], "distinct": [0]}, calls)
+        # a search limit no longer than the probe's leaves no room for one
+        status, calls, _ = self._calls_of_label_search(probe)
+        self.assertEqual({"find": [probe], "distinct": [probe // 2]}, calls)
+        # a listing too slow for its half leaves the other half to the regex, which answers the search
+        status, calls, too_slow = self._calls_of_label_search(1000, probe_ms=probe + 3, listing_ms=1000)
+        self.assertEqual(falcon.HTTP_200, status)
+        half = (1000 - probe - 3) // 2
+        self.assertEqual({"find": [probe, 1000 - probe - 3 - half], "distinct": [half]}, calls)
+        self.assertEqual(probed["data"]["search_results"], too_slow["data"]["search_results"])
+        # and is remembered (on the simulated clock, which the check cannot read any more)
+        self.assertIn(("functions", "function_labels.function_label"), self.index.getStorage()._over_cap_since)
 
     def testConfigWithoutTheSettingGetsTheDefault(self):
         # docker-mcrit replaces the config modules with older copies that do not name the setting
@@ -317,6 +399,17 @@ class MongoSearchCursorTestSuite(MemorySearchCursorTestSuite):
                 self.assertEqual("failed", payload["status"])
                 self.assertIn("took too long", payload["data"]["message"])
 
+    def testSearchTooLargeForMongoDBIsAnsweredAsBadInput(self):
+        def too_large(*args, **kwargs):
+            raise pymongo.errors.DocumentTooLarge("BSON document too large")
+
+        for route in self.ROUTES:
+            with self.subTest(route=route):
+                with mock.patch.object(pymongo.collection.Collection, "find", too_large):
+                    status, payload = self._route(route)
+                self.assertEqual(falcon.HTTP_400, status)
+                self.assertIn("too large", payload["data"]["message"])
+
     def testDistinctNameScanThatRunsOutOfTimeFallsBackAndIsNotRepeated(self):
         real_aggregate = pymongo.collection.Collection.aggregate
         attempts = []
@@ -331,6 +424,21 @@ class MongoSearchCursorTestSuite(MemorySearchCursorTestSuite):
         with mock.patch.object(pymongo.collection.Collection, "aggregate", time_out_on_scan):
             for _ in range(3):
                 status, _ = self._route("functions")
+                self.assertEqual(falcon.HTTP_200, status)
+        self.assertEqual(1, len(attempts))
+
+    def testDistinctLabelScanThatRunsOutOfTimeFallsBackAndIsNotRepeated(self):
+        attempts = []
+
+        def time_out(collection, *args, **kwargs):
+            attempts.append(1)
+            raise pymongo.errors.ExecutionTimeout("operation exceeded time limit")
+
+        self.index.getStorage()._over_cap_since.clear()
+        # without a probe before it, the listing has the search's whole limit: running out of that is a verdict
+        with mock.patch.object(pymongo.collection.Collection, "distinct", time_out), mock.patch.object(self.index.getStorage(), "_canProbe", return_value=False):
+            for _ in range(3):
+                status, _ = self._route("function_labels")
                 self.assertEqual(falcon.HTTP_200, status)
         self.assertEqual(1, len(attempts))
 

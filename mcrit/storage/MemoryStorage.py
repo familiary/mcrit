@@ -2,6 +2,7 @@ import base64
 import datetime
 import functools
 import hashlib
+import heapq
 import io
 import logging
 import operator
@@ -47,12 +48,29 @@ def _get_field_once(object, field):
         pass
 
 
+# the fields of a label that MongoDB stores (FunctionLabelEntry.toDict)
+_STORED_LABEL_FIELDS = ("function_label", "username", "timestamp")
+
+
 def _get_field(object, field):
     dot_index = field.find(".")
     if dot_index >= 0:
         first_field = field[:dot_index]
         remaining_fields = field[dot_index + 1 :]
-        return _get_field(_get_field_once(object, first_field), remaining_fields)
+        inner = _get_field_once(object, first_field)
+        if isinstance(inner, list):
+            # a path into a list reaches into each of its elements, as in MongoDB:
+            # "function_labels.function_label" is the list of label strings
+            values = []
+            for element in inner:
+                if isinstance(element, FunctionLabelEntry) and remaining_fields not in _STORED_LABEL_FIELDS:
+                    # a label carries its function_id here, never in MongoDB's label documents
+                    values.append(None)
+                    continue
+                value = _get_field(element, remaining_fields)
+                values.extend(value if isinstance(value, list) else [value])
+            return values
+        return _get_field(inner, remaining_fields)
     else:
         return _get_field_once(object, field)
 
@@ -99,6 +117,7 @@ class MemorySearchTranspiler(BaseVisitor):
         # and deliberately have no entry here.
         value = node.value
         if node.operator.endswith("?"):
+            # Python's case folding, which differs from MongoDB's (PCRE's) for a few non-ASCII letters
             regex = re.compile(re.escape(node.value), re.IGNORECASE)
             inverse = node.operator == "!?"
 
@@ -124,8 +143,7 @@ class MemorySearchTranspiler(BaseVisitor):
         chosen_operator = string_to_operator[node.operator]
         is_ordering = node.operator in ("<", "<=", ">", ">=")
 
-        def compare(entry):
-            entry_value = _get_field(entry, node.field)
+        def compare_value(entry_value):
             if isinstance(entry_value, datetime.datetime):
                 # compared as stored in MongoDB: as text, which orders like the datetime
                 entry_value = entry_value.strftime(TIMESTAMP_FORMAT)
@@ -133,6 +151,15 @@ class MemorySearchTranspiler(BaseVisitor):
                 # nothing orders against a missing value, as in MongoDB
                 return False
             return chosen_operator(entry_value, compared)
+
+        def compare(entry):
+            entry_value = _get_field(entry, node.field)
+            if isinstance(entry_value, list):
+                # MongoDB matches a list when one of its elements does, and "!=" when none is equal
+                if node.operator == "!=":
+                    return all(compare_value(element) for element in entry_value)
+                return any(compare_value(element) for element in entry_value)
+            return compare_value(entry_value)
 
         return compare
 
@@ -1343,13 +1370,14 @@ class MemoryStorage(StorageInterface):
 
     def findFunctionByString(self, search_tree: NodeType, cursor: Optional[FullSearchCursor] = None, max_num_results: int = 100) -> Dict[int, "FunctionEntry"]:
         result_dict = {}
-        # TODO also search through function labels once we have implemented them
+        # a plain term matches the name only; the labels are searched with the qualified field
+        # "function_labels.function_label", which resolves to the list of label strings
         search_fields = ["function_name"]
         filter = self._get_search_filter(search_fields, search_tree, cursor)
         sort_key = self._get_sort_key_from_cursor(cursor)
-        for entry in sorted(self._functions.values(), key=sort_key):
-            if filter(entry):
-                result_dict[entry.function_id] = entry
-            if len(result_dict) >= max_num_results:
-                break
+        # filtered before sorted: one pass over the functions per page (the cursor is part of the
+        # filter), and only the page's worth of matches is ordered instead of every function
+        matches = (entry for entry in self._functions.values() if filter(entry))
+        for entry in heapq.nsmallest(max_num_results, matches, key=sort_key):
+            result_dict[entry.function_id] = entry
         return result_dict

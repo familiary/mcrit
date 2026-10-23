@@ -15,6 +15,45 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Changed
+
+- **Function labels are searched with the qualified field, now from an index and on both storages
+  (#302).** `function_labels.function_label:?term` finds a function by any of its labels,
+  `function_labels.function_label:term` by an exact one and `function_labels.username:name` by who
+  gave it; a plain term keeps matching `function_name` only, with the query it had (see below for
+  very large searches). On MongoDB the label field had worked by walking every function document; it
+  now uses a new sparse `function_labels.function_label` index. The memory storage found nothing for
+  such a path; it now resolves it into the list of labels and compares element-wise as MongoDB does
+  (`?` / `=` when one label matches, `!?` / `!=` when none does). It matches with Python's regex,
+  whose case folding differs from MongoDB's for a few non-ASCII letters (the dotted capital I).
+
+  A search of nothing but label conditions, with a `?` among them, is first tried as the regex it
+  was, walking the index of the sort order for a fixed 50 ms: a term that many labels match fills
+  its page that way as fast as before (6 -> 5 ms over 250,000 functions; 34 -> 28 ms with 48,600
+  distinct labels). Only a probe that runs out lists the distinct labels (a `distinct` over the
+  index, 30-160 ms) and hands the ones that may match over as an `$in`, paired with the regex so
+  that the page is exactly what the regex finds. Probe, listing and query share the search time
+  limit, the listing at most half of what the probe left, so the search never takes longer than the
+  limit; a listing too slow for its half leaves the search to the regex, for an hour. An exact label
+  went 260-480 ms -> 1 ms, a rare substring 260-480 ms -> 80-220 ms. The labels are listed once per
+  search, past 16 MiB of them the search is the regex, and a negated label term (`!?`, `NOT`) always
+  is. A label condition next to a condition on another field is the query it always was: neither
+  probed nor listed for.
+
+  The `$in` / `$nin` lists of one query, names and labels alike, now share 1 MiB and 500,000 tests
+  of a term against a listed value, and a repeated term is transpiled once; a term past that budget
+  is the regex. For the names this bounds very large searches (the 51st `?` term of an OR over
+  10,000 names becomes a regex), which before could build a query MongoDB refuses: such a search
+  is now answered as the regex or with a 400, not a 500. The names keep the case folding of their
+  `$in` from #170 (Python's).
+
+  Also: the memory storage filters a function search before it sorts and keeps only a page of
+  matches (1.9-2.3 s -> 0.1-0.3 s for a search sorted by name over 250,000 functions), and MongoDB
+  search results no longer load an inline `_xcfg` (a corpus `migrate_xcfg_split` has not run on), so
+  they carry no disassembly, as on a migrated corpus. NOTE that the first start after upgrading
+  builds the new index, reading every function document (0.3 s for 250,000 here, 0.7 s with inline
+  disassembly; expect proportionally longer on a large corpus).
+
 ### Fixed
 
 - **Memory storage: substring search (`?`, `!?`) disagreed with MongoDB on values that are not

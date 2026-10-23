@@ -2,11 +2,15 @@ import hashlib
 import json
 import logging
 import os
+import re
+import time
+import types
 from unittest import TestCase, main
 from unittest.mock import patch
 
 import pytest
 from bson import encode as bson_encode
+from pymongo.errors import ExecutionTimeout, OperationFailure
 from smda.common.SmdaReport import SmdaReport
 
 from mcrit.config.McritConfig import McritConfig
@@ -18,8 +22,9 @@ from mcrit.index.MinHashIndex import MinHashIndex
 from mcrit.index.SearchCursor import FullSearchCursor
 from mcrit.index.SearchQueryParser import SearchQueryParser
 from mcrit.minhash.MinHash import MinHash
+from mcrit.storage import MongoDbStorage as mongo_db_storage_module
 from mcrit.storage.FunctionEntry import FunctionEntry
-from mcrit.storage.MongoDbStorage import MongoDbStorage
+from mcrit.storage.MongoDbStorage import MongoDbStorage, MongoSearchTranspiler
 from mcrit.storage.SampleEntry import TIMESTAMP_FORMAT, SampleEntry
 from mcrit.storage.StorageFactory import StorageFactory
 
@@ -1061,6 +1066,118 @@ class MemoryStorageTest(TestCase):
         self.assertEqual([sample_entry.family_id], list(self.storage.findFamilyByString(SearchQueryParser().parse("actors:?apt-z"), cursor=family_cursor)))
         self.assertNotIn(sample_entry.family_id, self.storage.findFamilyByString(SearchQueryParser().parse("actors:!?apt-z"), cursor=family_cursor))
 
+    # --- function labels, searched with the qualified field ----
+
+    LABEL = "function_labels.function_label"
+
+    def _storageWithLabelledFunctions(self):
+        self.storage.clearStorage()
+        with open(self.example_file_path) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        self.storage.addSmdaReport(report)
+        function_ids = sorted(entry.function_id for entry in self.storage.getFunctionsBySampleId(0) or [])
+        # renamed after being labelled: the term is left in a label only
+        self.storage.modifyFunction(function_ids[0], {"function_name": "qz_label_only"}, username="alice")
+        self.storage.modifyFunction(function_ids[0], {"function_name": "plain_renamed"}, username="bob")
+        # in the name and in the label it was given with it
+        self.storage.modifyFunction(function_ids[1], {"function_name": "qz_both"}, username="alice")
+        return function_ids
+
+    def _searchFunctionIds(self, term, sort_by="function_id", max_num_results=1000):
+        sort_list = [(sort_by, True), ("function_id", True)] if sort_by != "function_id" else [("function_id", True)]
+        cursor = FullSearchCursor(None, sort_list)
+        return list(self.storage.findFunctionByString(SearchQueryParser().parse(term), cursor=cursor, max_num_results=max_num_results))
+
+    def testPlainFunctionSearchMatchesTheNameOnly(self):
+        # a plain term keeps searching the name alone, and NOT term keeps negating just that
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        all_ids = self._searchFunctionIds("function_id:>=0")
+        self.assertEqual([], self._searchFunctionIds("qz_label_only"))
+        self.assertEqual([labelled], self._searchFunctionIds("plain_renamed"))
+        self.assertEqual([named], self._searchFunctionIds("qz_"))
+        self.assertEqual([i for i in all_ids if i != named], self._searchFunctionIds("NOT qz_"))
+        self.assertEqual(all_ids, self._searchFunctionIds("NOT qz_label_only"))
+
+    def _labelSearchPaths(self, term):
+        """What each way of answering a label search finds: in memory there is one."""
+        return [self._searchFunctionIds(term)]
+
+    def testNegatedAndPlainLabelTermsTogether(self):
+        function_ids = self._storageWithLabelledFunctions()
+        self.storage.modifyFunction(function_ids[2], {"function_name": "abc_X"}, username="alice")
+        self.storage.modifyFunction(function_ids[3], {"function_name": "abc_plain"}, username="alice")
+        field = "function_labels.function_label"
+        for term, expected in (
+            (f"{field}:?abc {field}:!?x", [function_ids[3]]),
+            (f"{field}:?ABC NOT {field}:?plain", [function_ids[2]]),
+            (f"{field}:?abc {field}:!?zz", function_ids[2:4]),
+        ):
+            for found in self._labelSearchPaths(term):
+                with self.subTest(term=term):
+                    self.assertEqual(expected, found)
+
+    def testLabelsAreSearchedByTheFieldsMongoDBStores(self):
+        # a label carries its function_id in memory (one read through FunctionEntry.fromDict, as an
+        # import gives them), but MongoDB stores none in a label document
+        function_ids = self._storageWithLabelledFunctions()
+        in_memory = getattr(self.storage, "_functions", {}).get(function_ids[0])
+        for label in in_memory.function_labels if in_memory is not None else []:
+            label.setFunctionId(function_ids[0])
+        self.assertEqual([], self._searchFunctionIds(f"function_labels.function_id:{function_ids[0]}"))
+        self.assertEqual([function_ids[0]], self._searchFunctionIds("function_labels.username:bob"))
+
+    def testQualifiedFunctionLabelSearch(self):
+        # the labels are addressed by their stored path, as every other field is
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        all_ids = self._searchFunctionIds("function_id:>=0")
+        label = self.LABEL
+        # found by a label its name no longer holds, case-insensitively; a function matched by
+        # two of its labels is listed once
+        self.assertEqual([labelled], self._searchFunctionIds(f"{label}:?LABEL_ONLY"))
+        self.assertEqual([labelled, named], self._searchFunctionIds(f"{label}:?qz_"))
+        self.assertEqual([named], self._searchFunctionIds(f"{label}:?qz_ function_name:?qz_"))
+        self.assertEqual([labelled, named], self._searchFunctionIds(f"{label}:?qz_label OR plain_renamed OR qz_both"))
+        self.assertEqual([], self._searchFunctionIds(f"{label}:?zzzzq"))
+        self.assertEqual([], self._searchFunctionIds(f"sample_id:1 {label}:?qz_"))
+        # "!?" holds where no label holds the term - MongoDB's $not on a list - and so for a
+        # function without labels; NOT negates the same way
+        self.assertEqual([i for i in all_ids if i not in (labelled, named)], self._searchFunctionIds(f"{label}:!?qz_"))
+        self.assertEqual([i for i in all_ids if i != labelled], self._searchFunctionIds(f"NOT {label}:?qz_label"))
+        self.assertEqual(all_ids, self._searchFunctionIds(f"{label}:!?zzzzq"))
+        # equality and "!=" hold for a list when one element is equal, and when none is
+        self.assertEqual([labelled], self._searchFunctionIds(f"{label}:qz_label_only"))
+        self.assertEqual([], self._searchFunctionIds(f"{label}:qz_label"))
+        self.assertEqual([i for i in all_ids if i != labelled], self._searchFunctionIds(f"{label}:!=qz_label_only"))
+        # and any other field of the labels
+        self.assertEqual([labelled, named], self._searchFunctionIds("function_labels.username:alice"))
+        self.assertEqual([labelled], self._searchFunctionIds("function_labels.username:?BO"))
+
+    def testQualifiedLabelSearchPagesAndSorts(self):
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        term = f"{self.LABEL}:?qz_"
+        # a page of one: the cursor of the first page leads to the second
+        index = MinHashIndex.__new__(MinHashIndex)
+        setattr(index, "getStorage", lambda: self.storage)
+        index.search_query_parser = SearchQueryParser()
+        first = index.getFunctionSearchResults(term, limit=1)
+        self.assertEqual([labelled], [int(key) for key in first["search_results"]])
+        second = index.getFunctionSearchResults(term, cursor=first["cursor"]["forward"], limit=1)
+        self.assertEqual([named], [int(key) for key in second["search_results"]])
+        self.assertIsNone(second["cursor"]["forward"])
+        back = index.getFunctionSearchResults(term, cursor=second["cursor"]["backward"], limit=1)
+        self.assertEqual([labelled], [int(key) for key in back["search_results"]])
+        # sorted by name: "plain_renamed" before "qz_both", and the other way round descending
+        self.assertEqual([labelled, named], self._searchFunctionIds(term, sort_by="function_name"))
+        by_name_descending = index.getFunctionSearchResults(term, sort_by="function_name", is_ascending=False)
+        self.assertEqual([named, labelled], [int(key) for key in by_name_descending["search_results"]])
+        by_name_first = index.getFunctionSearchResults(term, sort_by="function_name", is_ascending=False, limit=1)
+        by_name_second = index.getFunctionSearchResults(term, sort_by="function_name", is_ascending=False, cursor=by_name_first["cursor"]["forward"], limit=1)
+        self.assertEqual([named, labelled], [int(key) for page in (by_name_first, by_name_second) for key in page["search_results"]])
+
 
 @pytest.mark.mongo
 class MongoDbStorageTest(MemoryStorageTest):
@@ -1524,7 +1641,322 @@ class MongoDbStorageTest(MemoryStorageTest):
             self.assertEqual(0, listing.call_count)
             self.storage.findFunctionByString(SearchQueryParser().parse("function_name:qz_alpha"))
             self.assertEqual(0, listing.call_count)
+            self.storage.findFunctionByString(SearchQueryParser().parse("function_labels.function_label:qz_alpha"))
+            self.assertEqual(0, listing.call_count)
+            # a negated label condition is answered by the regex: a $nin examines every document as well
+            self.storage.findFunctionByString(SearchQueryParser().parse("function_labels.function_label:!?qz_alph"))
+            self.storage.findFunctionByString(SearchQueryParser().parse("NOT function_labels.function_label:?qz_alph"))
+            self.assertEqual(0, listing.call_count)
+            # a plain term lists the names alone, as before the labels could be searched
             self.storage.findFunctionByString(SearchQueryParser().parse("qz_alph"))
+            self.assertEqual([("functions", "function_name")], [call.args[:2] for call in listing.call_args_list])
+            # a label term is listed for only when the probe of the sort order finds no page
+            cursor = FullSearchCursor(None, [("function_id", True)])
+            with patch.object(self.storage, "_probeFunctionSearch", return_value=[]) as probing:
+                self.storage.findFunctionByString(SearchQueryParser().parse("function_labels.function_label:?qz_alph"), cursor=cursor)
+                self.assertEqual(1, probing.call_count)
+                self.assertEqual(1, listing.call_count)
+                # with a condition on another field the search is the query it always was: no probe, no listing
+                self.storage.findFunctionByString(SearchQueryParser().parse("sample_id:0 function_labels.function_label:?qz_alph"), cursor=cursor)
+                self.storage.findFunctionByString(SearchQueryParser().parse("qz_alph function_labels.function_label:?qz_alph"), cursor=cursor)
+                self.assertEqual(1, probing.call_count)
+                self.assertEqual([("functions", "function_name")] * 2, [call.args[:2] for call in listing.call_args_list])
+            with patch.object(self.storage, "_probeFunctionSearch", return_value=None):
+                self.storage.findFunctionByString(SearchQueryParser().parse("function_labels.function_label:?qz_alph"), cursor=cursor)
+            self.assertEqual(("functions", "function_labels.function_label"), listing.call_args_list[-1].args[:2])
+            self.assertEqual(3, listing.call_count)
+
+    def _labelQuery(self, term):
+        field = "function_labels.function_label"
+        return self.storage._get_search_query(["function_name"], SearchQueryParser().parse(term), None, distinct_fields={"function_name": "functions", field: "functions"})
+
+    def testPlainTermQueryIsTheNameQueryAlone(self):
+        self._storageWithLabelledFunctions()
+        with (
+            patch.object(self.storage, "_resolve_search_tree", wraps=self.storage._resolve_search_tree) as resolving,
+            patch.object(self.storage, "_list_known_values", wraps=self.storage._list_known_values) as listing,
+            patch.object(self.storage, "_probeFunctionSearch", wraps=self.storage._probeFunctionSearch) as probing,
+        ):
+            self.storage.findFunctionByString(SearchQueryParser().parse("qz_"), cursor=FullSearchCursor(None, [("function_id", True)]))
+        self.assertEqual([["function_name"]], list({tuple(call.args[0]): call.args[0] for call in resolving.call_args_list}.values()))
+        self.assertEqual([{"function_name": "functions"}], [call.args[1] for call in listing.call_args_list])
+        self.assertEqual(0, probing.call_count)
+        self.assertEqual({"function_name": {"$in": ["qz_both"]}}, self._labelQuery("qz_"))
+
+    def testLabelSearchIsAnsweredFromTheIndex(self):
+        function_ids = self._storageWithLabelledFunctions()
+        functions = self.storage._getDb().functions
+        label_index = [info for info in functions.index_information().values() if info["key"] == [("function_labels.function_label", 1)]]
+        self.assertEqual(1, len(label_index))
+        self.assertTrue(label_index[0].get("sparse"))
+        substring = self._labelQuery("function_labels.function_label:?qz_")
+        self.assertEqual(["function_labels.function_label"], list(substring))
+        self.assertEqual(["qz_both", "qz_label_only"], sorted(substring["function_labels.function_label"]["$in"]))
+        self.assertEqual("qz_", substring["function_labels.function_label"]["$regex"].pattern)
+        exact = self._labelQuery("function_labels.function_label:qz_both")
+        self.assertEqual({"function_labels.function_label": "qz_both"}, exact)
+        for query in (substring, exact):
+            for sort_list in ([("function_id", 1)], [("function_name", -1), ("function_id", -1)]):
+                plan = str(functions.find(query, sort=sort_list, limit=101).explain()["queryPlanner"]["winningPlan"])
+                self.assertNotIn("COLLSCAN", plan)
+                self.assertIn("function_labels.function_label_1", plan)
+        self.assertEqual(function_ids[:2], self._searchFunctionIds("function_labels.function_label:?qz_"))
+
+    def testLabelProbeAndListingAnswerTheSamePages(self):
+        # a "?" on the labels is answered by the probe (the regex) or, when that runs out of time, through
+        # the listed labels; either way the pages are the same, in the same order
+        self._storageWithLabelledFunctions()
+        index = MinHashIndex.__new__(MinHashIndex)
+        setattr(index, "getStorage", lambda: self.storage)
+        index.search_query_parser = SearchQueryParser()
+
+        def pages(term, sort_by, is_ascending):
+            answered, cursor = [], None
+            while True:
+                page = index.getFunctionSearchResults(term, sort_by=sort_by, is_ascending=is_ascending, cursor=cursor, limit=1)
+                answered.append(list(page["search_results"]))
+                cursor = page["cursor"]["forward"]
+                if cursor is None:
+                    return answered
+
+        for term in (
+            "function_labels.function_label:?qz_",
+            "function_labels.function_label:?LABEL_ON",
+            "function_labels.function_label:?qz_b OR function_labels.function_label:plain_renamed",
+        ):
+            for sort_by, is_ascending in (("function_id", True), ("function_id", False), ("function_name", False), ("offset", True)):
+                with self.subTest(term=term, sort_by=sort_by, is_ascending=is_ascending):
+                    with patch.object(self.storage, "_list_known_values", wraps=self.storage._list_known_values) as listing:
+                        probed = pages(term, sort_by, is_ascending)
+                        self.assertNotIn({"function_labels.function_label": "functions"}, [call.args[1] for call in listing.call_args_list])
+                    with patch.object(self.storage, "_probeFunctionSearch", return_value=None):
+                        listed = pages(term, sort_by, is_ascending)
+                    self.assertTrue(probed[0])
+                    self.assertEqual(probed, listed)
+
+    def _labelSearchPaths(self, term):
+        # the regex alone, as the probe asks it, and the search through the listed labels
+        with patch.object(self.storage, "_list_known_values", return_value={}):
+            as_regex = self._searchFunctionIds(term)
+        with patch.object(self.storage, "_probeFunctionSearch", return_value=None):
+            listed = self._searchFunctionIds(term)
+        return [as_regex, listed]
+
+    def testNegatedLabelTermKeepsMongoDBsCaseFolding(self):
+        # Python's re finds "i" in "abc_İ", MongoDB's regex does not: a negated label term stays the
+        # regex, so the listing excludes what the probe excludes
+        function_ids = self._storageWithLabelledFunctions()
+        self.storage.modifyFunction(function_ids[2], {"function_name": "abc_İ"}, username="alice")
+        self.storage.modifyFunction(function_ids[3], {"function_name": "abc_plain"}, username="alice")
+        field = "function_labels.function_label"
+        functions = self.storage._getDb().functions
+        in_mongodb = sorted(
+            document["function_id"] for document in functions.find({"$and": [{field: re.compile("abc", re.IGNORECASE)}, {field: {"$not": re.compile("i", re.IGNORECASE)}}]})
+        )
+        self.assertEqual([function_ids[2]], in_mongodb)
+        for term in (f"{field}:?abc {field}:!?i", f"{field}:?abc NOT {field}:?i"):
+            for found in self._labelSearchPaths(term):
+                with self.subTest(term=term):
+                    self.assertEqual(in_mongodb, found)
+
+    def testTooManyTermsForTheLabelsSkipTheListing(self):
+        # testing every term against every label would cost more than the regex: the search is the
+        # regex, and the next one does not list the labels again just to find that out
+        function_ids = self._storageWithLabelledFunctions()
+        field = "function_labels.function_label"
+        functions = self.storage._getDb().functions
+        labels = functions.distinct(field)
+        two_terms = f"{field}:?qz_ OR {field}:?renamed"
+        for fillers, term, listings in ((300_000, two_terms, 1), (500_001, f"{field}:?qz_", 1), (300_000, f"{field}:?qz_", 2)):
+            with self.subTest(fillers=fillers, term=term):
+                self.storage._distinct_count_since.clear()
+                many = labels + ["filler_%06d" % i for i in range(fillers)]
+                with (
+                    patch.object(type(functions), "distinct", autospec=True, return_value=many) as listing,
+                    patch.object(self.storage, "_probeFunctionSearch", return_value=None),
+                ):
+                    for _ in range(2):
+                        self.assertEqual(function_ids[:2], self._searchFunctionIds(term))
+                self.assertEqual(listings, listing.call_count)
+        self.storage._distinct_count_since.clear()
+
+    def testAListingTooSlowForTheLimitLeavesTheQueryHalfOfIt(self):
+        # On a simulated clock: a 300 ms limit, a probe that runs out after its 50 ms and a distinct
+        # that takes as long as MongoDB lets it. The listing gets half of the 250 ms left, the regex
+        # the other half, and the next search does not list the labels again.
+        function_ids = self._storageWithLabelledFunctions()
+        field = "function_labels.function_label"
+        functions = self.storage._getDb().functions
+        self.storage._over_cap_since.clear()
+        clock = [1000.0]
+
+        def probe_runs_out(*args, **kwargs):
+            clock[0] += MongoDbStorage._LABEL_PROBE_TIME_MS / 1000
+            return None
+
+        def waits_out_its_limit(collection, *args, **kwargs):
+            clock[0] += kwargs["maxTimeMS"] / 1000
+            raise ExecutionTimeout("operation exceeded time limit")
+
+        real_find = type(functions).find
+        query_ms = []
+
+        def find(collection, *args, **kwargs):
+            query_ms.append(kwargs["max_time_ms"])
+            return real_find(collection, *args, **kwargs)
+
+        with (
+            patch.object(self.storage._storage_config, "STORAGE_MONGODB_SEARCH_MAX_TIME_MS", 300),
+            patch.object(mongo_db_storage_module, "time", types.SimpleNamespace(monotonic=lambda: clock[0])),
+            patch.object(self.storage, "_probeFunctionSearch", side_effect=probe_runs_out),
+            patch.object(type(functions), "distinct", autospec=True, side_effect=waits_out_its_limit) as listing,
+            patch.object(type(functions), "find", autospec=True, side_effect=find),
+        ):
+            self.assertEqual(function_ids[:2], self._searchFunctionIds(f"{field}:?qz_"))
+            self.assertEqual([125], [call.kwargs["maxTimeMS"] for call in listing.call_args_list])
+            self.assertEqual([125], query_ms)
+            self.assertEqual(function_ids[:2], self._searchFunctionIds(f"{field}:?qz_"))
+            self.assertEqual(1, listing.call_count)
+        self.storage._over_cap_since.clear()
+
+    def testLabelProbeHasAFixedLimit(self):
+        self._storageWithLabelledFunctions()
+        functions = self.storage._getDb().functions
+        query = self._labelQuery("function_labels.function_label:?qz_")
+        sort_list = [("function_id", 1)]
+        self.storage._over_cap_since.clear()
+        with patch.object(type(functions), "find", autospec=True, side_effect=type(functions).find) as finding:
+            self.assertIsNotNone(self.storage._probeFunctionSearch(query, sort_list, 10, 30000))
+            self.assertEqual(MongoDbStorage._LABEL_PROBE_TIME_MS, finding.call_args.kwargs["max_time_ms"])
+            self.assertEqual([("function_id", 1)], finding.call_args.kwargs["hint"])
+            # no room under the search's own limit
+            self.assertIsNone(self.storage._probeFunctionSearch(query, sort_list, 10, MongoDbStorage._LABEL_PROBE_TIME_MS))
+            # over the cap the search is the regex anyway: nothing to probe for
+            self.storage._over_cap_since[("functions", "function_labels.function_label")] = time.monotonic()
+            self.assertIsNone(self.storage._probeFunctionSearch(query, sort_list, 10, 30000))
+            self.assertEqual(1, finding.call_count)
+        self.storage._over_cap_since.clear()
+
+    def testLabelsAreListedOncePerSearch(self):
+        function_ids = self._storageWithLabelledFunctions()
+        functions = self.storage._getDb().functions
+        term = " OR ".join(["function_labels.function_label:?qz_", "function_labels.function_label:?renamed", "function_labels.function_label:?qz_"])
+        with (
+            patch.object(type(functions), "distinct", autospec=True, side_effect=type(functions).distinct) as listing,
+            patch.object(self.storage, "_probeFunctionSearch", return_value=None),
+        ):
+            self.assertEqual(function_ids[:2], self._searchFunctionIds(term))
+        self.assertEqual(1, listing.call_count)
+
+    def testTheValueListsOfOneQueryShareItsByteBudget(self):
+        # hundreds of terms that each fit an $in would add up past MongoDB's 16 MiB: what one query
+        # lists stays within _DISTINCT_VALUES_MAX_BYTES, and a repeated condition is transpiled once
+        function_ids = self._storageWithLabelledFunctions()
+        field = "function_labels.function_label"
+        original_cap = MongoDbStorage._DISTINCT_VALUES_MAX_BYTES
+        try:
+            # "qz_both" and "qz_label_only" fill it
+            MongoDbStorage._DISTINCT_VALUES_MAX_BYTES = 20
+            term = " OR ".join([f"{field}:?qz_", f"{field}:?qz_", f"{field}:?both"])
+            query = self._labelQuery(term)
+            self.assertEqual(2, len(query["$or"]))
+            self.assertEqual(["qz_both", "qz_label_only"], sorted(query["$or"][0][field]["$in"]))
+            self.assertTrue(hasattr(query["$or"][1][field], "search"))
+            # a search does not mix them: an $or of listed and unlisted terms would scan the label
+            # index once per regex, so it is the regex throughout
+            functions = self.storage._getDb().functions
+            with (
+                patch.object(type(functions), "find", autospec=True, side_effect=type(functions).find) as finding,
+                patch.object(self.storage, "_probeFunctionSearch", return_value=None),
+            ):
+                self.assertEqual(function_ids[:2], self._searchFunctionIds(term))
+            self.assertNotIn("$in", str(finding.call_args.args[1]))
+            # the names as well
+            MongoDbStorage._DISTINCT_VALUES_MAX_BYTES = len("qz_both")
+            tree = self.storage._resolve_search_tree(["function_name"], SearchQueryParser().parse("qz_b OR qz_bo"), None)
+            names = MongoSearchTranspiler({"function_name": ["qz_both", "other"]}).visit(tree)
+            self.assertEqual(["qz_both"], names["$or"][0]["function_name"]["$in"])
+            self.assertTrue(hasattr(names["$or"][1]["function_name"], "search"))
+        finally:
+            MongoDbStorage._DISTINCT_VALUES_MAX_BYTES = original_cap
+
+    def testLabelListingKeepsMongoDBsCaseFolding(self):
+        # Python's re folds the dotted capital I to "i", MongoDB's regex does not; the listed labels
+        # are a superset the $regex beside them narrows to exactly what the probe finds
+        function_ids = self._storageWithLabelledFunctions()
+        for function_id, label in zip(function_ids[2:], ["İstanbul", "Kelvin", "ıtem", "straße"]):
+            self.storage.modifyFunction(function_id, {"function_name": label}, username="alice")
+        functions = self.storage._getDb().functions
+        field = "function_labels.function_label"
+        for term in ("i", "I", "İ", "ı", "k", "K", "ss", "ß", "stanbul"):
+            with self.subTest(term=term):
+                in_mongodb = sorted(document["function_id"] for document in functions.find({field: re.compile(re.escape(term), re.IGNORECASE)}))
+                self.assertEqual(in_mongodb, self._searchFunctionIds(f"{field}:?{term}"))
+                with patch.object(self.storage, "_probeFunctionSearch", return_value=None):
+                    self.assertEqual(in_mongodb, self._searchFunctionIds(f"{field}:?{term}"))
+        query = self._labelQuery(f"{field}:?i")
+        self.assertIn("İstanbul", query[field]["$in"])
+        plan = str(functions.find(query, sort=[("function_id", 1)], limit=101).explain()["queryPlanner"]["winningPlan"])
+        self.assertIn("IXSCAN", plan)
+        self.assertIn("function_labels.function_label_1", plan)
+
+    def testFunctionSearchLeavesAnInlineXcfgOnTheServer(self):
+        # a corpus migrate_xcfg_split has not run on still carries the disassembly in the function
+        # document; a search answers as on a migrated one, without it
+        function_ids = self._storageWithLabelledFunctions()
+        functions = self.storage._getDb().functions
+        functions.update_one({"function_id": function_ids[0]}, {"$set": {"_xcfg": json.dumps({"blocks": {"0": [[0, 1, "nop", ""]] * 1000}})}})
+        found = self.storage.findFunctionByString(SearchQueryParser().parse("plain_renamed"), cursor=FullSearchCursor(None, [("function_id", True)]))
+        self.assertEqual([function_ids[0]], list(found))
+        self.assertIsNone(found[function_ids[0]].xcfg)
+        migrated = self.storage.findFunctionByString(SearchQueryParser().parse("qz_both"), cursor=FullSearchCursor(None, [("function_id", True)]))
+        self.assertIsNone(migrated[function_ids[1]].xcfg)
+
+    def testLabelsAreListedPastTheCountCap(self):
+        # a regex on the multikey label index fetches every labelled function, so the labels are listed
+        # however many there are; only the matching ones have to fit the $in
+        function_ids = self._storageWithLabelledFunctions()
+        original_cap = MongoDbStorage._DISTINCT_VALUES_CAP
+        try:
+            MongoDbStorage._DISTINCT_VALUES_CAP = 1
+            self.assertIsNone(self.storage._getDistinctValues("functions", "function_name"))
+            labels = self.storage._getDistinctValues("functions", "function_labels.function_label")
+            assert labels is not None
+            self.assertEqual(["plain_renamed", "qz_both", "qz_label_only"], sorted(label for label in labels if isinstance(label, str)))
+            self.assertEqual(function_ids[:2], self._searchFunctionIds("function_labels.function_label:?qz_"))
+        finally:
+            MongoDbStorage._DISTINCT_VALUES_CAP = original_cap
+
+    def testMatchingLabelsPastTheByteCapFallBackToTheRegex(self):
+        function_ids = self._storageWithLabelledFunctions()
+        original_cap = MongoDbStorage._DISTINCT_VALUES_MAX_BYTES
+        try:
+            # "qz_both" fits, "qz_both" and "qz_label_only" together do not
+            MongoDbStorage._DISTINCT_VALUES_MAX_BYTES = 10
+            query = self._labelQuery("function_labels.function_label:?qz_")
+            self.assertTrue(hasattr(query["function_labels.function_label"], "search"))
+            query = self._labelQuery("function_labels.function_label:?qz_b")
+            self.assertEqual(["qz_both"], query["function_labels.function_label"]["$in"])
+            # same answers either way
+            self.assertEqual(function_ids[:2], self._searchFunctionIds("function_labels.function_label:?qz_"))
+            self.assertEqual([function_ids[1]], self._searchFunctionIds("function_labels.function_label:?qz_b"))
+            self.assertNotIn(function_ids[0], self._searchFunctionIds("function_labels.function_label:!?qz_"))
+        finally:
+            MongoDbStorage._DISTINCT_VALUES_MAX_BYTES = original_cap
+
+    def testLabelsPastWhatDistinctAnswersFallBackToTheRegex(self):
+        function_ids = self._storageWithLabelledFunctions()
+        functions = self.storage._getDb().functions
+
+        def too_big(*args, **kwargs):
+            raise OperationFailure("Executor error during distinct command :: caused by :: distinct too big, 16mb cap", code=17217)
+
+        with patch.object(type(functions), "distinct", autospec=True, side_effect=too_big) as listing:
+            query = self._labelQuery("function_labels.function_label:?qz_")
+            self.assertTrue(hasattr(query["function_labels.function_label"], "search"))
+            self.assertEqual(function_ids[:2], self._searchFunctionIds("function_labels.function_label:?qz_"))
+            self.assertEqual([function_ids[0]], self._searchFunctionIds("function_labels.function_label:?label_only"))
+            # remembered like any other verdict over the cap
             self.assertEqual(1, listing.call_count)
 
     def testCounterInitIsIdempotent(self):

@@ -411,10 +411,14 @@ as by default - and left alone when it has a database of its own, which this can
 A search that runs out of time is stopped on the MongoDB side and answered 400 with a message
 to narrow the search term, instead of holding the database busy for as long as it takes. The
 limit applies to each scan of one search separately: the lookup of the matching entries and,
-for function names, the scan of the distinct names (if that one runs out, the search falls back
-to matching the names in the database, as it does for a corpus with too many distinct names, and
-the scan is not repeated for an hour). The lookups of a single id or sha256 are not limited. The
-in-memory storage has no such limit.
+for function names, the scan of the distinct names (if that one runs out, the search falls back to
+matching the names in the database, as it does for a corpus with too many distinct names, and the
+scan is not repeated for an hour). A search of nothing but function labels
+(`function_labels.function_label:?term`) is first tried as the plain lookup for a fixed 50 ms, then
+through the distinct labels; probe, listing and lookup share the one limit (the listing gets at
+most half of what the probe left, the lookup the rest), so that search never takes longer than the
+limit in total. The lookups of a
+single id or sha256 are not limited. The in-memory storage has no such limit.
 Raise it (or set 0) if broad searches on a large corpus are cut off and you accept their cost.
 
 ## Keeping submitted binaries
