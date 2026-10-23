@@ -891,10 +891,37 @@ class MongoQueue:
 
     def release_all_jobs(self, consumer_id=None):
         # release all jobs associated with our consumer id if they are started, locked, but not finished.
-        self._getCollection().update_many(
-            filter={"locked_by": consumer_id if consumer_id else self.consumer_id, "started_at": {"$ne": None}, "finished_at": {"$eq": None}},
-            update={"$set": {"locked_by": None, "locked_at": None}, "$inc": {"attempts_left": -1}},
-        )
+        holder = consumer_id if consumer_id else self.consumer_id
+        self._release_stranded_jobs({"locked_by": holder, "started_at": {"$ne": None}, "finished_at": None})
+
+    def _release_stranded_jobs(self, stranded) -> int:
+        """Release the jobs matching the filter and return how many were released.
+
+        Per job, like Job.error(): the attempt that was lost counts, and a job out of
+        attempts fails and releases whatever waits on it instead of being requeued. The
+        queue counters follow the job.
+        """
+        counter_updates = []
+        released = 0
+        for job_id in [job["_id"] for job in self._getCollection().find(stranded, {"_id": 1})]:
+            job = self._getCollection().find_one_and_update(
+                {"_id": job_id, **stranded},
+                {"$set": {"locked_by": None, "locked_at": None}, "$inc": {"attempts_left": -1}},
+                return_document=ReturnDocument.AFTER,
+            )
+            if job is None:
+                continue
+            released += 1
+            method = job["payload"]["method"]
+            counter_updates.append((method, "in_progress", -1))
+            if job["attempts_left"] <= 0:
+                self._notify_dependent_jobs(str(job["_id"]))
+                counter_updates.append((method, "failed", 1))
+            else:
+                counter_updates.append((method, "queued", 1))
+        if released:
+            self.updateQueueCounters(counter_updates)
+        return released
 
     def release_orphaned_jobs(self):
         """Return the jobs held by workers that are not alive to the queue.
@@ -919,29 +946,9 @@ class MongoQueue:
         if not orphan_ids:
             return
         stranded = {"locked_by": {"$in": orphan_ids}, "started_at": {"$ne": None}, "finished_at": None}
-        counter_updates = []
-        released = 0
-        for job_id in [job["_id"] for job in self._getCollection().find(stranded, {"_id": 1})]:
-            # per job, like Job.error(): the attempt that died counts, and a job out of
-            # attempts fails and releases whatever waits on it instead of being requeued
-            job = self._getCollection().find_one_and_update(
-                {"_id": job_id, **stranded},
-                {"$set": {"locked_by": None, "locked_at": None}, "$inc": {"attempts_left": -1}},
-                return_document=ReturnDocument.AFTER,
-            )
-            if job is None:
-                continue
-            released += 1
-            method = job["payload"]["method"]
-            counter_updates.append((method, "in_progress", -1))
-            if job["attempts_left"] <= 0:
-                self._notify_dependent_jobs(str(job["_id"]))
-                counter_updates.append((method, "failed", 1))
-            else:
-                counter_updates.append((method, "queued", 1))
+        released = self._release_stranded_jobs(stranded)
         if released:
             LOGGER.warning("Released %d job(s) held by dead worker(s) %s back to the queue.", released, ", ".join(orphan_ids))
-            self.updateQueueCounters(counter_updates)
 
     def terminate_all_jobs(self):
         pass

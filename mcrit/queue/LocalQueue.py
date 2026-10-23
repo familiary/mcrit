@@ -394,6 +394,11 @@ class LocalQueue:
         # left empty, as we only have one worker in local mode
         pass
 
+    def release_all_jobs(self, consumer_id=None):
+        # left empty: jobs run synchronously in the calling process and next() hands out nothing,
+        # so no job is ever held by a consumer that exits; Job.__exit__ releases on error itself
+        pass
+
     def getQueueStatistics(self):
         # we don't track stats for the volatile local mode
         return {}
