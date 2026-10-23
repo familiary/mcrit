@@ -1822,7 +1822,8 @@ class MongoDbStorage(StorageInterface):
         self._decodePichash(query_result, delete_old=False)
         encoded_pichash = query_result["_pichash"]
         decoded_pichash = query_result["pichash"]
-        if decoded_pichash is None:
+        # 0 stands for "no PicHash", stored as "0x0" like a hash but shared by no two functions
+        if not decoded_pichash:
             return None
 
         sample_and_function_ids = set(
@@ -1845,7 +1846,8 @@ class MongoDbStorage(StorageInterface):
             self._decodePichash(pichash, delete_old=False)
             encoded_pichash = pichash["_pichash"]
             decoded_pichash = pichash["pichash"]
-            if decoded_pichash in pichashes:
+            # 0 stands for "no PicHash", stored as "0x0" like a hash but shared by no two functions
+            if not decoded_pichash or decoded_pichash in pichashes:
                 continue
             pichashes[decoded_pichash] = set()
             encoded_to_decoded[encoded_pichash] = decoded_pichash
@@ -3002,6 +3004,9 @@ class MongoDbStorage(StorageInterface):
         return self._getDb().functions.find_one(query) is not None
 
     def getMatchesForPicHash(self, pichash: int) -> Set[Tuple[int, int, int]]:
+        # 0 stands for "no PicHash", stored as "0x0" like a hash but shared by no two functions
+        if not pichash:
+            return set()
         query = {"pichash": pichash}
         self._encodePichash(query)
         return set(
@@ -3014,6 +3019,9 @@ class MongoDbStorage(StorageInterface):
     def getMatchesForPicHashes(self, pichashes: List[int]) -> Dict[int, Set[Tuple[int, int, int]]]:
         encoded_to_decoded = {}
         for pichash in set(pichashes):
+            # 0 stands for "no PicHash", as in getPicHashMatchesByFunctionIds
+            if not pichash:
+                continue
             query = {"pichash": pichash}
             self._encodePichash(query)
             encoded_to_decoded[query["_pichash"]] = pichash

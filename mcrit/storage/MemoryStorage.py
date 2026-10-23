@@ -919,7 +919,8 @@ class MemoryStorage(StorageInterface):
         if function_id not in self._functions:
             return None
         pichash = self._functions[function_id].pichash
-        if pichash is None:
+        # 0 stands for "no PicHash" and is not indexed
+        if not pichash:
             return None
         return {pichash: deepcopy(self._pichashes[pichash])}
 
@@ -928,7 +929,8 @@ class MemoryStorage(StorageInterface):
         for function_id in function_ids:
             if function_id in self._functions:
                 pichash = self._functions[function_id].pichash
-                if pichash is None:
+                # 0 stands for "no PicHash" and is not indexed
+                if not pichash:
                     continue
                 # a hash over MINHASH_PICHASH_MAX_MATCHES keeps its key with no holders, as in MongoDbStorage
                 pichashes[pichash] = deepcopy(self._pichashes[pichash]) if self._isPicHashWithinMatchCount(pichash) else set()

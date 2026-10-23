@@ -15,6 +15,22 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **A function without a sample failed every matching job that met it, and functions without a
+  PicHash matched each other** (#305). Functions whose sample document is gone (left by imports of
+  older releases, #270, by a delete that stopped half-way, or by a sample deleted while a job ran)
+  hit an `AssertionError` as soon as a PicHash or MinHash match reached them. Matches against such
+  samples are now left out, they no longer take a place in the matching shortlist, and the job logs
+  one warning with how many samples and matches it left out. Comparing such a function with `GET
+  /matches/function/{a}/{b}` answers 404 instead of failing. A function without a PicHash is stored
+  with pichash 0: sample-vs-sample and sample-vs-group matching reported every two of those as an
+  exact match, matching a sample against the corpus did the same on MongoDB and raised `KeyError` on
+  `MemoryStorage`, `GET /matches/function/{a}/{b}` flagged two of them as a PicHash match, and `GET
+  /query/pichash/0000000000000000` listed every such function on MongoDB. All of them now treat 0 as
+  no PicHash. Internally, `MatcherInterface._restrictToShortlist` no longer returns a single
+  function's candidates when it cannot resolve sample ids; no shipped matcher reaches that branch.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

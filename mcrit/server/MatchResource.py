@@ -85,5 +85,11 @@ class MatchResource:
             db_log_msg(self.index, req, "MatchResource.on_get_function_vs - failed - at least one unknown function_id.")
             return
         function_match = self.index.getMatchesFunctionVs(function_id, function_id_b)
+        if function_match is None:
+            # one of the functions belongs to no sample the corpus still has
+            resp.data = jsonify({"status": "failed", "data": {"message": "We don't have a sample with that id."}})
+            resp.status = falcon.HTTP_404
+            db_log_msg(self.index, req, "MatchResource.on_get_function_vs - failed - function without a sample.")
+            return
         resp.data = jsonify({"status": "successful", "data": function_match})
         db_log_msg(self.index, req, "MatchResource.on_get_function_vs - success.")

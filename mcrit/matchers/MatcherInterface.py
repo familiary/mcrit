@@ -138,6 +138,11 @@ class MatcherInterface:
         self._shortlist_unavailable = shortlist_unavailable
         # why a requested shortlist was not applied, for the report
         self._shortlist_fallback: Optional[str] = None
+        # corpus sample ids that functions still point to but that have no sample document (an
+        # import of an older release, a delete that crashed half-way, a sample deleted while this
+        # job ran), and the matches left out because of them; logged once per job
+        self._orphaned_sample_ids: Set[int] = set()
+        self._orphaned_matches: Set[Tuple[int, int, int]] = set()
         self._additional_setup()
         self._sample_to_lib_info: Dict[int, bool]
         # NOTE: query matchers seed this with a sentinel entry for the query sample itself
@@ -274,16 +279,41 @@ class MatcherInterface:
         # the query's own sample must never be shortlisted away - self-matches are how a
         # sample-vs-corpus result reports its own functions
         votes.pop(self._sample_id, None)
+        if (self._sample_info or {}).get("architecture"):
+            # the architecture filter below reads every voted sample's entry; the report needs the
+            # own one too, so it comes with them in the same lookup
+            self._prefetchSampleEntries(set(votes) | {self._sample_id})
         # samples of another architecture are dropped from the report, so they must not take the
         # places of samples that would be reported
         for sample_id in self._otherArchitectureSampleIds(set(votes)):
             del votes[sample_id]
-        shortlist = self._rankShortlist(votes, shortlist_size)
+        pichash_sample_ids = {match_ids[1] for match_ids in pichash_matches or {}}
+        shortlist = self._rankShortlistOfKnownSamples(votes, shortlist_size, pichash_sample_ids)
         if self._sample_id is not None:
             shortlist.add(self._sample_id)
         self._shortlist_candidate_cache = cached_groups
         LOGGER.info("Shortlisted %d of %d voted samples for exact matching", len(shortlist), len(votes))
         return shortlist
+
+    def _rankShortlistOfKnownSamples(self, votes: "Counter", shortlist_size: int, pichash_sample_ids: Set[int]) -> Set[int]:
+        """_rankShortlist, without the samples that have functions but no sample document.
+
+        Those cannot be reported, so they must not take a place either. Only the shortlisted
+        samples are looked up - together with the PicHash-matched ones and the own sample, which
+        the report needs anyway - so that is the job's one sample lookup; the ranking is redone
+        only when it shortlisted such a sample, each round one more lookup of the newly
+        shortlisted samples. An orphan that only voted and never made the shortlist is not looked
+        up, so it is not in the job's warning either; it took no place and has no matches.
+        """
+        also_needed = pichash_sample_ids | {self._sample_id}
+        while True:
+            shortlist = self._rankShortlist(votes, shortlist_size)
+            orphaned = self._findOrphanedSampleIds(shortlist | also_needed)
+            also_needed = set()
+            for sample_id in orphaned:
+                votes.pop(sample_id, None)
+            if not orphaned & shortlist:
+                return shortlist
 
     def _rankShortlist(self, votes: "Counter", shortlist_size: int) -> Set[int]:
         """Pick the samples to keep, by absolute *and* by relative evidence.
@@ -340,7 +370,15 @@ class MatcherInterface:
                 candidates = np.fromiter(entry, dtype=np.int64, count=len(entry))
                 resolved = self._resolveSampleIds(candidates)
                 if resolved is None:
-                    return entry
+                    # unreachable from the shipped matchers, whose shortlist always comes with
+                    # stage 1's (candidates, sample_ids) cache; kept for any other caller.
+                    # the index went incomplete since stage 1: what cannot be resolved cannot be
+                    # restricted, so this and every later batch match against the whole corpus
+                    LOGGER.warning("Shortlisting requested but the function range index is unavailable; matching against the whole corpus instead.")
+                    self._shortlist_fallback = "function_range_index_incomplete"
+                    self._sample_shortlist = None
+                    self._shortlist_array = None
+                    return {key: set(value[0].tolist()) if isinstance(value, tuple) else set(value) for key, value in candidate_groups.items()}
                 sample_ids = resolved
             if not candidates.size:
                 continue
@@ -470,23 +508,62 @@ class MatcherInterface:
                 minhash_matches = self._harmonizeMinHashMatches(self._sample_id, self._performMinHashMatching(candidate_groups, matching_cache))
                 all_minhash_matches.update(minhash_matches)
             LOGGER.info("Calculated MinHash matches.")
+        # one lookup for the samples of both kinds of matches; stage 1 took orphaned samples out of
+        # its votes already, and has looked up what it shortlisted
+        orphaned = self._findOrphanedSampleIds({match_ids[1] for match_ids in pichash_matches} | {match_ids[1] for match_ids in all_minhash_matches})
+        pichash_matches = self._dropOrphanedSamples(pichash_matches, orphaned)
+        all_minhash_matches = self._dropOrphanedSamples(all_minhash_matches, orphaned)
         pichash_matches = self._dropOtherArchitectures(pichash_matches)
         all_minhash_matches = self._dropOtherArchitectures(all_minhash_matches)
         matching_report = self._craftResultDict(pichash_matches, all_minhash_matches)
+        if self._orphaned_sample_ids:
+            # one line per job, however many functions point to missing samples - also when they
+            # only had shortlist votes taken away and no match was left to drop
+            LOGGER.warning(
+                "Left out %d samples that have functions but no sample document, and %d matches against them (sample ids: %s)",
+                len(self._orphaned_sample_ids),
+                len(self._orphaned_matches),
+                sorted(self._orphaned_sample_ids)[:10],
+            )
         LOGGER.info("Returning aggregated match report.")
         return matching_report
 
+    def _findOrphanedSampleIds(self, sample_ids) -> Set[int]:
+        """The corpus samples among sample_ids that functions point to but that have no sample document.
+
+        Such functions are left behind by imports of older releases (#270), by a delete that did
+        not finish, or by a sample deleted while this job runs. They cannot be reported - there is
+        no family, name or size to report them with - so the matcher leaves them out rather than
+        failing the whole job on them. The query's own sample is never one of them.
+        """
+        self._prefetchSampleEntries(sample_ids)
+        return {sample_id for sample_id in sample_ids if sample_id in self._orphaned_sample_ids}
+
+    def _dropOrphanedSamples(self, matches: HarmonizedMatches, orphaned: Set[int]) -> HarmonizedMatches:
+        """Leave out matches against the orphaned samples, remembering them for the job's warning."""
+        if not matches or not orphaned:
+            return matches
+        kept: HarmonizedMatches = {}
+        for match_ids, strength in matches.items():
+            if match_ids[1] in orphaned:
+                self._orphaned_matches.add(match_ids)
+            else:
+                kept[match_ids] = strength
+        return kept
+
     def _prefetchSampleEntries(self, sample_ids) -> None:
         """Fetch the entries of sample_ids not fetched yet in one lookup, rather than one or two
-        per sample later on (N+1, #111). Lazy per-id lookups stay the fallback for anything the
-        batch did not return."""
-        missing = [sample_id for sample_id in sample_ids if sample_id not in self._sample_id_to_entry]
-        if not missing or not hasattr(self._storage, "getSampleEntriesByIds"):
+        per sample later on (N+1, #111). An id the lookup does not answer has no sample document;
+        it is remembered as orphaned, so it is neither looked up again nor reported."""
+        missing = [sample_id for sample_id in sample_ids if sample_id is not None and sample_id not in self._sample_id_to_entry and sample_id not in self._orphaned_sample_ids]
+        if not missing:
             return
-        for sample_id, entry in self._storage.getSampleEntriesByIds(missing).items():
+        entries = self._storage.getSampleEntriesByIds(missing)
+        for sample_id, entry in entries.items():
             self._sample_id_to_entry.setdefault(sample_id, entry)
             # same predicate as getLibraryInfoForSampleId(...) is not None
             self._sample_to_lib_info.setdefault(sample_id, bool(entry.is_library))
+        self._orphaned_sample_ids.update(sample_id for sample_id in missing if sample_id not in entries and sample_id != self._sample_id)
 
     def _otherArchitectureSampleIds(self, sample_ids) -> Set[int]:
         """The samples among sample_ids that are of another architecture than the one matched (#93).
@@ -822,6 +899,10 @@ class MatcherInterface:
                 self_matched_functions.add(own_function_id)
                 self_matched_functions.add(foreign_function_id)
             else:
+                # _getMatchesRoutineInner has dropped these already; this covers a caller that did not
+                if foreign_sample_id not in self._sample_id_to_entry and self._findOrphanedSampleIds({foreign_sample_id}):
+                    self._orphaned_matches.add(match_ids)
+                    continue
                 if foreign_sample_id not in self._sample_to_lib_info:
                     self._sample_to_lib_info[foreign_sample_id] = self._storage.getLibraryInfoForSampleId(foreign_sample_id) is not None
                 has_libinfo = self._sample_to_lib_info[foreign_sample_id]
@@ -834,10 +915,6 @@ class MatcherInterface:
                     # tuple per match is what grows with the number of matches (#69)
                     continue
 
-                if foreign_sample_id not in self._sample_id_to_entry:
-                    foreign_sample_entry = self._storage.getSampleById(foreign_sample_id)
-                    assert foreign_sample_entry is not None
-                    self._sample_id_to_entry[foreign_sample_id] = foreign_sample_entry
                 foreign_family_id = self._sample_id_to_entry[foreign_sample_id].family_id
 
                 flags = is_pichash_match * MatcherFlags.IS_PICHASH_FLAG + is_minhash_match * MatcherFlags.IS_MINHASH_FLAG + has_libinfo * MatcherFlags.IS_LIBRARY_FLAG
@@ -919,10 +996,10 @@ class MatcherInterface:
         family_adjustment = self._get_family_adjustment(match_report)
 
         for foreign_sample_id in matches_per_sample:
-            if foreign_sample_id not in self._sample_id_to_entry:
-                foreign_sample_entry = self._storage.getSampleById(foreign_sample_id)
-                assert foreign_sample_entry is not None
-                self._sample_id_to_entry[foreign_sample_id] = foreign_sample_entry
+            # _summarizeMatches left out matches against samples without a document, so every
+            # sample here has its entry cached; this only guards callers that skipped it
+            if foreign_sample_id not in self._sample_id_to_entry and self._findOrphanedSampleIds({foreign_sample_id}):
+                continue
             sample_info = self._sample_id_to_entry[foreign_sample_id]
             sample_summary[foreign_sample_id] = {
                 "family": sample_info.family,

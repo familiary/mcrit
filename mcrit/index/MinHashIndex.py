@@ -630,6 +630,9 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             return
         sample_entry_a = storage.getSampleById(function_entry_a.sample_id)
         sample_entry_b = storage.getSampleById(function_entry_b.sample_id)
+        if sample_entry_a is None or sample_entry_b is None:
+            # a function whose sample document is gone (#270) cannot be reported, as in matching
+            return
         minhash_a = function_entry_a.getMinHash(minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
         minhash_b = function_entry_b.getMinHash(minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
 
@@ -638,7 +641,8 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             score = MinHash.calculateMinHashScore(minhash_a.minhash, minhash_b.minhash, minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
         match_flags = 0
         match_flags += MatcherFlags.IS_MINHASH_FLAG if score is not None and score >= self._minhash_config.MINHASH_MATCHING_THRESHOLD else 0
-        match_flags += MatcherFlags.IS_PICHASH_FLAG if function_entry_a.pichash == function_entry_b.pichash else 0
+        # 0 stands for "no PicHash", which two functions do not share
+        match_flags += MatcherFlags.IS_PICHASH_FLAG if function_entry_a.pichash and function_entry_a.pichash == function_entry_b.pichash else 0
         match_flags += MatcherFlags.IS_LIBRARY_FLAG if sample_entry_b.is_library else 0
         match_tuple = [function_entry_b.family_id, function_entry_b.sample_id, function_entry_b.function_id, score, match_flags]
         result = {
