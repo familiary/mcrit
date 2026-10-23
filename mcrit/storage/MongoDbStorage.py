@@ -44,11 +44,12 @@ from mcrit.libs.utility import decode_two_complement, encode_two_complement
 from mcrit.minhash.MinHash import MinHash
 from mcrit.minhash.MinHasher import MINHASH_SHINGLER_REVISION, SHINGLER_REVISION_SINCE
 from mcrit.storage.FamilyEntry import FamilyEntry
-from mcrit.storage.FunctionEntry import FunctionEntry, smdaFunctionFromXcfg
+from mcrit.storage.FunctionEntry import FunctionEntry, picBlockHashEntries, smdaFunctionFromXcfg
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
 from mcrit.storage.MatchingCache import MatchingCache
 from mcrit.storage.SampleEntry import SampleEntry
 from mcrit.storage.StorageInterface import BinaryStream, StorageInterface
+from mcrit.storage.UniqueBlocksResult import UniqueBlocksProgressReporter, blockScore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -701,7 +702,7 @@ class MongoDbStorage(StorageInterface):
         for collection, documents in self._extractXcfgDocuments(function_dicts).items():
             self._dbInsertMany(collection, documents)
 
-    def _fetchXcfgBlobs(self, function_ids: List[int]) -> Dict[int, str]:
+    def _fetchXcfgBlobs(self, function_ids: List[int], progress_reporter=None) -> Dict[int, str]:
         """One `$in` per collection for a whole batch of ids - never one query per function,
         which is the N+1 shape #111 removed elsewhere."""
         blobs = {}
@@ -711,6 +712,8 @@ class MongoDbStorage(StorageInterface):
                 continue
             for document in self._getDb()[collection].find({"_id": {"$in": ids}}):
                 blobs[document["_id"]] = document["_xcfg"]
+                if progress_reporter is not None:
+                    progress_reporter.step()
         return blobs
 
     def _attachXcfgBlobs(self, function_documents: List[Dict]) -> None:
@@ -3055,12 +3058,7 @@ class MongoDbStorage(StorageInterface):
         # calculate block hashes and add separately
         image_lower = sample_entry.base_addr
         image_upper = image_lower + sample_entry.binary_size
-        picblockhashes = []
-        for hash_entry in self.blockhasher.getBlockhashesForFunction(smda_function, image_lower, image_upper, hash_size=8):
-            for block_entry in hash_entry["offset_tuples"]:
-                block_entry["hash"] = hash_entry["hash"]
-                picblockhashes.append(block_entry)
-        function_entry.picblockhashes = picblockhashes
+        function_entry.picblockhashes = picBlockHashEntries(self.blockhasher, smda_function, image_lower, image_upper)
         # convert for persistance
         function_dict = function_entry.toDict()
         self._encodeFunction(function_dict)
@@ -3509,11 +3507,7 @@ class MongoDbStorage(StorageInterface):
                     functions_updated += 1
                     update_document["pichash"] = new_pichash
                 # check if any blockhashes changed and possibly stage for update
-                picblockhashes = []
-                for hash_entry in self.blockhasher.getBlockhashesForFunction(smda_function, binary_info.base_addr, binary_info.base_addr + binary_info.binary_size, hash_size=8):
-                    for block_entry in hash_entry["offset_tuples"]:
-                        block_entry["hash"] = hash_entry["hash"]
-                        picblockhashes.append(block_entry)
+                picblockhashes = picBlockHashEntries(self.blockhasher, smda_function, binary_info.base_addr, binary_info.base_addr + binary_info.binary_size)
                 set_old = set([(pbh["offset"], pbh["hash"]) for pbh in old_blockhashes])
                 set_new = set([(pbh["offset"], pbh["hash"]) for pbh in picblockhashes])
                 if len(set_new) != len(set_old.intersection(set_new)):
@@ -3677,8 +3671,8 @@ class MongoDbStorage(StorageInterface):
         LOGGER.info("Rebuilt picblockhash index over %d distinct block hashes.", num_hashes)
         return num_hashes
 
-    def _reduceToUniqueBlocksUsingIndex(self, candidate_picblockhashes: Dict, sample_ids: List[int]) -> None:
-        """Drop every candidate the index shows in a sample outside the request."""
+    def _reduceToUniqueBlocksUsingIndex(self, candidate_picblockhashes: Dict, sample_ids: List[int], progress: UniqueBlocksProgressReporter) -> None:
+        """Drop every candidate the index shows in a sample outside the request, a step of <progress> per candidate."""
         requested_sample_ids = set(sample_ids)
         collection = self._getDb()[self._PICBLOCKHASH_INDEX_COLLECTION]
         candidate_hashes = list(candidate_picblockhashes)
@@ -3687,23 +3681,22 @@ class MongoDbStorage(StorageInterface):
             for document in collection.find({"_id": {"$in": hash_slice}}, {"sample_ids": 1}):
                 if any(sample_id not in requested_sample_ids for sample_id in document["sample_ids"]):
                     candidate_picblockhashes.pop(document["_id"], None)
+            progress.step(len(hash_slice))
 
-    def _reduceToUniqueBlocksByScan(self, candidate_picblockhashes: Dict, sample_ids: List[int], progress_reporter=None) -> None:
-        """The pre-index elimination: read every function that has block hashes.
+    def _reduceToUniqueBlocksByScan(self, candidate_picblockhashes: Dict, sample_ids: List[int], progress: UniqueBlocksProgressReporter) -> None:
+        """The pre-index elimination: read every function that has block hashes, a step of <progress> per function.
 
         Kept as the fallback for an instance whose index has not been built yet, so that upgrading
         never silently changes results - it only stays slow until rebuildPicBlockHashIndex runs.
         """
-        if progress_reporter is not None:
-            progress_reporter.set_total(self._getDb().functions.count_documents(filter={}))
         for entry in self._getDb().functions.find({"_picblockhashes": {"$exists": True, "$ne": []}}, {"sample_id": 1, "_picblockhashes": 1, "_id": 0}):
-            if progress_reporter is not None:
-                progress_reporter.step()
+            progress.step()
             if entry["sample_id"] not in sample_ids:
                 for block_entry in entry["_picblockhashes"]:
                     candidate_picblockhashes.pop(block_entry["hash"], None)
 
     def getUniqueBlocks(self, sample_ids: List[int], progress_reporter=None) -> Dict:
+        progress = UniqueBlocksProgressReporter.wrap(progress_reporter)
         # query once to get all blocks from the functions of our samples
         block_statistics: Dict[str, Any] = {
             "by_sample_id": {sample_id: {"sample_id": sample_id, "total_blocks": 0, "characteristic_blocks": 0, "unique_blocks": 0} for sample_id in sample_ids},
@@ -3711,15 +3704,25 @@ class MongoDbStorage(StorageInterface):
             "num_samples": len(sample_ids),
         }
         candidate_picblockhashes: Dict[int, Dict[str, Any]] = {}
+        # expect every function of the samples; those without blocks take no step, and the next
+        # start_phase fills what they leave
+        num_functions = sum(
+            document.get("statistics", {}).get("num_functions", 0)
+            for document in self._getDb().samples.find({"sample_id": {"$in": sample_ids}}, {"statistics.num_functions": 1, "_id": 0})
+        )
+        progress.start_phase("collect", num_functions)
         for entry in self._getDb().functions.find(
             {"sample_id": {"$in": sample_ids}, "_picblockhashes": {"$exists": True, "$ne": []}}, {"function_id": 1, "sample_id": 1, "_picblockhashes": 1, "_id": 0}
         ):
             sample_id = entry["sample_id"]
             for block_entry in entry["_picblockhashes"]:
                 block_hash = block_entry["hash"]
-                if block_hash not in candidate_picblockhashes:
+                candidate = candidate_picblockhashes.get(block_hash)
+                # a block in several functions is represented by the lowest function_id, as
+                # MemoryStorage has it, whatever order find() answers in (#283)
+                if candidate is None or entry["function_id"] < candidate["function_id"]:
                     candidate_picblockhashes[block_hash] = {
-                        "samples": set(),
+                        "samples": candidate["samples"] if candidate is not None else set(),
                         "length": block_entry["length"],
                         "function_id": entry["function_id"],
                         "sample_id": sample_id,
@@ -3729,6 +3732,7 @@ class MongoDbStorage(StorageInterface):
                         "score": 0,
                     }
                 candidate_picblockhashes[block_hash]["samples"].add(sample_id)
+            progress.step()
         # update statistics based on candidates
         for picblockhash, entry in candidate_picblockhashes.items():
             for sample_id in entry["samples"]:
@@ -3736,13 +3740,17 @@ class MongoDbStorage(StorageInterface):
         LOGGER.info(f"Found {len(candidate_picblockhashes)} candidate picblock hashes")
         # remove those that are not unique
         if self._isPicBlockHashIndexComplete():
-            self._reduceToUniqueBlocksUsingIndex(candidate_picblockhashes, sample_ids)
+            progress.start_phase("eliminate", len(candidate_picblockhashes))
+            self._reduceToUniqueBlocksUsingIndex(candidate_picblockhashes, sample_ids, progress)
         else:
+            # the scan steps once per function with blocks; counting those would read the collection
+            # once more, so the phase expects the collection's size, as its metadata estimates it
+            progress.start_phase("eliminate", self._getDb().functions.estimated_document_count())
             LOGGER.warning(
                 "picblockhash index is not built - falling back to a full scan of the functions collection. "
                 "Run rebuildPicBlockHashIndex() (Worker.rebuildPicBlockHashIndex) to enable the indexed path."
             )
-            self._reduceToUniqueBlocksByScan(candidate_picblockhashes, sample_ids, progress_reporter=progress_reporter)
+            self._reduceToUniqueBlocksByScan(candidate_picblockhashes, sample_ids, progress)
         # update statistics again after having reduced to results
         for picblockhash, entry in candidate_picblockhashes.items():
             if len(entry["samples"]) == 1:
@@ -3752,27 +3760,21 @@ class MongoDbStorage(StorageInterface):
                 block_statistics["by_sample_id"][sample_id]["characteristic_blocks"] += 1
         block_statistics["unique_blocks_overall"] = len(candidate_picblockhashes)
         LOGGER.info(f"Reduced to {len(candidate_picblockhashes)} unique picblock hashes")
-        # we are basically finished when we reached this step, so set progress to 100%
-        if progress_reporter is not None:
-            progress_reporter.set_total(1)
-            progress_reporter.step()
         # iterate over candidates by function_id and extract instructions
         function_id_to_block_offsets = {}
+        progress.start_phase("score", len(candidate_picblockhashes))
         for picblockhash, entry in candidate_picblockhashes.items():
             candidate_picblockhashes[picblockhash]["samples"] = sorted(list(entry["samples"]))
             # we calculate the score for this block as 80% of how well it covers the samples and 20% how far its size is away from an "ideal" signature block
-            sample_score = 100.0 * len(entry["samples"]) / len(sample_ids)
-            length_score = 100.0
-            if entry["length"] < 7:
-                length_score = 100.0 - (100.0 * (7 - entry["length"]) / 7)
-            elif entry["length"] > 10:
-                length_score = 100.0 * (1 / (entry["length"] - 10))
-            candidate_picblockhashes[picblockhash]["score"] = 0.8 * sample_score + 0.2 * length_score
+            candidate_picblockhashes[picblockhash]["score"] = blockScore(len(entry["samples"]), len(sample_ids), entry["length"])
             if entry["function_id"] not in function_id_to_block_offsets:
                 function_id_to_block_offsets[entry["function_id"]] = []
             function_id_to_block_offsets[entry["function_id"]].append((entry["offset"], picblockhash))
+            progress.step()
         block_function_ids = list(function_id_to_block_offsets.keys())
-        block_xcfg_blobs = self._fetchXcfgBlobs(block_function_ids)
+        # a step per xcfg blob fetched and per function read
+        progress.start_phase("extract", 2 * len(block_function_ids))
+        block_xcfg_blobs = self._fetchXcfgBlobs(block_function_ids, progress_reporter=progress)
         for entry in self._getDb().functions.find({"function_id": {"$in": block_function_ids}}, {"function_id": 1, "_xcfg": 1, "_id": 0}):
             function_id = entry["function_id"]
             # inline `_xcfg` is the fallback for pre-migration documents (see _attachXcfgBlobs)
@@ -3786,7 +3788,11 @@ class MongoDbStorage(StorageInterface):
                 if block_instructions is None:
                     continue
                 candidate_picblockhashes[picblockhash]["instructions"] = block_instructions
+            progress.step()
         LOGGER.info(f"Instructions for {len(candidate_picblockhashes)} blocks extracted.")
+        # called directly rather than by Worker.getUniqueBlocks, which finishes its own
+        if progress is not progress_reporter:
+            progress.finish()
         return {"statistics": block_statistics, "unique_blocks": candidate_picblockhashes}
 
     ##### helpers for search ######

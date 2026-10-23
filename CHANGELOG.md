@@ -15,6 +15,75 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- **Four opt-in options for the unique-blocks cover** ([#283]), the other directions the issue
+  proposes, so they can be evaluated against the current cover before any of them becomes a default.
+  All are off by default and leave the cover unchanged unless given. `gentle_length_score` lets
+  blocks past 11 instructions lose length score as 11 / length rather than 1 / (length - 10): a
+  12-instruction block's length score is about 92 instead of 50, so it no longer ranks below a
+  4-instruction block (57). `max_blocks_per_function` caps how many blocks one function of one
+  sample adds to the cover. `demote_generic_blocks` ranks function exits (a block ending in a return
+  that only restores registers and the stack, calls, checks the stack cookie or sets the return
+  value to zero, -1, a flag, a register, a small constant or a local) and blocks that are at least
+  half wildcards behind every other block reaching as many samples; the heuristic is Intel-centric.
+  `exclude_picblockhashes` is a negative set, for siblings that are not in the index: it goes in the
+  body of a POST to either `/uniqueblocks` route, the job stores it as a file rather than in its
+  arguments, and `mcrit.storage.UniqueBlocksResult.picBlockHashesOfReport` computes it from an SMDA
+  report locally. The first three are query parameters on both routes, all four are arguments of
+  `McritClient.requestUniqueBlocksForSamples` and `requestUniqueBlocksForFamily`, and the result's
+  statistics always echo the first three, even when off, and count the blocks the negative set
+  removed. Over the REST API and `McritClient`, an empty negative set and a cap of 0 make the same
+  job as leaving them out. `UniqueBlocksResult.generateBlockCover` takes the cap and the demotion
+  from those statistics, so given the job's `covers_required` and no size filters, the rule MCRITweb
+  renders is the one the job picked.
+
+### Changed
+
+- **The unique-blocks cover no longer rescans every block after each pick** ([#283]). It keeps the
+  blocks in a heap by how many samples each reached when last checked, a count that only shrinks,
+  and rechecks only the block on top until its count is current. It picks the same cover, faster the
+  more blocks it picks: with `covers_required=10`, 20,000 blocks over 50 samples take about 0.1 s
+  instead of 2 s when each reaches 1 to 3 of them, and 0.06 s instead of 0.4 s when they reach up to
+  all 50.
+
+### Fixed
+
+- **The unique-blocks cover broke score ties by dict order** ([#283]). A block's score is 80% the
+  samples it covers and 20% its length, and with one input sample every unique block of 7 to 11
+  instructions scores exactly 100.0. Among those the cover took whichever the storage happened to
+  return last. Ties are now broken by how many hex digits of the block's YARA string are fixed,
+  wildcards not counted, and then by the lowest picblockhash, in both `Worker.getUniqueBlocks` and
+  `UniqueBlocksResult.generateBlockCover`. The same input now always gives the same cover. Scores,
+  the length scoring and every default are unchanged. This prefers longer fixed patterns, not
+  necessarily more distinctive ones: whether it makes rules better, and whether any of the issue's
+  other directions, opt-in above, should become a default, still need the evaluation the issue
+  proposes. `RESULTS_VERSION` is now 3, and since every report job is keyed on it, cached match and
+  unique-blocks reports alike are recomputed once on their next request.
+- **On MongoDB, a unique block found in several functions was represented by whichever one the
+  query answered first** ([#283]). It now takes the lowest `function_id`, as memory storage did, so
+  its function, sample and offset, and with `max_blocks_per_function` the cover, no longer depend
+  on document order.
+- **A unique-blocks job for samples listed its first option as its family** ([#283]).
+  `Job.family_id` read the job's second argument, which for a samples request is whichever option
+  came first, such as `covers_required`; it now reads `family_id` by name.
+- **`UniqueBlocksResult.generateBlockCover` stopped after one block for `required_per_sample=0`**
+  ([#283]). It now clamps it to 1, as `Worker.getUniqueBlocks` already did with `covers_required`,
+  and answers the same 1-of-1 cover as the job.
+- **A unique-blocks job's progress overshot 100% on MongoDB and stayed at 0% on memory storage.**
+  On MongoDB it jumped to 100% once the candidates were eliminated and could then read 200%, or
+  far more after the full scan that an instance without the picblockhash index falls back to; on
+  memory storage it stayed at 0% until the end. Each phase now fills a fixed share, so progress only
+  grows and ends at 100%. A terminated job used to be noticed only at the end, and on MongoDB also
+  during that scan and after the elimination. It is now also noticed at each phase boundary and
+  while the Worker builds the blocks' escaped byte strings. On MongoDB, storage also checks while it
+  collects, eliminates (with the index, once per 20,000 candidates) and scores the candidates, and
+  while it extracts their instructions.
+- **`McritClient.requestUniqueBlocksForSamples` and `requestUniqueBlocksForFamily` ignored
+  `raw_responses`** and answered the parsed job id; they now answer the `requests.Response`, as most
+  other request methods do. A caller that set `raw_responses` but took the job id from these two
+  methods' answers now has to read it from the response.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct
@@ -1531,3 +1600,4 @@ date, the version, and what changed.
 [#57]: https://github.com/danielplohmann/mcrit/issues/57
 [#68]: https://github.com/danielplohmann/mcrit/issues/68
 [#95]: https://github.com/danielplohmann/mcrit/issues/95
+[#283]: https://github.com/danielplohmann/mcrit/issues/283

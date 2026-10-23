@@ -20,11 +20,12 @@ from mcrit.index.SearchQueryTree import AndNode, BaseVisitor, FilterSingleElemen
 from mcrit.minhash.MinHash import MinHash
 from mcrit.minhash.MinHasher import MINHASH_SHINGLER_REVISION
 from mcrit.storage.FamilyEntry import FamilyEntry
-from mcrit.storage.FunctionEntry import FunctionEntry
+from mcrit.storage.FunctionEntry import FunctionEntry, picBlockHashEntries
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
 from mcrit.storage.MatchingCache import MatchingCache, StorageBackedMatchingCache
 from mcrit.storage.SampleEntry import TIMESTAMP_FORMAT, SampleEntry
 from mcrit.storage.StorageInterface import BinaryStream, StorageInterface
+from mcrit.storage.UniqueBlocksResult import UniqueBlocksProgressReporter, blockScore
 
 if TYPE_CHECKING:  # pragma: no cover
     from smda.common.SmdaFunction import SmdaFunction
@@ -658,12 +659,7 @@ class MemoryStorage(StorageInterface):
             function_entry = FunctionEntry(sample_entry, smda_function, self._useCounter("functions"), minhash=minhash)
         image_lower = sample_entry.base_addr
         image_upper = image_lower + sample_entry.binary_size
-        picblockhashes = []
-        for hash_entry in self.blockhasher.getBlockhashesForFunction(smda_function, image_lower, image_upper, hash_size=8):
-            for block_entry in hash_entry["offset_tuples"]:
-                block_entry["hash"] = hash_entry["hash"]
-                picblockhashes.append(block_entry)
-        function_entry.picblockhashes = picblockhashes
+        function_entry.picblockhashes = picBlockHashEntries(self.blockhasher, smda_function, image_lower, image_upper)
         self._functions[function_entry.function_id] = function_entry
         if minhash and minhash.hasMinHash():
             minhash.function_id = function_entry.function_id
@@ -1079,6 +1075,7 @@ class MemoryStorage(StorageInterface):
             self._bands[band_number][band_hash].append(minhash.function_id)
 
     def getUniqueBlocks(self, sample_ids: List[int], progress_reporter=None) -> Dict:
+        progress = UniqueBlocksProgressReporter.wrap(progress_reporter)
         # query once to get all blocks from the functions of our samples
         block_statistics: Dict[str, Any] = {
             "by_sample_id": {sample_id: {"sample_id": sample_id, "total_blocks": 0, "characteristic_blocks": 0, "unique_blocks": 0} for sample_id in sample_ids},
@@ -1087,6 +1084,9 @@ class MemoryStorage(StorageInterface):
         }
         candidate_picblockhashes: Dict[int, Dict[str, Any]] = {}
         wanted_sample_ids = set(sample_ids)
+        # a step per function would slow the loops noticeably, so each phase reports only once it is
+        # done, which is also when a terminated job is noticed
+        progress.start_phase("collect", 1)
         for function_id, entry in self._functions.items():
             sample_id = entry.sample_id
             # the blocks of the samples asked about only, as MongoDbStorage reads them; a block
@@ -1112,6 +1112,7 @@ class MemoryStorage(StorageInterface):
             for sample_id in entry["samples"]:
                 block_statistics["by_sample_id"][sample_id]["total_blocks"] += 1
         LOGGER.info(f"Found {len(candidate_picblockhashes)} candidate picblock hashes")
+        progress.start_phase("eliminate", 1)
         for functiond_id, entry in self._functions.items():
             sample_id = entry.sample_id
             if sample_id not in wanted_sample_ids:
@@ -1128,19 +1129,15 @@ class MemoryStorage(StorageInterface):
         LOGGER.info(f"Reduced to {len(candidate_picblockhashes)} unique picblock hashes")
         # iterate over candidates by function_id and extract instructions
         function_id_to_block_offsets = {}
+        progress.start_phase("score", 1)
         for picblockhash, entry in candidate_picblockhashes.items():
             candidate_picblockhashes[picblockhash]["samples"] = sorted(list(entry["samples"]))
             # we calculate the score for this block as 80% of how well it covers the samples and 20% how far its size is away from an "ideal" signature block
-            sample_score = 100.0 * len(entry["samples"]) / len(sample_ids)
-            length_score = 100.0
-            if entry["length"] < 7:
-                length_score = 100.0 - (100.0 * (7 - entry["length"]) / 7)
-            elif entry["length"] > 10:
-                length_score = 100.0 * (1 / (entry["length"] - 10))
-            candidate_picblockhashes[picblockhash]["score"] = 0.8 * sample_score + 0.2 * length_score
+            candidate_picblockhashes[picblockhash]["score"] = blockScore(len(entry["samples"]), len(sample_ids), entry["length"])
             if entry["function_id"] not in function_id_to_block_offsets:
                 function_id_to_block_offsets[entry["function_id"]] = []
             function_id_to_block_offsets[entry["function_id"]].append((entry["offset"], picblockhash))
+        progress.start_phase("extract", 1)
         for function_id, entry in self._functions.items():
             if function_id not in function_id_to_block_offsets.keys():
                 continue
@@ -1156,6 +1153,9 @@ class MemoryStorage(StorageInterface):
                 if block_instructions is None:
                     continue
                 candidate_picblockhashes[picblockhash]["instructions"] = block_instructions
+        # called directly rather than by Worker.getUniqueBlocks, which finishes its own
+        if progress is not progress_reporter:
+            progress.finish()
         return {"statistics": block_statistics, "unique_blocks": candidate_picblockhashes}
 
     def rebuildPicBlockHashIndex(self, progress_reporter=None) -> int:

@@ -3,7 +3,7 @@ import functools
 import logging
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import requests
 from smda.common.SmdaReport import SmdaReport
@@ -15,6 +15,7 @@ from mcrit.storage.FunctionEntry import FunctionEntry
 from mcrit.storage.RebuiltSmdaReport import RebuiltSmdaReport
 from mcrit.storage.SampleEntry import SampleEntry
 from mcrit.storage.SearchResult import SearchResult
+from mcrit.storage.UniqueBlocksResult import parseBlockHash
 
 # Only do basicConfig if no handlers have been configured
 if not logging.root.handlers:
@@ -1173,31 +1174,75 @@ class McritClient:
     ###########################################
 
     @staticmethod
-    def _getUniqueBlocksParams(covers_required=None, min_instructions=None):
+    def _getUniqueBlocksParams(covers_required=None, min_instructions=None, gentle_length_score=None, max_blocks_per_function=None, demote_generic_blocks=None):
         # covers_required is the k of the k-of-n block cover, min_instructions drops shorter blocks
-        # before it is chosen; omitted parameters leave the server defaults (10 and 0) in place
+        # before it is chosen; omitted parameters leave the server defaults (10 and 0) in place.
+        # The other three are the opt-in directions of #283, off unless given.
         params = {}
         if covers_required is not None:
             params["covers_required"] = covers_required
         if min_instructions is not None:
             params["min_instructions"] = min_instructions
+        if max_blocks_per_function:
+            params["max_blocks_per_function"] = max_blocks_per_function
+        # as the server reads them: only True, or "true" in any case, turns them on
+        if str(gentle_length_score).lower() == "true":
+            params["gentle_length_score"] = "true"
+        if str(demote_generic_blocks).lower() == "true":
+            params["demote_generic_blocks"] = "true"
         return params
 
-    def requestUniqueBlocksForSamples(self, sample_ids: List[int], covers_required=None, min_instructions=None) -> Dict:
+    def _requestUniqueBlocks(self, url, params, exclude_picblockhashes):
+        # a negative set goes in a POST body: thousands of hashes do not fit a URL. Checked as the
+        # server checks them, so a bad hash fails here rather than as a 400
+        if exclude_picblockhashes is not None and not isinstance(exclude_picblockhashes, (list, tuple, set, frozenset)):
+            raise ValueError("exclude_picblockhashes must be a list of picblockhashes")
+        excluded = sorted({parseBlockHash(block_hash) for block_hash in exclude_picblockhashes or []})
+        if excluded:
+            response = self._session.post(url, headers=self.headers, params=params, json={"exclude_picblockhashes": excluded}, timeout=self.timeout)
+        else:
+            response = self._session.get(url, headers=self.headers, params=params, timeout=self.timeout)
+        if self.raw:
+            return response
+        return self._handle(response)
+
+    def requestUniqueBlocksForSamples(
+        self,
+        sample_ids: List[int],
+        covers_required=None,
+        min_instructions=None,
+        gentle_length_score=None,
+        max_blocks_per_function=None,
+        demote_generic_blocks=None,
+        exclude_picblockhashes=None,
+    ) -> Any:
+        """Schedule a unique-blocks job for <sample_ids>; see Worker.getUniqueBlocks for the options.
+
+        <exclude_picblockhashes> is a negative set, e.g. mcrit.storage.UniqueBlocksResult.picBlockHashesOfReport
+        for SMDA reports of siblings that are not in the index.
+        """
         if isinstance(sample_ids, list) and all(isinstance(item, int) for item in sample_ids):
             sample_ids_as_str = ",".join([str(sample_id) for sample_id in sample_ids])
-            params = self._getUniqueBlocksParams(covers_required, min_instructions)
-            response = self._session.get(f"{self.mcrit_server}/uniqueblocks/samples/{sample_ids_as_str}", headers=self.headers, params=params, timeout=self.timeout)
-            result_data = self._handle(response)
+            params = self._getUniqueBlocksParams(covers_required, min_instructions, gentle_length_score, max_blocks_per_function, demote_generic_blocks)
+            result_data = self._requestUniqueBlocks(f"{self.mcrit_server}/uniqueblocks/samples/{sample_ids_as_str}", params, exclude_picblockhashes)
         else:
             raise ValueError("sample_ids must be a list of int.")
         return result_data
 
-    def requestUniqueBlocksForFamily(self, family_id: int, covers_required=None, min_instructions=None) -> Dict:
+    def requestUniqueBlocksForFamily(
+        self,
+        family_id: int,
+        covers_required=None,
+        min_instructions=None,
+        gentle_length_score=None,
+        max_blocks_per_function=None,
+        demote_generic_blocks=None,
+        exclude_picblockhashes=None,
+    ) -> Any:
+        """Schedule a unique-blocks job for the samples of <family_id>, as requestUniqueBlocksForSamples."""
         if isinstance(family_id, int):
-            params = self._getUniqueBlocksParams(covers_required, min_instructions)
-            response = self._session.get(f"{self.mcrit_server}/uniqueblocks/family/{family_id}", headers=self.headers, params=params, timeout=self.timeout)
-            result_data = self._handle(response)
+            params = self._getUniqueBlocksParams(covers_required, min_instructions, gentle_length_score, max_blocks_per_function, demote_generic_blocks)
+            result_data = self._requestUniqueBlocks(f"{self.mcrit_server}/uniqueblocks/family/{family_id}", params, exclude_picblockhashes)
         else:
             raise ValueError("family_id must be an int.")
         return result_data

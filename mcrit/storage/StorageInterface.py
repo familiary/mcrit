@@ -838,7 +838,8 @@ class StorageInterface:
 
         Args:
             sample_ids: a list of sample_ids
-            progress_reporter: (optional) might be passed by worker to inquiry progress of this DB only operation
+            progress_reporter: (optional) a UniqueBlocksProgressReporter, as Worker.getUniqueBlocks passes
+                it, whose phases this fills, or any reporter with set_total, step and poll
 
         Returns:
             a dictionary with the isolated blocks

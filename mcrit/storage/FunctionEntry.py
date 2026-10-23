@@ -55,6 +55,16 @@ def smdaFunctionFromXcfg(xcfg: Optional[Dict], binary_info: Optional[BinaryInfo]
     return SmdaFunction.fromDict(xcfg, binary_info=binary_info)
 
 
+def picBlockHashEntries(blockhasher, smda_function: SmdaFunction, lower_addr: int, upper_addr: int) -> List[Dict]:
+    """The picblockhashes of a function's blocks as storage keeps them: each block's offset tuple with its hash."""
+    entries = []
+    for hash_entry in blockhasher.getBlockhashesForFunction(smda_function, lower_addr, upper_addr, hash_size=8):
+        for block_entry in hash_entry["offset_tuples"]:
+            block_entry["hash"] = hash_entry["hash"]
+            entries.append(block_entry)
+    return entries
+
+
 # Dataclass, post init
 # constructor -> .fromSmdaFunction
 # assume sample_entry, smda_function always available

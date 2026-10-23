@@ -522,6 +522,9 @@ class NoProgressReporter:
     def step(self):
         pass
 
+    def poll(self):
+        pass
+
     def get_total(self):
         return 1
 
@@ -553,6 +556,10 @@ class JobProgressReporter:
 
     def step(self):
         self._count += 1
+        self.poll()
+
+    # report progress and check for termination once the interval has passed, without counting a step
+    def poll(self):
         now = time.time()
         if now - self._last_update > self._report_interval:
             progress = self._count / self._total
