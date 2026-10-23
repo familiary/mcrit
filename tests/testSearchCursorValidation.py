@@ -267,11 +267,16 @@ class MongoSearchCursorTestSuite(MemorySearchCursorTestSuite):
 
         def spy_on(name):
             def spy(collection, *args, **kwargs):
-                calls[name].append(kwargs)
+                # the settings are read without a limit: a lookup of one small document (#301)
+                if collection.name != "settings":
+                    calls[name].append(kwargs)
                 return real[name](collection, *args, **kwargs)
 
             return spy
 
+        # the other labels are listed once per change to them (#301): here for every search
+        if hasattr(storage, "_other_labels_listing"):
+            storage._other_labels_listing = None
         saved = storage._storage_config
         if storage_config is not None:
             storage._storage_config = storage_config
@@ -295,7 +300,8 @@ class MongoSearchCursorTestSuite(MemorySearchCursorTestSuite):
                 self.assertEqual([30000], [kwargs["max_time_ms"] for kwargs in calls["find"]])
                 if route == "functions":
                     self.assertEqual([30000], [kwargs["maxTimeMS"] for kwargs in calls["aggregate"]])
-                    self.assertEqual([], calls["distinct"])
+                    # and the listing of the labels that differ from the names (#301)
+                    self.assertEqual([30000], [kwargs["maxTimeMS"] for kwargs in calls["distinct"]])
                 limited = StorageConfig(STORAGE_METHOD=StorageFactory.STORAGE_METHOD_MONGODB)
                 limited.STORAGE_MONGODB_SEARCH_MAX_TIME_MS = 1234
                 self.index.getStorage()._over_cap_since.clear()
@@ -303,14 +309,14 @@ class MongoSearchCursorTestSuite(MemorySearchCursorTestSuite):
                 self.assertEqual([1234], [kwargs["max_time_ms"] for kwargs in calls["find"]])
                 if route == "functions":
                     self.assertEqual([1234], [kwargs["maxTimeMS"] for kwargs in calls["aggregate"]])
-                    self.assertEqual([], calls["distinct"])
+                    self.assertEqual([1234], [kwargs["maxTimeMS"] for kwargs in calls["distinct"]])
                 limited.STORAGE_MONGODB_SEARCH_MAX_TIME_MS = 0
                 self.index.getStorage()._over_cap_since.clear()
                 calls = self._calls_of_search(route, limited)
                 self.assertEqual([None], [kwargs["max_time_ms"] for kwargs in calls["find"]])
                 if route == "functions":
                     self.assertEqual([0], [kwargs["maxTimeMS"] for kwargs in calls["aggregate"]])
-                    self.assertEqual([], calls["distinct"])
+                    self.assertEqual([0], [kwargs["maxTimeMS"] for kwargs in calls["distinct"]])
 
     def _calls_of_label_search(self, search_max_time_ms, probe_ms=None, listing_ms=0):
         """The time limits a label search hands MongoDB, on a simulated clock: the probe answers, or

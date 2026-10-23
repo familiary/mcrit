@@ -873,8 +873,10 @@ class StorageInterface:
 
     def findFunctionByString(self, search_tree: NodeType, cursor: Optional[FullSearchCursor] = None, max_num_results: int = 100) -> Dict[int, "FunctionEntry"]:
         """Given a parsed search tree, return all FunctionEntry objects that match the terms we are searching.
-        A plain search term matches the function name only. The labels are searched by their stored
-        path, as every field is: "function_labels.function_label:?term" (substring),
+        A plain search term matches the function name and the labels that differ from it (#301): "term"
+        finds a function named so or labelled so before a rename, "NOT term" one that neither its name
+        nor any such label matches. "function_name:?term" is the name alone. Every label is searched by
+        its stored path, as every field is: "function_labels.function_label:?term" (substring),
         "function_labels.function_label:term" (exact), "function_labels.username:term".
 
         Args:

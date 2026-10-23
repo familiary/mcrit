@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
 import smda.common.SmdaFunction as smda_function_module
 from smda.common.BinaryInfo import BinaryInfo
@@ -55,6 +55,25 @@ def smdaFunctionFromXcfg(xcfg: Optional[Dict], binary_info: Optional[BinaryInfo]
     return SmdaFunction.fromDict(xcfg, binary_info=binary_info)
 
 
+# The labels of a function that differ from its current name, which a plain search term matches
+# besides the name (#301). MongoDB keeps them in this derived, indexed field of the function
+# document, absent when there are none; it is storage-only and never part of a FunctionEntry.
+OTHER_LABELS_FIELD = "_other_labels"
+
+
+def otherLabels(function_name: Optional[str], function_labels: Iterable[Any]) -> List[str]:
+    """The distinct label strings that differ from the function name, in the order first given.
+
+    MongoDbStorage computes the same set on the server (_OTHER_LABELS_STAGE) for the writes that
+    change a function's labels or its name, as $setDifference does: compared exactly, case and all.
+    """
+    others: List[str] = []
+    for label in function_labels:
+        if isinstance(label, str) and label != function_name and label not in others:
+            others.append(label)
+    return others
+
+
 # Dataclass, post init
 # constructor -> .fromSmdaFunction
 # assume sample_entry, smda_function always available
@@ -107,6 +126,10 @@ class FunctionEntry:
         empty_minhash = MinHash()
         self.minhash = minhash.getMinHash() if minhash else empty_minhash.getMinHash()
         self.shingler_composition = minhash.getComposition() if minhash else empty_minhash.getComposition()
+
+    def getOtherLabels(self) -> List[str]:
+        """The labels that differ from the current name (see otherLabels)."""
+        return otherLabels(getattr(self, "function_name", None), (label.function_label for label in self.function_labels))
 
     def getMinHash(self, minhash_bits=32):
         return MinHash(function_id=self.function_id, minhash_bytes=self.minhash, minhash_bits=minhash_bits)

@@ -20,11 +20,12 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 - **Function labels are searched with the qualified field, now from an index and on both storages
   (#302).** `function_labels.function_label:?term` finds a function by any of its labels,
   `function_labels.function_label:term` by an exact one and `function_labels.username:name` by who
-  gave it; a plain term keeps matching `function_name` only, with the query it had (see below for
-  very large searches). On MongoDB the label field had worked by walking every function document; it
-  now uses a new sparse `function_labels.function_label` index. The memory storage found nothing for
-  such a path; it now resolves it into the list of labels and compares element-wise as MongoDB does
-  (`?` / `=` when one label matches, `!?` / `!=` when none does). It matches with Python's regex,
+  gave it; a plain term matches `function_name` with the query it had (see below for very large
+  searches), and since #301 the labels other than the name besides. On MongoDB the label field had
+  worked by walking every function document; it now uses a new sparse
+  `function_labels.function_label` index. The memory storage found nothing for such a path; it now
+  resolves it into the list of labels and compares element-wise as MongoDB does (`?` / `=` when
+  one label matches, `!?` / `!=` when none does). It matches with Python's regex,
   whose case folding differs from MongoDB's for a few non-ASCII letters (the dotted capital I).
 
   A search of nothing but label conditions, with a `?` among them, is first tried as the regex it
@@ -53,6 +54,40 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   they carry no disassembly, as on a migrated corpus. NOTE that the first start after upgrading
   builds the new index, reading every function document (0.3 s for 250,000 here, 0.7 s with inline
   disassembly; expect proportionally longer on a large corpus).
+
+- **A plain function search term also finds a function by its labels (#301, #307).** `term`
+  matches the name and every label that differs from it, so a renamed function is found by the
+  name it had and a labelled one by its label; `NOT term` keeps a function that neither matches.
+  `function_name:?term` is the name alone. MongoDB keeps those labels in a derived field of the
+  function document, `_other_labels`, with a sparse index: absent where a function has none, so
+  the index holds only renamed or user-labelled functions, typically a few hundred. A label equal
+  to the name, as an import or a report gives every named function, is none. Every write that
+  renames or labels a function derives it in the same update; it never appears in API answers or
+  exports. The memory storage derives the same labels on the fly, with the case folding caveat of
+  #302.
+
+  Or-ing the field into the name query would cost a sort by name its walk of the
+  `(function_name, function_id)` index (4.7 -> 98-167 ms for a common term over 250,000
+  functions, the 23 -> 420 ms #301 reports). A plain term instead matches the terms against the
+  list of other labels, searches the functions with none matching by the name query it had, and
+  those with one through the sparse index, merging the two pages in the sort order. Each process
+  keeps that list, and which of its labels each of the last 256 terms matches, until a write
+  changes the other labels: every such write, in any process, increments `other_labels_version`
+  in `settings`, and a search reads only that counter. Over 250,000 functions with 500 other
+  labels (medians of three interleaved runs) a term no other label matches costs 1-2 ms more (no
+  hit 21.1 -> 23.3 ms, rare term 21.8 -> 23.6 ms), and one that some 200 match 4-12 ms, mostly
+  fetching the functions now found by such a label (medium term 25.8 -> 29.4 ms, common term by
+  name 27.4 -> 39.4 ms). With 22,000 other labels a term few of them match costs 0-6 ms more, and
+  one that thousands match 9-26 ms (common term 34.8 -> 60.7 ms).
+
+  NOTE that the first start after upgrading derives the field when at most 100,000 functions carry
+  labels (0.74 s for 87,700 here). A larger database logs, once an hour at most, that
+  `python -m mcrit.migrations.migrate_other_labels` is due (`dry-run`, `apply`, `verify`;
+  batched and resumable, 1.1-4.0 s for 100,000 labelled functions); until it has run, a plain term
+  finds a function by such a label only if it was renamed or labelled since. A fill or a migrated
+  function that fails is logged or reported and passed over. A process of an older MCRIT does not
+  keep the field; re-run `apply` after one has written. See
+  [docs/migration-other-labels.md](docs/migration-other-labels.md).
 
 ### Fixed
 

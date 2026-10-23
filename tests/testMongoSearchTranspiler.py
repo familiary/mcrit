@@ -99,3 +99,29 @@ class TestSubstringSearchOverKnownValues(unittest.TestCase):
         self.assertEqual({"function_name": "main"}, self._visit("=", "main"))
         condition = self._visit("?", "main", field="family")
         self.assertTrue(hasattr(condition["family"], "search"))
+
+
+class TestFoldOtherLabels(unittest.TestCase):
+    """The tree a plain term gives, as it holds for a function without other labels (#301)."""
+
+    @staticmethod
+    def _fold(term):
+        from mcrit.index.SearchQueryParser import SearchQueryParser
+        from mcrit.index.SearchQueryTree import FilterSingleElementLists, PropagateNot, SearchFieldResolver
+        from mcrit.storage.MongoDbStorage import _foldOtherLabels
+
+        tree = SearchFieldResolver(MongoDbStorage._PLAIN_FUNCTION_SEARCH_FIELDS).visit(SearchQueryParser().parse(term))
+        return repr(_foldOtherLabels(PropagateNot().visit(FilterSingleElementLists().visit(tree))))
+
+    def test_a_plain_term_is_the_name_alone(self):
+        self.assertEqual("Condition('function_name' ? 'abc')", self._fold("abc"))
+        self.assertEqual("Condition('function_name' !? 'abc')", self._fold("NOT abc"))
+        self.assertEqual("And(Condition('function_name' ? 'abc'), Condition('sample_id' : '3'))", self._fold("abc sample_id:3"))
+        self.assertEqual("Or(Condition('function_name' ? 'a'), Condition('function_name' ? 'b'))", self._fold("a OR b"))
+
+    def test_conditions_on_the_field_alone_fold_into_constants(self):
+        self.assertEqual("False", self._fold("_other_labels:?abc"))
+        self.assertEqual("True", self._fold("_other_labels:!?abc"))
+        self.assertEqual("False", self._fold("_other_labels:?abc sample_id:3"))
+        self.assertEqual("Condition('sample_id' : '3')", self._fold("_other_labels:!?abc sample_id:3"))
+        self.assertEqual("True", self._fold("_other_labels:?abc OR NOT _other_labels:?x"))

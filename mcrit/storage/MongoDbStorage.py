@@ -1,5 +1,6 @@
 import contextlib
 import datetime
+import functools
 import hashlib
 import json
 import logging
@@ -8,6 +9,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
@@ -23,7 +25,7 @@ from gridfs.errors import FileExists
 from packaging import version
 from picblocks.blockhasher import BlockHasher
 from pymongo import MongoClient, UpdateMany, UpdateOne
-from pymongo.errors import BulkWriteError, DocumentTooLarge, ExecutionTimeout, OperationFailure
+from pymongo.errors import BulkWriteError, DocumentTooLarge, ExecutionTimeout, OperationFailure, PyMongoError
 from smda.common.BinaryInfo import BinaryInfo
 from smda.common.SmdaFunction import SmdaFunction
 from smda.SmdaConfig import SmdaConfig
@@ -44,7 +46,7 @@ from mcrit.libs.utility import decode_two_complement, encode_two_complement
 from mcrit.minhash.MinHash import MinHash
 from mcrit.minhash.MinHasher import MINHASH_SHINGLER_REVISION, SHINGLER_REVISION_SINCE
 from mcrit.storage.FamilyEntry import FamilyEntry
-from mcrit.storage.FunctionEntry import FunctionEntry, smdaFunctionFromXcfg
+from mcrit.storage.FunctionEntry import OTHER_LABELS_FIELD, FunctionEntry, otherLabels, smdaFunctionFromXcfg
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
 from mcrit.storage.MatchingCache import MatchingCache
 from mcrit.storage.SampleEntry import SampleEntry
@@ -141,7 +143,10 @@ class MongoSearchTranspiler(BaseVisitor):
     def _may_match(term: str, value: str) -> bool:
         # A superset of what MongoDB's case-insensitive regex matches: its folding (PCRE's) differs
         # from Python's for a few characters, such as the dotted capital I, which Python's re folds
-        # to "i" and PCRE does not. The $regex the $in is paired with decides.
+        # to "i" and PCRE does not. The $regex the $in is paired with decides. Both fold ASCII alike,
+        # and nearly every label is ASCII: that test alone is a third of the cost (#301).
+        if term.isascii() and value.isascii():
+            return term.lower() in value.lower()
         return term.lower() in value.lower() or term.upper() in value.upper() or term.casefold() in value.casefold()
 
     @staticmethod
@@ -253,6 +258,17 @@ def _conditionFields(tree: NodeType) -> Set[str]:
     return set()
 
 
+def _fieldConditions(tree: NodeType, field: str) -> List[SearchConditionNode]:
+    """The (resolved) tree's conditions on the field."""
+    if isinstance(tree, SearchConditionNode):
+        return [tree] if tree.field == field else []
+    if isinstance(tree, (AndNode, OrNode)):
+        return [condition for child in tree.children for condition in _fieldConditions(child, field)]
+    if isinstance(tree, NotNode):
+        return _fieldConditions(tree.child, field)
+    return []
+
+
 def _substringTerms(tree: NodeType, field: str, operator: str) -> Set[str]:
     """The distinct terms of the (resolved) tree's substring conditions on the field."""
     if isinstance(tree, SearchConditionNode):
@@ -262,6 +278,63 @@ def _substringTerms(tree: NodeType, field: str, operator: str) -> Set[str]:
     if isinstance(tree, NotNode):
         return _substringTerms(tree.child, field, operator)
     return set()
+
+
+def _foldOtherLabels(tree: NodeType) -> Union[NodeType, bool]:
+    """The (resolved) tree as it holds for a function without OTHER_LABELS_FIELD: its conditions on
+    that field folded into the constants they are for a missing field, True or False when the
+    whole tree is one. A regex or a comparison never matches a missing field, a negated one always
+    does, as in MongoDB."""
+    if isinstance(tree, SearchConditionNode):
+        if tree.field == OTHER_LABELS_FIELD:
+            return tree.operator in ("!?", "!=")
+        return tree
+    if isinstance(tree, (AndNode, OrNode)):
+        is_and = isinstance(tree, AndNode)
+        children = []
+        for child in tree.children:
+            folded = _foldOtherLabels(child)
+            if isinstance(folded, bool):
+                if folded != is_and:
+                    # a False in an and, a True in an or decides it
+                    return folded
+                continue
+            children.append(folded)
+        if not children:
+            return is_and
+        if len(children) == 1:
+            return children[0]
+        return AndNode(children) if is_and else OrNode(children)
+    return tree
+
+
+def _sortValue(value: Any) -> Tuple[int, Any]:
+    """MongoDB's order of the values a function search sorts by: a missing value or null first,
+    then numbers, then strings (compared by code point, as MongoDB compares their UTF-8 bytes)."""
+    if value is None:
+        return (0, 0)
+    if isinstance(value, bool):
+        return (3, value)
+    if isinstance(value, (int, float)):
+        return (1, value)
+    if isinstance(value, str):
+        return (2, value)
+    return (4, str(value))
+
+
+def _sortedDocuments(documents: List[Dict], sort_list: Optional[List[Tuple[str, int]]]) -> List[Dict]:
+    """The documents in the order MongoDB sorts them by the sort list, which ends in a unique field."""
+    if not sort_list:
+        return documents
+
+    def compare(first: Dict, second: Dict) -> int:
+        for field, direction in sort_list:
+            first_value, second_value = _sortValue(first.get(field)), _sortValue(second.get(field))
+            if first_value != second_value:
+                return direction if first_value > second_value else -direction
+        return 0
+
+    return sorted(documents, key=functools.cmp_to_key(compare))
 
 
 def _hasSubstringCondition(tree: NodeType, field: str, operators: Tuple[str, ...] = ("?", "!?")) -> bool:
@@ -306,7 +379,10 @@ class MongoDbStorage(StorageInterface):
     # the 16 MiB a distinct can answer, past which the labels fall back to the regex after all; the
     # $in stays within _DISTINCT_VALUES_MAX_BYTES because the transpiler only uses the matching
     # values up to that size.
-    _DISTINCT_VALUES_IN_ARRAYS = ("function_labels.function_label",)
+    # The labels that differ from a function's name (#301), which a plain term matches besides the
+    # name, are listed the same way: a few hundred values on a real corpus, listed in about a
+    # millisecond from their sparse index.
+    _DISTINCT_VALUES_IN_ARRAYS = ("function_labels.function_label", OTHER_LABELS_FIELD)
     # A search of nothing but label conditions with a "?" among them is first tried as the regex
     # walking the sort order, for this long: a term that many labels match fills its page within a
     # few milliseconds that way (5-35 ms over 250,000 functions), where listing the labels costs
@@ -316,7 +392,43 @@ class MongoDbStorage(StorageInterface):
     _LABEL_PROBE_TIME_MS = 50
     # an inline `_xcfg` (a corpus migrate_xcfg_split has not run on) is left on the server: a search
     # result carries no disassembly, as it never did once the blobs were split out
-    _FUNCTION_SEARCH_PROJECTION = {"_id": 0, "_xcfg": 0}
+    _FUNCTION_SEARCH_PROJECTION = {"_id": 0, "_xcfg": 0, OTHER_LABELS_FIELD: 0}
+    # The update stage that derives OTHER_LABELS_FIELD from the document it updates (#301): the
+    # distinct label strings other than function_name, the field removed when there are none, so its
+    # sparse index holds only renamed or user-labelled functions. Every write that changes a
+    # function's labels or its name runs it in the same update, so the field follows the document
+    # as written, however writes interleave; an insert sets it from FunctionEntry's otherLabels.
+    _OTHER_LABELS_STAGE = {
+        "$set": {
+            OTHER_LABELS_FIELD: {
+                "$let": {
+                    "vars": {
+                        "others": {
+                            "$setDifference": [
+                                {"$filter": {"input": {"$ifNull": ["$function_labels.function_label", []]}, "cond": {"$eq": [{"$type": "$$this"}, "string"]}}},
+                                [{"$ifNull": ["$function_name", None]}],
+                            ]
+                        }
+                    },
+                    "in": {"$cond": [{"$gt": [{"$size": "$$others"}, 0]}, "$$others", "$$REMOVE"]},
+                }
+            }
+        }
+    }
+    # settings flag: every labelled function carries OTHER_LABELS_FIELD as its labels and name say.
+    # Set for an empty database, by the startup backfill and by migrate_other_labels; until then a
+    # plain term finds a function by a label other than its name only once a write touched it.
+    _OTHER_LABELS_SETTING = "other_labels_complete"
+    # A database upgrading into #301 fills OTHER_LABELS_FIELD on startup when it has at most this many
+    # labelled functions: one server-side update over them, 0.74 s for 87,700 of 250,000 functions
+    # here. A larger corpus is left to migrate_other_labels, and startup logs that it is due.
+    _OTHER_LABELS_STARTUP_MAX = 100_000
+    # where mcrit.migrations.migrate_other_labels keeps its progress
+    _OTHER_LABELS_MIGRATION_STATE = "other_labels_migration_state"
+    # settings counter: bumped after every write that can change which other labels exist (a rename,
+    # a label, an insert of functions with other labels, a deletion of functions, the fill and the
+    # migration), so that each process lists them again only after one, in whichever process it was
+    _OTHER_LABELS_VERSION_SETTING = "other_labels_version"
     # Inverted index over picblockhashes: {_id: <block hash>, sample_ids: [<sample_id>, ...]}.
     # getUniqueBlocks only ever asks "does this block hash occur outside the requested samples?",
     # so the sample list is all it needs - deliberately not function ids or offsets, which would
@@ -381,6 +493,19 @@ class MongoDbStorage(StorageInterface):
         # of it), for the fields of _DISTINCT_VALUES_IN_ARRAYS: a search with too many terms to test
         # against that many values skips the listing for _OVER_CAP_TTL seconds
         self._distinct_count_since: Dict[Tuple[str, str], Tuple[int, float]] = {}
+        # (settings.other_labels_version it was listed at, the distinct other labels): a plain term
+        # reads the version and lists them only when it moved (#301)
+        self._other_labels_listing: Optional[Tuple[int, List[Any]]] = None
+        # time.monotonic() at which they could not be listed: not tried again for _OVER_CAP_TTL
+        # seconds, whatever writes there are meanwhile
+        self._other_labels_unlisted_since: Optional[float] = None
+        # (term as matched) -> (the version of the listing, the other labels of it a "?" with the
+        # term may match), least recently used first, so a repeated term skips testing every label;
+        # dropped as a whole when the version moves (_otherLabelsMatchingTerm). The lock guards it:
+        # the server shares this object across its request threads (#109).
+        self._other_label_matches: OrderedDict[str, Tuple[int, List[str]]] = OrderedDict()
+        self._other_label_matches_version: Optional[int] = None
+        self._other_label_matches_lock = threading.Lock()
 
     def _getDb(self):
         # because of gunicorn and forking workers, we want to delay creation of MongoClient until actual usage and avoid it within __init__()
@@ -466,6 +591,8 @@ class MongoDbStorage(StorageInterface):
                 self._setBandDfIndexComplete(True)
             if not self.isPicHashCountIndexComplete():
                 self._setPicHashCountIndexComplete(True)
+            if not self.isOtherLabelsComplete():
+                self._setOtherLabelsComplete(True)
         self._getDb()["samples"].create_index("sample_id")
         self._getDb()["samples"].create_index("sha256")
         self._getDb()["samples"].create_index("family_id")
@@ -491,6 +618,9 @@ class MongoDbStorage(StorageInterface):
         # the qualified label search (findFunctionByString); sparse, as only named or labelled functions carry
         # labels, and a query for label values never asks for the functions without one
         self._getDb()["functions"].create_index("function_labels.function_label", sparse=True)
+        # the labels that differ from the name, which a plain term matches as well (#301); sparse, as
+        # only renamed or user-labelled functions have any, typically a few hundred
+        self._getDb()["functions"].create_index(OTHER_LABELS_FIELD, sparse=True)
         self._getDb()["functions"].create_index("_pichash")
         self._getDb()["functions"].create_index("_picblockhashes.hash")
         # Searches sorted by a field other than the id (fkie-cad/mcritweb#59): the search cursor sorts by that
@@ -553,6 +683,105 @@ class MongoDbStorage(StorageInterface):
             self._updateDbState()
         stored_unknown_family = self.getFamily(0)
         assert stored_unknown_family is not None and stored_unknown_family.family_name == ""
+        # last, and never fatal: a failed fill (_ensureOtherLabels) leaves the flag unset rather
+        # than this process without the setup above
+        try:
+            self._ensureOtherLabels()
+        except Exception:
+            LOGGER.exception("Could not derive the labels other than their name of the labelled functions (#301); see migrate_other_labels.")
+
+    def isOtherLabelsComplete(self) -> bool:
+        """Whether every labelled function carries OTHER_LABELS_FIELD (#301): a plain search term
+        finds a function by a label other than its name only where it does."""
+        settings_document = self._getDb().settings.find_one({}, {self._OTHER_LABELS_SETTING: 1})
+        return bool(settings_document and settings_document.get(self._OTHER_LABELS_SETTING))
+
+    def _setOtherLabelsComplete(self, is_complete: bool) -> None:
+        self._getDb().settings.update_one({}, {"$set": {self._OTHER_LABELS_SETTING: bool(is_complete)}})
+
+    def _otherLabelsVersion(self) -> int:
+        settings_document = self._getDb().settings.find_one({}, {self._OTHER_LABELS_VERSION_SETTING: 1})
+        return int((settings_document or {}).get(self._OTHER_LABELS_VERSION_SETTING, 0))
+
+    def _bumpOtherLabelsVersionFor(self, function_documents: List[Dict]) -> None:
+        """After inserting these functions: a bump only when one of them has other labels."""
+        if any(OTHER_LABELS_FIELD in document for document in function_documents):
+            self._bumpOtherLabelsVersion()
+
+    def _bumpOtherLabelsVersion(self) -> None:
+        """After a write that can change which other labels exist: every process lists them anew."""
+        self._getDb().settings.update_one({}, {"$inc": {self._OTHER_LABELS_VERSION_SETTING: 1}})
+
+    # database name -> time.monotonic() at which this process found it due for migrate_other_labels:
+    # it neither counts nor says so again for _OVER_CAP_TTL seconds
+    _other_labels_due_since: Dict[str, float] = {}
+    # settings field holding when a process last found the database due, so that the processes
+    # SpawningWorker starts for each job skip the count and the warning as well
+    _OTHER_LABELS_DUE_SETTING = "other_labels_due_at"
+
+    def _ensureOtherLabels(self) -> None:
+        """Fill OTHER_LABELS_FIELD on a database upgrading into #301, when that is cheap.
+
+        Runs on every storage construction, so once the flag is set it costs one read of the
+        settings. Before, it counts the labelled functions up to _OTHER_LABELS_STARTUP_MAX through
+        their sparse index (about 60 ms at the cap) and fills the field with one server-side update
+        when there are no more, which is idempotent, so processes starting together may each run it.
+        A larger corpus is left to migrate_other_labels: startup would take seconds to minutes. That
+        verdict is kept for _OVER_CAP_TTL seconds, in this process and in the settings, so neither a
+        restart nor a job SpawningWorker starts pays the count again or repeats the warning.
+        """
+        settings_document = self._getDb().settings.find_one({}, {self._OTHER_LABELS_SETTING: 1, self._OTHER_LABELS_DUE_SETTING: 1}) or {}
+        if settings_document.get(self._OTHER_LABELS_SETTING):
+            return
+        db_name = self._getDb().name
+        due_since = self._other_labels_due_since.get(db_name)
+        if due_since is not None and time.monotonic() - due_since < self._OVER_CAP_TTL:
+            return
+        now = self._getCurrentTimestamp()
+        due_at = settings_document.get(self._OTHER_LABELS_DUE_SETTING)
+        if isinstance(due_at, datetime.datetime) and now - due_at < datetime.timedelta(seconds=self._OVER_CAP_TTL):
+            # another process found it due a moment ago, and said so
+            self._other_labels_due_since[db_name] = time.monotonic()
+            return
+        labelled = {"function_labels.function_label": {"$exists": True}}
+        num_labelled = self._getDb().functions.count_documents(labelled, limit=self._OTHER_LABELS_STARTUP_MAX + 1)
+        if num_labelled > self._OTHER_LABELS_STARTUP_MAX:
+            if self._noteOtherLabelsDue(db_name, due_at, now):
+                LOGGER.warning(
+                    "More than %d functions carry labels: a plain search term finds a function by a label other than its name only once "
+                    "python -m mcrit.migrations.migrate_other_labels has run on this database (#301). Until then it finds only "
+                    "the functions renamed or labelled since this upgrade; the qualified field function_labels.function_label finds all.",
+                    self._OTHER_LABELS_STARTUP_MAX,
+                )
+            return
+        started = time.monotonic()
+        try:
+            result = self._getDb().functions.update_many(labelled, [self._OTHER_LABELS_STAGE])
+        except PyMongoError as error:
+            # such as one function whose document cannot grow (10334): the functions written before
+            # it keep the field, the others are the migration's, and no start tries again for a while
+            self._bumpOtherLabelsVersion()
+            if self._noteOtherLabelsDue(db_name, due_at, now):
+                LOGGER.error(
+                    "Could not derive the labels other than their name of the labelled functions (#301): %s. Run "
+                    "python -m mcrit.migrations.migrate_other_labels --mode apply, which passes over and reports the functions it cannot update.",
+                    error,
+                )
+            return
+        self._bumpOtherLabelsVersion()
+        self._setOtherLabelsComplete(True)
+        LOGGER.info(
+            "Derived the labels other than their name for %d of %d labelled functions in %.1f s (#301).", result.modified_count, result.matched_count, time.monotonic() - started
+        )
+
+    def _noteOtherLabelsDue(self, db_name: str, due_at: Any, now: datetime.datetime) -> bool:
+        """Records that the database is due for migrate_other_labels, in this process and in the
+        settings; True for the one process of those starting together that is to say so."""
+        self._other_labels_due_since[db_name] = time.monotonic()
+        noted = self._getDb().settings.update_one(
+            {"$or": [{self._OTHER_LABELS_DUE_SETTING: due_at}, {self._OTHER_LABELS_DUE_SETTING: {"$exists": False}}]}, {"$set": {self._OTHER_LABELS_DUE_SETTING: now}}
+        )
+        return bool(noted.modified_count)
 
     def _removeCounterDuplicates(self) -> None:
         # one-off cleanup for #105: releases before 1.6.2 upserted a fresh {name, value: 1} document on every
@@ -942,11 +1171,30 @@ class MongoDbStorage(StorageInterface):
     def _encodeFunction(function_dict: Dict, delete_old: bool = True) -> None:
         MongoDbStorage._encodePichash(function_dict, delete_old=delete_old)
         MongoDbStorage._encodeXcfg(function_dict, delete_old=delete_old)
+        MongoDbStorage._encodeOtherLabels(function_dict)
 
     @staticmethod
     def _decodeFunction(function_dict: Dict, delete_old: bool = True) -> None:
         MongoDbStorage._decodePichash(function_dict, delete_old=delete_old)
         MongoDbStorage._decodeXcfg(function_dict, delete_old=delete_old)
+        # storage-only, derived from the labels: never part of a FunctionEntry
+        function_dict.pop(OTHER_LABELS_FIELD, None)
+
+    @staticmethod
+    def _encodeOtherLabels(function_dict: Dict) -> None:
+        """Derive OTHER_LABELS_FIELD for a function document about to be inserted (#301)."""
+        labels = [label.get("function_label") for label in function_dict.get("function_labels") or [] if isinstance(label, dict)]
+        others = otherLabels(function_dict.get("function_name"), labels)
+        if others:
+            function_dict[OTHER_LABELS_FIELD] = others
+        else:
+            function_dict.pop(OTHER_LABELS_FIELD, None)
+
+    @classmethod
+    def _pushLabelUpdate(cls, label: FunctionLabelEntry) -> List[Dict]:
+        """An update appending the label, as $push does, and deriving OTHER_LABELS_FIELD anew."""
+        appended = {"$concatArrays": [{"$ifNull": ["$function_labels", []]}, [{"$literal": label.toDict()}]]}
+        return [{"$set": {"function_labels": appended}}, cls._OTHER_LABELS_STAGE]
 
     ###############################################################################
     # Interface
@@ -1028,6 +1276,7 @@ class MongoDbStorage(StorageInterface):
         # remove functions
         self._deleteXcfgForFunctionIds([function_minhash["function_id"] for function_minhash in function_minhashes])
         num_functions_deleted = self._getDb().functions.delete_many({"sample_id": sample_id}).deleted_count
+        self._bumpOtherLabelsVersion()
         # remove sample
         # the report's extras before the sample document, as for a query sample: an interrupted
         # deletion leaves a sample to delete again, never extras nothing refers to (#94)
@@ -1230,13 +1479,17 @@ class MongoDbStorage(StorageInterface):
             return False
         if "function_name" in update_information:
             function_name = update_information["function_name"]
-            self._getDb().functions.update_one({"function_id": function_id}, {"$set": {"function_name": function_name}})
+            # the labels that differ from the name follow the rename in the same update (#301); a
+            # name is a literal here, where a "$" would otherwise make it a field path
+            rename = [{"$set": {"function_name": {"$literal": function_name}}}, self._OTHER_LABELS_STAGE]
+            self._getDb().functions.update_one({"function_id": function_id}, rename)
             if function_name:
                 # the "not yet labelled so by this user" check is part of the update's filter,
                 # so two concurrent identical requests cannot both push the label
                 label_username = username or "anonymous"
                 not_yet_labelled = {"function_id": function_id, "function_labels": {"$not": {"$elemMatch": {"username": label_username, "function_label": function_name}}}}
-                self._getDb().functions.update_one(not_yet_labelled, {"$push": {"function_labels": FunctionLabelEntry(function_name, label_username).toDict()}})
+                self._getDb().functions.update_one(not_yet_labelled, self._pushLabelUpdate(FunctionLabelEntry(function_name, label_username)))
+            self._bumpOtherLabelsVersion()
         return True
 
     def modifyFamily(self, family_id: int, update_information: dict) -> bool:
@@ -1673,6 +1926,7 @@ class MongoDbStorage(StorageInterface):
             "sample_binaries.chunks",
             self._PICHASH_COUNT_COLLECTION,
             self._FUNCTION_RANGE_COLLECTION,
+            self._OTHER_LABELS_MIGRATION_STATE,
         ]
         for band_id in range(self._storage_config.STORAGE_NUM_BANDS):
             collections.append("band_%d" % band_id)
@@ -1681,6 +1935,9 @@ class MongoDbStorage(StorageInterface):
         # an emptied corpus is under every cap again; other processes simply wait out the TTL
         self._over_cap_since.clear()
         self._distinct_count_since.clear()
+        self._other_labels_unlisted_since = None
+        # the settings outlive a clear: other processes learn of it from the version
+        self._bumpOtherLabelsVersion()
         self._ensureIndexAndUnknownFamily()
 
     def getSampleBySha256(self, sha256: str, is_query=False) -> Optional["SampleEntry"]:
@@ -1721,7 +1978,7 @@ class MongoDbStorage(StorageInterface):
             # match by function_id or offset and add the label if it had not existed before.
             if is_new_label:
                 new_function_entry_label = FunctionLabelEntry(extracted_label, username)
-                update_command = {"$push": {"function_labels": new_function_entry_label.toDict()}}
+                update_command = self._pushLabelUpdate(new_function_entry_label)
                 # as modifyFunction does: the "not yet labelled so by this user" check is part of the
                 # filter, and a function deleted meanwhile is not recreated as a bare label document
                 not_yet_labelled = {
@@ -1731,6 +1988,7 @@ class MongoDbStorage(StorageInterface):
                 label_updates.append(UpdateOne(not_yet_labelled, update_command))
         if label_updates:
             self._getDb().functions.bulk_write(label_updates, ordered=False)
+            self._bumpOtherLabelsVersion()
 
     def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False) -> Optional["SampleEntry"]:
         assert smda_report.sha256 is not None
@@ -1764,6 +2022,7 @@ class MongoDbStorage(StorageInterface):
                         function_dicts.append(self._getFunctionDocument(sample_entry, smda_function, function_id))
                     self._insertXcfgDocuments(function_dicts)
                     self._dbInsertMany("functions", function_dicts)
+                    self._bumpOtherLabelsVersionFor(function_dicts)
                 except Exception:
                     # a sample whose functions could not all be written would stay without them, and
                     # every resubmission of the report would be answered that it exists already
@@ -1803,6 +2062,7 @@ class MongoDbStorage(StorageInterface):
         try:
             self._insertXcfgDocuments([function_dict])
             self._dbInsert("functions", function_dict)
+            self._bumpOtherLabelsVersionFor([function_dict])
         except Exception:
             self._discardFunctions([function_entry.function_id])
             raise
@@ -1827,6 +2087,7 @@ class MongoDbStorage(StorageInterface):
         try:
             self._insertXcfgDocuments(functions_as_dicts)
             self._dbInsertMany("functions", functions_as_dicts)
+            self._bumpOtherLabelsVersionFor(functions_as_dicts)
         except Exception:
             # none of them, rather than the ones before the document that failed
             self._discardFunctions(function_ids)
@@ -1850,6 +2111,7 @@ class MongoDbStorage(StorageInterface):
         self._deleteXcfgForFunctionIds(function_ids)
         for offset in range(0, len(function_ids), 10000):
             self._getDb().functions.delete_many({"function_id": {"$in": function_ids[offset : offset + 10000]}})
+        self._bumpOtherLabelsVersion()
 
     def discardImportedSample(self, sample_entry: "SampleEntry") -> None:
         sample_id = sample_entry.sample_id
@@ -3947,6 +4209,8 @@ class MongoDbStorage(StorageInterface):
         _OVER_CAP_TTL seconds, so a large corpus pays for the capped scan once, not per search.
         max_time_ms replaces the search time limit for a scan that has only part of it; running out
         of that is the same verdict: the listing is too slow for the limit searches have."""
+        if field == OTHER_LABELS_FIELD:
+            return self._getOtherLabels(max_time_ms)
         if self._isOverCap(collection, field):
             return None
         try:
@@ -3958,6 +4222,41 @@ class MongoDbStorage(StorageInterface):
             self._over_cap_since[(collection, field)] = time.monotonic()
         elif field in self._DISTINCT_VALUES_IN_ARRAYS:
             self._distinct_count_since[(collection, field)] = (len(values), time.monotonic())
+        return values
+
+    def _getOtherLabels(self, max_time_ms: Optional[int] = None) -> Optional[List[Any]]:
+        """The distinct other labels (#301), listed again only when settings.other_labels_version
+        moved since this process last listed them: a search reads one small document instead of
+        listing them (2 ms for 500, 55 ms for 22,000). None - the search is then done without them -
+        when they exceed the 16 MiB a distinct answers, the time limit or the values a search may
+        test (MongoSearchTranspiler._MAX_VALUE_TESTS), a verdict kept for _OVER_CAP_TTL seconds
+        whatever the version does, as each try may cost the whole time limit. Their size is not
+        capped otherwise: the $in and $nin a search builds hold only the ones its terms match, which
+        _matchingOtherLabels bounds.
+
+        The version is read before the listing, so a write that lands meanwhile has the next search
+        list again; one that lands after the listing but before its bump goes unseen by searches
+        until the bump, as it would without the cache.
+        """
+        unlisted_since = self._other_labels_unlisted_since
+        if unlisted_since is not None and time.monotonic() - unlisted_since < self._OVER_CAP_TTL:
+            return None
+        version = self._otherLabelsVersion()
+        held = self._other_labels_listing
+        if held is not None and held[0] == version:
+            return held[1]
+        try:
+            values = self._scanDistinctValues("functions", OTHER_LABELS_FIELD, max_time_ms or self._getSearchMaxTimeMS())
+        except ExecutionTimeout:
+            values = None
+        if values is None or len(values) > MongoSearchTranspiler._MAX_VALUE_TESTS:
+            self._other_labels_unlisted_since = time.monotonic()
+            return None
+        self._other_labels_unlisted_since = None
+        # a thread that read an older version than another one's listing leaves that in place
+        held = self._other_labels_listing
+        if held is None or held[0] < version:
+            self._other_labels_listing = (version, values)
         return values
 
     def _lastDistinctCount(self, collection: str, field: str) -> Optional[int]:
@@ -4145,20 +4444,162 @@ class MongoDbStorage(StorageInterface):
             query = MongoSearchTranspiler().visit(full_tree)
         return list(self._getDb().functions.find(query, self._FUNCTION_SEARCH_PROJECTION, sort=sort_list, limit=max_num_results, max_time_ms=self._remainingMS(deadline)))
 
+    # what a plain search term matches: the name, and the labels that differ from it (#301)
+    _PLAIN_FUNCTION_SEARCH_FIELDS = ["function_name", OTHER_LABELS_FIELD]
+
+    def _findFunctionsByNameOrOtherLabel(self, full_tree: NodeType, sort_list, max_num_results: int) -> List[Dict]:
+        """A search with a plain term, which matches function_name or OTHER_LABELS_FIELD (#301).
+
+        As one query, $or[name, other labels] costs a sort by name its bounded walk of the
+        (function_name, function_id) index: the name branch can no longer deliver the order, so
+        MongoDB reads every name the term matches and sorts them (4.7 -> 98-167 ms for a common term
+        over 250,000 functions). Instead the functions are searched in two disjoint parts:
+
+        - those whose other labels the terms cannot match - nearly all, as most have none - by the
+          name query as before: the conditions on the field fold into what they are for a missing
+          field, and a $nin of the other labels the terms match keeps the rest out;
+        - those with such an other label by the whole tree, through the field's sparse index,
+          bounded to these labels by the hint and an $in.
+
+        The page is the first max_num_results of both pages merged in the sort order, as the $or
+        would give it. The other labels are listed for that once per change to them in any process
+        (_getOtherLabels); when they cannot be (past the time limit or 16 MiB), or a condition on the field is not a
+        substring one, the second part is every function with other labels.
+        """
+        max_time_ms = self._getSearchMaxTimeMS()
+        # one listing per field for both queries: the names (#76), and the other labels for the $in
+        # that bounds a "?" on them to the matching keys of their index (#302)
+        known_values = self._list_known_values(full_tree, {"function_name": "functions", OTHER_LABELS_FIELD: "functions"})
+        matching_other_labels = self._matchingOtherLabels(full_tree, known_values)
+        if matching_other_labels is None:
+            apart: Dict[str, Any] = {"$exists": True}
+            not_apart: Optional[Dict[str, Any]] = {OTHER_LABELS_FIELD: {"$exists": False}}
+        else:
+            apart = {"$in": matching_other_labels}
+            not_apart = {OTHER_LABELS_FIELD: {"$nin": matching_other_labels}} if matching_other_labels else None
+        function_documents: List[Dict] = []
+        tree_without_other_labels = _foldOtherLabels(full_tree)
+        if tree_without_other_labels is not False:
+            conditions = [] if tree_without_other_labels is True else [MongoSearchTranspiler(known_values).visit(tree_without_other_labels)]
+            conditions += [not_apart] if not_apart else []
+            query = conditions[0] if len(conditions) == 1 else {"$and": conditions} if conditions else {}
+            function_documents.extend(self._getDb().functions.find(query, self._FUNCTION_SEARCH_PROJECTION, sort=sort_list, limit=max_num_results, max_time_ms=max_time_ms))
+        if matching_other_labels != []:
+            # The hint keeps MongoDB on the sparse index, whatever the other conditions would make it
+            # try. The few functions it reads are matched by the regex on the names rather than an $in
+            # of every name a common term matches, thousands the query would carry for nothing; the
+            # other labels are matched among the ones found to match.
+            other_labels_listed = known_values.get(OTHER_LABELS_FIELD) if matching_other_labels is None else matching_other_labels
+            transpiler = MongoSearchTranspiler({} if other_labels_listed is None else {OTHER_LABELS_FIELD: other_labels_listed})
+            query = {"$and": [transpiler.visit(full_tree), {OTHER_LABELS_FIELD: apart}]}
+            # only their sort keys at first: a function document is large (100 of them take 2.6 ms
+            # to fetch), and the merge keeps few of them as a rule
+            key_projection = {"_id": 0, "function_id": 1, **{field: 1 for field, _ in sort_list or []}}
+            keys = list(self._getDb().functions.find(query, key_projection, sort=sort_list, limit=max_num_results, max_time_ms=max_time_ms, hint=[(OTHER_LABELS_FIELD, 1)]))
+            if keys:
+                keyed = {id(key) for key in keys}
+                page = _sortedDocuments(function_documents + keys, sort_list)[:max_num_results]
+                wanted = [document["function_id"] for document in page if id(document) in keyed]
+                fetched = {}
+                if wanted:
+                    found = self._getDb().functions.find({"function_id": {"$in": wanted}}, self._FUNCTION_SEARCH_PROJECTION, max_time_ms=max_time_ms)
+                    fetched = {document["function_id"]: document for document in found}
+                function_documents = []
+                for document in page:
+                    if id(document) in keyed:
+                        # a function deleted in between is left out
+                        document = fetched.get(document["function_id"])
+                    if document is not None:
+                        function_documents.append(document)
+        return function_documents[:max_num_results]
+
+    def _matchingOtherLabels(self, full_tree: NodeType, known_values: Dict[str, List[Any]]) -> Optional[List[str]]:
+        """The listed other labels that the tree's terms on OTHER_LABELS_FIELD may match, a superset of
+        what MongoDB's regex matches (MongoSearchTranspiler._may_match); a function whose other labels
+        are none of them meets every such condition as a function without the field does. None when
+        that cannot be told: a condition on the field that is not a substring one, the labels not
+        listed, or more of them than one query takes."""
+        conditions = _fieldConditions(full_tree, OTHER_LABELS_FIELD)
+        if any(condition.operator not in ("?", "!?") or not isinstance(condition.value, str) for condition in conditions):
+            return None
+        values = known_values.get(OTHER_LABELS_FIELD)
+        if values is None and not _hasSubstringCondition(full_tree, OTHER_LABELS_FIELD, ("?",)):
+            # listed for a "?" only (_list_known_values), whose None stands; a "!?" alone lists them here
+            values = self._getDistinctValues("functions", OTHER_LABELS_FIELD)
+        terms = {condition.value for condition in conditions}
+        if values is None or len(values) * len(terms) > MongoSearchTranspiler._MAX_VALUE_TESTS:
+            return None
+        if len(terms) == 1:
+            matching = self._otherLabelsMatchingTerm(next(iter(terms)), values)
+        else:
+            # a label several terms match is listed once
+            matching = list(dict.fromkeys(value for term in sorted(terms) for value in self._otherLabelsMatchingTerm(term, values)))
+        if sum(len(value.encode("utf-8")) for value in matching) > self._DISTINCT_VALUES_MAX_BYTES:
+            return None
+        return matching
+
+    # how many terms' matches a process keeps per listing of the other labels
+    _OTHER_LABEL_MATCHES_MAX = 256
+
+    def _otherLabelsMatchingTerm(self, term: str, values: List[Any]) -> List[str]:
+        """The other labels among values that a "?" with term may match, kept per term for as long as
+        values is the listing _getOtherLabels holds: a search repeating a term reads the counter and
+        nothing else. An ASCII term matches the same labels in any case (the regex ignores it, and
+        _may_match folds an ASCII term to the same strings), so it is kept lowercase.
+
+        The labels are tested outside the lock, and kept only when values is still the held listing
+        then: a thread holding a listing another one has replaced meanwhile keeps nothing."""
+        key = term.lower() if term.isascii() else term
+        listing = self._other_labels_listing
+        if listing is None or listing[1] is not values:
+            return self._scanOtherLabelsMatchingTerm(key, values)
+        version = listing[0]
+        with self._other_label_matches_lock:
+            kept = self._other_label_matches.get(key)
+            if kept is not None and kept[0] == version:
+                self._other_label_matches.move_to_end(key)
+                return kept[1]
+        matching = self._scanOtherLabelsMatchingTerm(key, values)
+        with self._other_label_matches_lock:
+            if self._other_labels_listing is listing:
+                if self._other_label_matches_version != version:
+                    self._other_label_matches.clear()
+                    self._other_label_matches_version = version
+                self._other_label_matches[key] = (version, matching)
+                self._other_label_matches.move_to_end(key)
+                while len(self._other_label_matches) > self._OTHER_LABEL_MATCHES_MAX:
+                    self._other_label_matches.popitem(last=False)
+        return matching
+
+    @staticmethod
+    def _scanOtherLabelsMatchingTerm(term: str, values: List[Any]) -> List[str]:
+        # matched as the transpiler lists a "?" on the labels (#302): the regex, or _may_match for
+        # what MongoDB's case folding may match besides, which for ASCII is the same
+        pattern = re.compile(re.escape(term), re.IGNORECASE)
+        if term.isascii():
+            return [
+                value
+                for value in values
+                if isinstance(value, str) and (pattern.search(value) is not None or (not value.isascii() and MongoSearchTranspiler._may_match(term, value)))
+            ]
+        return [value for value in values if isinstance(value, str) and (pattern.search(value) is not None or MongoSearchTranspiler._may_match(term, value))]
+
     def findFunctionByString(self, search_tree: NodeType, cursor: Optional[FullSearchCursor] = None, max_num_results: int = 100) -> Dict[int, "FunctionEntry"]:
         result_dict = {}
         with self._searchTimeLimit():
-            # a plain term matches the name only: or-ing in the labels cost a sort by name its bounded
-            # index path. The labels are searched with the qualified field "function_labels.function_label".
-            full_tree = self._resolve_search_tree(["function_name"], search_tree, cursor)
+            # a plain term matches the name and the labels that differ from it (#301); every label is
+            # searched with the qualified field "function_labels.function_label"
+            full_tree = self._resolve_search_tree(self._PLAIN_FUNCTION_SEARCH_FIELDS, search_tree, cursor)
             sort_list = self._get_sort_list_from_cursor(cursor)
-            search_fields = _conditionFields(self._resolve_search_tree(["function_name"], search_tree, None))
+            search_fields = _conditionFields(self._resolve_search_tree(self._PLAIN_FUNCTION_SEARCH_FIELDS, search_tree, None))
             if search_fields == {"function_labels.function_label"} and _hasSubstringCondition(full_tree, "function_labels.function_label", ("?",)):
                 function_documents = self._findFunctionsByLabels(full_tree, sort_list, max_num_results)
+            elif OTHER_LABELS_FIELD in search_fields:
+                function_documents = self._findFunctionsByNameOrOtherLabel(full_tree, sort_list, max_num_results)
             else:
                 # any other search is the query it always was: a hint or a listing would cost a
                 # condition on another field the plan MongoDB picks for it
-                query = self._get_search_query(["function_name"], search_tree, cursor, distinct_fields={"function_name": "functions"})
+                query = self._get_search_query(self._PLAIN_FUNCTION_SEARCH_FIELDS, search_tree, cursor, distinct_fields={"function_name": "functions"})
                 function_documents = self._getDb().functions.find(
                     query, self._FUNCTION_SEARCH_PROJECTION, sort=sort_list, limit=max_num_results, max_time_ms=self._getSearchMaxTimeMS()
                 )
