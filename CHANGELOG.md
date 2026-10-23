@@ -15,6 +15,14 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **Memory storage: substring search (`?`, `!?`) disagreed with MongoDB on values that are not
+  text (#293).** `!?` left out every entry whose field is missing or a number (`sample_id:!?0` found
+  nothing), where MongoDB's negated regex includes them all. `pichash:?…` and `timestamp:?…` never
+  matched, where MongoDB matches the hex digits and the text they are stored as, and a list such as
+  a family's `actors` never matched, where MongoDB matches it when one of its elements does.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

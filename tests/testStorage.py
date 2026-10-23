@@ -20,7 +20,7 @@ from mcrit.index.SearchQueryParser import SearchQueryParser
 from mcrit.minhash.MinHash import MinHash
 from mcrit.storage.FunctionEntry import FunctionEntry
 from mcrit.storage.MongoDbStorage import MongoDbStorage
-from mcrit.storage.SampleEntry import SampleEntry
+from mcrit.storage.SampleEntry import TIMESTAMP_FORMAT, SampleEntry
 from mcrit.storage.StorageFactory import StorageFactory
 
 from .context import getTestMongoServerAndPort
@@ -1021,6 +1021,45 @@ class MemoryStorageTest(TestCase):
         self.assertIsNotNone(self.storage.getSmdaExtras(sample_entry.sample_id))
         self.assertIsNone(self.storage.getSmdaExtras(query_entry.sample_id))
         self.assertTrue(all(sample_id >= 0 for sample_id in self.storage._smda_extras))
+
+    def testSubstringSearchOnNonStringFieldsAgreesWithMongoDb(self):
+        self.storage.clearStorage()
+        with open(self.example_file_path) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        self.storage.addSmdaReport(report)
+
+        def search(term):
+            cursor = FullSearchCursor(None, [("function_id", True)])
+            return sorted(self.storage.findFunctionByString(SearchQueryParser().parse(term), cursor=cursor, max_num_results=1000))
+
+        all_ids = search("function_id:>=0")
+        self.assertTrue(all_ids)
+        # a number is not text: "?" never finds it, "!?" always does
+        self.assertEqual([], search("sample_id:?0"))
+        self.assertEqual(all_ids, search("sample_id:!?0"))
+        self.assertEqual(all_ids, search("offset:!?zz"))
+        # a pichash is searched as the hex digits it is stored as
+        function_entry = self.storage.getFunctionById(all_ids[0])
+        assert function_entry is not None
+        digits = hex(function_entry.pichash)[2:10]
+        with_digits = search(f"pichash:?{digits}")
+        self.assertIn(function_entry.function_id, with_digits)
+        self.assertEqual(sorted(set(all_ids) - set(with_digits)), search(f"pichash:!?{digits}"))
+        self.assertEqual([], search("pichash:?zz"))
+        self.assertEqual(all_ids, search("pichash:!?zz"))
+        # a timestamp is searched as the text it is stored as
+        sample_entry = self.storage.getSampleById(function_entry.sample_id)
+        assert sample_entry is not None and sample_entry.timestamp is not None
+        sample_cursor = FullSearchCursor(None, [("sample_id", True)])
+        stamp = sample_entry.timestamp.strftime(TIMESTAMP_FORMAT)[:13]
+        self.assertEqual([sample_entry.sample_id], list(self.storage.findSampleByString(SearchQueryParser().parse(f"timestamp:?{stamp}"), cursor=sample_cursor)))
+        self.assertEqual([], list(self.storage.findSampleByString(SearchQueryParser().parse(f"timestamp:!?{stamp}"), cursor=sample_cursor)))
+        # a list matches when one of its elements does
+        self.storage.modifyFamily(sample_entry.family_id, {"actors": ["apt-zz", "other"]})
+        family_cursor = FullSearchCursor(None, [("family_id", True)])
+        self.assertEqual([sample_entry.family_id], list(self.storage.findFamilyByString(SearchQueryParser().parse("actors:?apt-z"), cursor=family_cursor)))
+        self.assertNotIn(sample_entry.family_id, self.storage.findFamilyByString(SearchQueryParser().parse("actors:!?apt-z"), cursor=family_cursor))
 
 
 @pytest.mark.mongo

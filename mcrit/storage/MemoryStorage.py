@@ -102,11 +102,20 @@ class MemorySearchTranspiler(BaseVisitor):
             regex = re.compile(re.escape(node.value), re.IGNORECASE)
             inverse = node.operator == "!?"
 
+            def matches(value):
+                # matched as MongoDB stores the value: a datetime as text, a pichash in hex
+                if isinstance(value, datetime.datetime):
+                    value = value.strftime(TIMESTAMP_FORMAT)
+                elif node.field == "pichash" and isinstance(value, int):
+                    value = hex(value)
+                # a regex never matches a missing or non-string value in MongoDB, so "!?" always does
+                return isinstance(value, str) and regex.search(value) is not None
+
             def check_regex(entry):
                 value = _get_field(entry, node.field)
-                if not isinstance(value, str):
-                    return False
-                return (regex.search(value) is not None) ^ inverse
+                # MongoDB matches a list when one of its elements matches
+                found = any(matches(element) for element in value) if isinstance(value, list) else matches(value)
+                return found ^ inverse
 
             return check_regex
 
