@@ -15,6 +15,26 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- **`QUEUE_TRANSIENT_JOB_RETENTION_SECONDS` (default 0, off) expires finished ingestion and
+  maintenance jobs (#294).** With a positive value, the queue clean-up deletes such jobs that
+  finished longer ago than that, then their GridFS result and file parameters; a pass deletes at
+  most 1,000, oldest first. Matching, query, cross compare, unique-block and
+  `getBandDfCutoffCoverage` jobs, unknown methods, and failed or terminated jobs are never expired
+  by it. At the default nothing is deleted, as before. A deleted job costs about 7 ms, so a full
+  1,000-job pass takes about 7 s on a local mongod. Queue start creates an index on `payload.method`
+  and `finished_at` for the clean-up query, which takes a moment on a large queue. `finished_at` is
+  naive local time, so keep the retention well above any clock or time zone offset between hosts. A
+  deployment that ships its own config modules needs the setting added; without it the default
+  applies.
+
+### Fixed
+
+- **The queue's `BaseRemoteCallerClass.awaitResult` returns `None` for a job that does not exist or
+  is deleted while it polls (#294)**, as it does for a failed or terminated one, instead of raising
+  `AttributeError`. `McritClient.awaitResult` is a different method and is unchanged.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

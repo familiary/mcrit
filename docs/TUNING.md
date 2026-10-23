@@ -379,6 +379,31 @@ machine; raising it buys nothing once the round trip has stopped mattering.
   a 4-core / 16 GiB host with mongod 7.0. The shape of the result - one-stage grows with the
   corpus, two-stage does not - is the finding; the absolute seconds are host-specific.
 
+## Expiring finished ingestion and maintenance jobs
+
+| setting | default | effect |
+|---|---|---|
+| `QUEUE_TRANSIENT_JOB_RETENTION_SECONDS` | `0` | delete finished ingestion and maintenance jobs, with their GridFS result and file parameters, this many seconds after they finished; `0` keeps them |
+| `QUEUE_CLEAN_INTERVAL` | `1200` | seconds each worker waits between queue cleanups, and so between expiry passes |
+
+`QUEUE_TRANSIENT_JOB_RETENTION_SECONDS` controls automatic removal of finished ingestion and
+maintenance jobs. It defaults to `0`, which disables job expiry; set it to `604800` to retain them
+for seven days. Only the known transient methods (sample submission (`addBinarySample`), updates,
+deletions, rebuilds, repairs and queue cleanup) expire. Matching, query, cross compare,
+unique-block, `getBandDfCutoffCoverage` and unknown future methods are not expired by queue cleanup.
+Query jobs may still be removed by `doDbCleanup` under `STORAGE_MONGODB_CLEANUP_TTL`. Failed and
+terminated jobs remain for diagnosis. Queue cleanup runs at `QUEUE_CLEAN_INTERVAL` and removes each
+expired job before its GridFS result and file parameters; `deleteOrphanedQueueFiles` can reclaim
+files if cleanup is interrupted. A pass deletes at most 1,000 jobs, oldest first, so enabling this
+on a large backlog drains it over several intervals instead of holding a worker. At the default
+interval that is up to 3,000 jobs an hour per worker; every submitted report adds one
+`updateMinHashesForSample` job, so an instance ingesting faster than that needs a shorter
+`QUEUE_CLEAN_INTERVAL` (or more workers) for the backlog to shrink. A long-running worker also
+cleans once when it starts; the single-job processes `spawningworker` launches do not. Jobs record
+`finished_at` in the local time of the host that ran them, without a zone, so keep the retention
+well above any clock or time zone offset between hosts. This setting does not limit the lifetime of
+cached analysis results.
+
 ## Reclaiming space after the query cleanup
 
 | setting | default | effect |

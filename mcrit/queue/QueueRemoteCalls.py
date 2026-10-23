@@ -104,18 +104,16 @@ class BaseRemoteCallerClass:
         return result_dict
 
     def awaitResult(self, job_id):
+        """Wait for a result ID.
+
+        Returns None if the job is failed or terminated, does not exist, or disappears while being
+        polled (removed by queue cleanup under QUEUE_TRANSIENT_JOB_RETENTION_SECONDS, or by a clear).
+        """
         job = self.queue.get_job(job_id)
-        terminated = job._is_terminated(use_cached=True)
-        failed = job.is_failed
-        result_id = job.result
-        while (result_id is None) and (not terminated) and (not failed):
+        while job is not None and job.result is None and not job._is_terminated(use_cached=True) and not job.is_failed:
             time.sleep(0.05)
-            # TODO what if job is already killed by clear?
             job = self.queue.get_job(job_id)
-            terminated = job._is_terminated(use_cached=True)
-            failed = job.is_failed
-            result_id = job.result
-        return result_id
+        return None if job is None else job.result
 
 
 ########### START Class Metaprogramming

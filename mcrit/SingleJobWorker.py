@@ -32,6 +32,10 @@ class SingleJobWorker(Worker):
         if not queue:
             queue = QueueFactory().getQueue(config, consumer_id=self._worker_id)
 
+        # a process spawned for one job must not spend its start on a retention pass (the
+        # long-running worker handles that); Worker.__init__ cleans once on construction
+        queue.retention_seconds = 0
+
         if profiling:
             print("[!] Running as profiled application.")
             profiling_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "profiler"))

@@ -22,6 +22,12 @@ class QueueConfig(ConfigInterface):
     QUEUE_MAX_ATTEMPTS: int = 3
     # QUEUE_CLEAN_INTERVAL is the time EACH WORKER waits between cleaning
     QUEUE_CLEAN_INTERVAL: int = 20 * 60  # Clean every 20 minutes
+    # 0 (the default) never deletes a job. A positive value lets the clean-up expire finished
+    # maintenance and ingestion jobs after this many seconds (at most 1,000 per clean-up);
+    # matching, query, cross compare, unique-block and getBandDfCutoffCoverage results, and failed or
+    # terminated jobs, stay (see mcrit/queue/retention.py). finished_at is
+    # naive local time, so keep this well above any clock or time zone offset between hosts.
+    QUEUE_TRANSIENT_JOB_RETENTION_SECONDS: int = 0
     # timeout in seconds for child processes spawned by SpawningWorker
     QUEUE_SPAWNINGWORKER_CHILDREN_TIMEOUT: int = 60 * 60
     # Memory, in bytes, a job run by a SpawningWorker may hold before it is stopped; 0 is no limit.

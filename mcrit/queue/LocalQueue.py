@@ -372,12 +372,17 @@ class Job:
 
 
 class LocalQueue:
+    # most jobs one clean() deletes, as MongoQueue
+    CLEAN_MAX_JOBS = 1000
+
     def __init__(self):
         self._setup_empty_queue()
         self._worker: Any = None
         self._job_counter = 0
         self.clean_interval: float = 10**9
-        self.cache_time: float = 10**9
+        # as MongoQueue: set by QueueFactory; 0 deletes nothing
+        self.retention_seconds: float = 0
+        self.transient_methods: frozenset = frozenset()
         self.max_attempts = 1
 
     def _setup_empty_queue(self):
@@ -637,11 +642,21 @@ class LocalQueue:
         return deleted_count
 
     def clean(self):
-        time_threshold = datetime.now() - timedelta(seconds=self.cache_time)
+        # as MongoQueue.clean: transient methods only, oldest first, at most CLEAN_MAX_JOBS
         delete_list = []
-        for d in self._jobs.values():
-            if (d["finished_at"] is not None) and d["finished_at"] < time_threshold:
-                delete_list.append(d["_id"])
+        if self.retention_seconds > 0:
+            try:
+                time_threshold = datetime.now() - timedelta(seconds=self.retention_seconds)
+            except OverflowError:
+                # a retention beyond what a datetime can reach is "never expire"
+                time_threshold = datetime.min
+            expired = [
+                d
+                for d in self._jobs.values()
+                if d["payload"]["method"] in self.transient_methods and d["finished_at"] is not None and d["finished_at"] < time_threshold and not d.get("terminated")
+            ]
+            expired.sort(key=lambda d: d["finished_at"])
+            delete_list = [d["_id"] for d in expired[: self.CLEAN_MAX_JOBS]]
 
         self.delete_history.append(delete_list)
         LOGGER.debug("Perfomed clean, delete_history now has %d entries.", len(self.delete_history))
