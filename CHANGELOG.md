@@ -15,6 +15,28 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- **`docs/api_reference.md`, a REST API reference generated from the route table**, listing
+  every route with its methods, what it does and the `McritClient` method that calls it.
+  `python -m mcrit.server.api_reference` rewrites it (`--check` exits 1 when it is stale), every
+  responder now carries the docstring it is described by, and `tests/testApiReference.py` fails
+  when the committed file no longer matches the code, when a route is undocumented, or when a
+  public client method has no docstring or return annotation. Every public `McritClient` method
+  is now typed and documented with the route it calls ([#54]).
+
+### Changed
+
+- **Behaviour change: `McritClient(raw_responses=True)` now answers the `requests.Response` from
+  ten more methods** - `respawn`, `addBinarySample`, `modifyFamily`, `deleteFamily`,
+  `modifySample`, `deleteSample`, `getExportData`, `addImportData`,
+  `requestUniqueBlocksForSamples` and `requestUniqueBlocksForFamily` never checked the mode and
+  answered the parsed data, or `None` for a failed request. A caller in raw mode that relied on
+  that gets the response now, like from every other request method. `search_families`,
+  `search_samples` and `search_functions` are unchanged and still answer the parsed data in raw
+  mode; `getSamplesByFamilyId` and `awaitResult` do not work in raw mode. A test reads the
+  client's source and fails for a request method that ignores the mode ([#54]).
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct
@@ -1509,6 +1531,7 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#54]: https://github.com/danielplohmann/mcrit/issues/54
 [#94]: https://github.com/danielplohmann/mcrit/issues/94
 [#241]: https://github.com/danielplohmann/mcrit/issues/241
 [#93]: https://github.com/danielplohmann/mcrit/issues/93

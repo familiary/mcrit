@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import unittest
+from typing import Any, cast
 from unittest import mock
 
 import falcon
@@ -286,7 +287,8 @@ class BandDfCutoffCoverageEndToEndTest(unittest.TestCase):
             self.assertIsNone(McritClient("http://mcrit.test").requestBandDfCutoffCoverage(band_df_cutoff=-1))
             with self.assertRaises(McritBadRequest):
                 McritClient("http://mcrit.test", raise_client_errors=True).requestBandDfCutoffCoverage(band_df_cutoff=-1)
-            raw = McritClient("http://mcrit.test", raw_responses=True).requestBandDfCutoffCoverage(band_df_cutoff=-1)
+            # the annotation describes the default mode; raw mode answers the Response
+            raw = cast(Any, McritClient("http://mcrit.test", raw_responses=True).requestBandDfCutoffCoverage(band_df_cutoff=-1))
         self.assertEqual(raw.status_code, 400)
 
 

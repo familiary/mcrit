@@ -3,7 +3,7 @@
 import json
 import unittest
 from copy import deepcopy
-from typing import Any, List
+from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
 
 import falcon
@@ -515,7 +515,7 @@ class ClientTest(unittest.TestCase):
         self.assertEqual((100, 50), (index.getMatchesForSample.call_args.kwargs["shortlist_size"], index.getMatchesForSample.call_args.kwargs["band_df_cutoff"]))
 
 
-KNOBS = {"shortlist_size": 3, "band_df_cutoff": 4}
+KNOBS: Dict[str, Any] = {"shortlist_size": 3, "band_df_cutoff": 4}
 
 
 class ForwardingTest(unittest.TestCase):
