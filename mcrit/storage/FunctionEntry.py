@@ -65,8 +65,8 @@ class FunctionEntry:
     function_id: int
     family_id: int
     sample_id: int
-    minhash: bytes  # TODO rename -> minhash_bytes? minhash_hex?
-    minhash_shingle_composition: Optional[Dict] = None  # FIXME MongoDbStorage fails without this, ... why?
+    minhash: bytes
+    minhash_shingle_composition: Optional[Dict]
     # inherited from sample
     architecture: str
     # smda information
@@ -106,7 +106,7 @@ class FunctionEntry:
         self.matches = {}
         empty_minhash = MinHash()
         self.minhash = minhash.getMinHash() if minhash else empty_minhash.getMinHash()
-        self.shingler_composition = minhash.getComposition() if minhash else empty_minhash.getComposition()
+        self.minhash_shingle_composition = minhash.getComposition() if minhash else empty_minhash.getComposition()
 
     def getMinHash(self, minhash_bits=32):
         return MinHash(function_id=self.function_id, minhash_bytes=self.minhash, minhash_bits=minhash_bits)

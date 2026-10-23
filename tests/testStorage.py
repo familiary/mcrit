@@ -444,7 +444,10 @@ class MemoryStorageTest(TestCase):
         assert sample_entry is not None
         sample_id = sample_entry.sample_id
         minhashes = [MinHash(function_id=function_id, minhash_signature=[0x30 + function_id + index for index in range(10)], minhash_bits=8) for function_id in [0, 2, 3, 5, 7, 8]]
+        for minhash in minhashes:
+            minhash.shingler_composition = {"EscapedBlockShingler": 1}
         self.storage.addMinHashes(minhashes)
+        self.assertEqual(6, sum(1 for f in self.storage.getFunctionsBySampleId(sample_id) if f.minhash_shingle_composition == {"EscapedBlockShingler": 1}))
         # nothing recorded yet: stale; recorded below the threshold: stale; at or above: current
         self.assertEqual([sample_id], self.storage.getSamplesWithStaleMinHashes("4.4.5"))
         self.assertEqual(1, self.storage.countSamplesWithStaleMinHashes("4.4.5"))
@@ -458,6 +461,7 @@ class MemoryStorageTest(TestCase):
         # dropping the sample's minhashes empties its functions and the band index, and forgets the version
         self.assertEqual(6, self.storage.deleteMinHashesForSample(sample_id))
         self.assertTrue(all(not f.minhash for f in self.storage.getFunctionsBySampleId(sample_id)))
+        self.assertTrue(all(not f.minhash_shingle_composition for f in self.storage.getFunctionsBySampleId(sample_id)))
         self.assertEqual(0, self._numBandEntries())
         self.assertEqual([sample_id], self.storage.getSamplesWithStaleMinHashes("4.4.5"))
         self.assertEqual(0, self.storage.deleteMinHashesForSample(sample_id))

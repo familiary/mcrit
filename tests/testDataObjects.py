@@ -43,6 +43,18 @@ class MinHashingTestSuite(unittest.TestCase):
             # test text-friendly encoding of binary pichashes
             self.assertEqual(as_entry.minhash, function_entry.minhash)
 
+    def testFunctionEntryKeepsTheShingleCompositionOfItsMinHash(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_report.smda")) as fjson:
+            smda_report = SmdaReport.fromDict(json.load(fjson))
+        assert smda_report is not None
+        sample_entry = SampleEntry(smda_report, sample_id=0, family_id=0)
+        minhash = MinHash(function_id=1, minhash_signature=[0x30, 0x31])
+        minhash.shingler_composition = {"EscapedBlockShingler": 2}
+        function_entry = FunctionEntry(sample_entry, next(iter(smda_report.getFunctions())), 1, minhash=minhash)
+        self.assertEqual({"EscapedBlockShingler": 2}, function_entry.minhash_shingle_composition)
+        self.assertEqual({"EscapedBlockShingler": 2}, function_entry.toDict()["minhash_shingle_composition"])
+        self.assertEqual({"EscapedBlockShingler": 2}, FunctionEntry.fromDict(function_entry.toDict()).minhash_shingle_composition)
+
     def testSampleEntry(self):
         THIS_FILE_PATH = str(os.path.abspath(__file__))
         PROJECT_ROOT = str(os.path.abspath(os.sep.join([THIS_FILE_PATH, "..", ".."])))

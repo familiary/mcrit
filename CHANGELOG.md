@@ -15,6 +15,14 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **A function entry built with its MinHash dropped the MinHash's shingle composition (#292).**
+  `FunctionEntry.__init__` stored it under a misspelled attribute, so `toDict` fell back to an
+  empty composition: memory storage kept none for functions added with their MinHash, and kept
+  the old one when a sample's MinHashes were deleted. The class-level default that hid the typo
+  (marked "FIXME MongoDbStorage fails without this") is gone.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

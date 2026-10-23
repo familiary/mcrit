@@ -440,7 +440,7 @@ class MemoryStorage(StorageInterface):
                     if not self._bands[band_number][band_hash]:
                         del self._bands[band_number][band_hash]
             function_entry.minhash = b""
-            function_entry.shingler_composition = {}
+            function_entry.minhash_shingle_composition = {}
         self._minhash_versions.pop(sample_id, None)
         self._minhash_shingler_revisions.pop(sample_id, None)
         return num_hashed
