@@ -216,6 +216,13 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         exported_data["function_entries"] = exported_function_entries
         return exported_data
 
+    @staticmethod
+    def _statedNumFunctions(sample_entry_dict) -> int:
+        """The functions an exported sample entry states it has, if it does: a sample submitted without statistics holds none."""
+        statistics = sample_entry_dict.get("statistics")
+        num_functions = statistics.get("num_functions") if isinstance(statistics, dict) else None
+        return num_functions if isinstance(num_functions, int) else 0
+
     def addImportData(self, export_data):
         storage = self.getStorage()
         import_report = {
@@ -344,7 +351,7 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 if storage.getSampleBySha256(sample_sha256):
                     LOGGER.info(f"Sample with SHA256 {sample_sha256} already present in database, skipping...")
                     import_report["num_samples_skipped"] += 1
-                    import_report["num_functions_skipped"] += sample_entry_dict["statistics"]["num_functions"]
+                    import_report["num_functions_skipped"] += self._statedNumFunctions(sample_entry_dict)
                     continue
                 sample_entry = SampleEntry.fromDict(sample_entry_dict)
                 # adjust family_id in sample_entry using our remapping
@@ -355,7 +362,7 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                     # another writer stored the same sample since the check above: it is theirs, so this
                     # import neither attaches functions to it nor removes it should it fail later
                     import_report["num_samples_skipped"] += 1
-                    import_report["num_functions_skipped"] += sample_entry_dict["statistics"]["num_functions"]
+                    import_report["num_functions_skipped"] += self._statedNumFunctions(sample_entry_dict)
                     continue
                 import_report["num_samples_imported"] += 1
                 imported_sample_entries.append(remapped_sample_entry)
@@ -426,6 +433,14 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
 
     #### NOT REDIRECTED ####
     def addReport(self, smda_report, calculate_hashes=True, calculate_matches=False, username=None):
+        # checked before the lookup, where MongoDB would read an object as a query operator
+        if not SampleEntry.isValidSha256(smda_report.sha256):
+            raise ValueError("the report's sha256 is not 64 hex digits")
+        for smda_function in smda_report.getFunctions():
+            # None is a function without a PicHash (stored as 0); anything else is stored through hex()
+            pic_hash = smda_function.pic_hash
+            if pic_hash is not None and (not isinstance(pic_hash, int) or isinstance(pic_hash, bool) or not 0 <= pic_hash < 2**64):
+                raise ValueError(f"the pic_hash of function at {smda_function.offset} is not an unsigned 64-bit integer")
         storage = self.getStorage()
         sample_entry = storage.getSampleBySha256(smda_report.sha256)
         if sample_entry:
@@ -638,7 +653,8 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             score = MinHash.calculateMinHashScore(minhash_a.minhash, minhash_b.minhash, minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
         match_flags = 0
         match_flags += MatcherFlags.IS_MINHASH_FLAG if score is not None and score >= self._minhash_config.MINHASH_MATCHING_THRESHOLD else 0
-        match_flags += MatcherFlags.IS_PICHASH_FLAG if function_entry_a.pichash == function_entry_b.pichash else 0
+        # a PicHash of 0 is a function without one, not a hash two functions can share
+        match_flags += MatcherFlags.IS_PICHASH_FLAG if function_entry_a.pichash and function_entry_a.pichash == function_entry_b.pichash else 0
         match_flags += MatcherFlags.IS_LIBRARY_FLAG if sample_entry_b.is_library else 0
         match_tuple = [function_entry_b.family_id, function_entry_b.sample_id, function_entry_b.function_id, score, match_flags]
         result = {

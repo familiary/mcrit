@@ -8,6 +8,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
@@ -1560,6 +1561,9 @@ class MongoDbStorage(StorageInterface):
 
     def getSampleBySha256(self, sha256: str, is_query=False) -> Optional["SampleEntry"]:
         target_sample = None
+        if not isinstance(sha256, str):
+            # an object would be read as a query operator
+            return None
         if is_query:
             report_dict = self._getDb().query_samples.find_one({"sha256": sha256})
         else:
@@ -1648,7 +1652,8 @@ class MongoDbStorage(StorageInterface):
                 self._addToPicBlockHashIndex(function_dicts)
                 self._addToPicHashCounts(function_dicts)
                 self._recordFunctionRange(sample_entry.sample_id, [document["function_id"] for document in function_dicts])
-                self._updateFamilyStats(family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))
+                # the functions stored, as deleteSample counts them: the report's statistics are its own claim
+                self._updateFamilyStats(family_id, +1, len(function_dicts), int(sample_entry.is_library))
                 self._updateDbState()
             else:
                 LOGGER.warning("Sample %s already existed, skipping.", smda_report.sha256)
@@ -1660,7 +1665,8 @@ class MongoDbStorage(StorageInterface):
             sample_entry.sample_id = sample_id
             self._dbInsert("samples", sample_entry.toDict())
             self._ensureFamilyDocument(sample_entry.family_id, sample_entry.family)
-            self._updateFamilyStats(sample_entry.family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))
+            # its functions are counted as they are imported, not by the statistics the export states
+            self._updateFamilyStats(sample_entry.family_id, +1, 0, int(sample_entry.is_library))
             self._updateDbState()
             return sample_entry
         # the entry still carries the id it had in the export, which here may well be another sample's
@@ -1681,6 +1687,8 @@ class MongoDbStorage(StorageInterface):
         except Exception:
             self._discardFunctions([function_entry.function_id])
             raise
+        # counted once stored, so that discardImportedSample takes off what it finds stored
+        self._updateFamilyStats(function_entry.family_id, 0, 1, 0)
         self._addToPicBlockHashIndex([function_dict])
         self._addToPicHashCounts([function_dict])
         self._recordFunctionRange(function_entry.sample_id, [function_entry.function_id])
@@ -1706,6 +1714,9 @@ class MongoDbStorage(StorageInterface):
             # none of them, rather than the ones before the document that failed
             self._discardFunctions(function_ids)
             raise
+        # counted once stored, so that discardImportedSample takes off what it finds stored
+        for family_id, num_functions in Counter(function_dict["family_id"] for function_dict in functions_as_dicts).items():
+            self._updateFamilyStats(family_id, 0, num_functions, 0)
         self._addToPicBlockHashIndex(functions_as_dicts)
         self._addToPicHashCounts(functions_as_dicts)
         # as addSmdaReport does: without a range, a shortlisted match never attributes these
@@ -1734,11 +1745,14 @@ class MongoDbStorage(StorageInterface):
             return
         # the picblockhash index is read from the functions, so before they go, as in deleteSample
         self._removeSampleFromPicBlockHashIndex(sample_id)
-        self._discardFunctions([document["function_id"] for document in self._getDb().functions.find({"sample_id": sample_id}, {"function_id": 1, "_id": 0})])
-        if self._getDb().samples.delete_one({"sample_id": sample_id, "sha256": sample_entry.sha256}).deleted_count:
-            # the mirror of importSampleEntry's increment; the family stays, since it may have been
-            # there before the import, with actors of its own
-            self._updateFamilyStats(sample_entry.family_id, -1, -sample_entry.statistics["num_functions"], -int(sample_entry.is_library))
+        function_ids = [document["function_id"] for document in self._getDb().functions.find({"sample_id": sample_id}, {"function_id": 1, "_id": 0})]
+        self._discardFunctions(function_ids)
+        num_samples_deleted = self._getDb().samples.delete_one({"sample_id": sample_id, "sha256": sample_entry.sha256}).deleted_count
+        if num_samples_deleted or function_ids:
+            # the mirror of the increments of importSampleEntry and of the functions as they were stored
+            # (not of its statistics); the family stays, since it may have been there before the import,
+            # with actors of its own
+            self._updateFamilyStats(sample_entry.family_id, -num_samples_deleted, -len(function_ids), -num_samples_deleted * int(sample_entry.is_library))
         self._updateDbState()
 
     def getFunctionsBySampleId(self, sample_id: int) -> Optional[List["FunctionEntry"]]:
@@ -1822,7 +1836,8 @@ class MongoDbStorage(StorageInterface):
         self._decodePichash(query_result, delete_old=False)
         encoded_pichash = query_result["_pichash"]
         decoded_pichash = query_result["pichash"]
-        if decoded_pichash is None:
+        # 0 is what a function without a PicHash is stored with (FunctionEntry), not a hash it shares
+        if not decoded_pichash:
             return None
 
         sample_and_function_ids = set(
@@ -1837,15 +1852,19 @@ class MongoDbStorage(StorageInterface):
     def getPicHashMatchesByFunctionIds(self, function_ids: List[int]) -> Dict[int, Set[Tuple[int, int, int]]]:
         # internal format!
         pichash_raw = self._getDb().functions.find({"function_id": {"$in": function_ids}}, {"_pichash": 1, "_id": 0})
-        pichashes_list = list(pichash_raw)  # broken? TODO
+        pichashes_list = list(pichash_raw)
         pichashes = {}
         encoded_to_decoded = {}
         for pichash in pichashes_list:
-            # TODO what happens if pichash does not exist??
+            # a function document without one has no pichash to match, as in the single-id lookup
+            if "_pichash" not in pichash:
+                continue
             self._decodePichash(pichash, delete_old=False)
             encoded_pichash = pichash["_pichash"]
             decoded_pichash = pichash["pichash"]
-            if decoded_pichash in pichashes:
+            # 0 is what a function without a PicHash is stored with: matching it would pair every
+            # such function with every other one as an exact match, as MemoryStorage never does
+            if not decoded_pichash or decoded_pichash in pichashes:
                 continue
             pichashes[decoded_pichash] = set()
             encoded_to_decoded[encoded_pichash] = decoded_pichash
@@ -2987,7 +3006,6 @@ class MongoDbStorage(StorageInterface):
         # STORAGE_DROP_DISASSEMBLY now genuinely shrinks the instance (#137)
         self._getDb()["xcfg"].drop()
 
-    # TODO move to storage interface, remove this from memory storage?
     def getLibraryInfoForSampleId(self, sample_id: int) -> Optional[Dict[str, str]]:
         sample_entry = self.getSampleById(sample_id)
         if sample_entry is None:
@@ -2997,11 +3015,16 @@ class MongoDbStorage(StorageInterface):
         return None
 
     def isPicHash(self, pichash: int) -> bool:
+        # 0 is what a function without a PicHash is stored with, not a hash (as in MemoryStorage)
+        if not pichash:
+            return False
         query = {"pichash": pichash}
         self._encodePichash(query)
         return self._getDb().functions.find_one(query) is not None
 
     def getMatchesForPicHash(self, pichash: int) -> Set[Tuple[int, int, int]]:
+        if not pichash:
+            return set()
         query = {"pichash": pichash}
         self._encodePichash(query)
         return set(
@@ -3014,6 +3037,8 @@ class MongoDbStorage(StorageInterface):
     def getMatchesForPicHashes(self, pichashes: List[int]) -> Dict[int, Set[Tuple[int, int, int]]]:
         encoded_to_decoded = {}
         for pichash in set(pichashes):
+            if not pichash:
+                continue
             query = {"pichash": pichash}
             self._encodePichash(query)
             encoded_to_decoded[query["_pichash"]] = pichash

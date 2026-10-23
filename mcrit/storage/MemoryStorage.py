@@ -269,17 +269,21 @@ class MemoryStorage(StorageInterface):
             # update sample_entry and function_entries with new family information
             self._samples[sample_id].family = family_name
             self._samples[sample_id].family_id = family_id
+            num_functions_moved = 0
             for function_id, function_entry in self._functions.items():
                 if function_entry.sample_id == sample_id:
                     function_entry.family_id = family_id
                     self._functions[function_id] = function_entry
-                    self._pichashes[function_entry.pichash].remove((old_family_id, sample_id, function_id))
-                    self._pichashes[function_entry.pichash].add((family_id, sample_id, function_id))
-            # update family information itself
+                    # 0 is what a function without a PicHash is stored with, and never indexed
+                    if function_entry.pichash:
+                        self._pichashes[function_entry.pichash].remove((old_family_id, sample_id, function_id))
+                        self._pichashes[function_entry.pichash].add((family_id, sample_id, function_id))
+                    num_functions_moved += 1
+            # update family information itself, by the functions moved as MongoDbStorage does
             self._families[old_family_id].num_samples -= 1
-            self._families[old_family_id].num_functions -= self._samples[sample_id].statistics["num_functions"]
+            self._families[old_family_id].num_functions -= num_functions_moved
             self._families[family_id].num_samples += 1
-            self._families[family_id].num_functions += self._samples[sample_id].statistics["num_functions"]
+            self._families[family_id].num_functions += num_functions_moved
             if self._samples[sample_id].is_library:
                 self._families[old_family_id].num_library_samples -= 1
                 self._families[family_id].num_library_samples += 1
@@ -351,8 +355,9 @@ class MemoryStorage(StorageInterface):
             for function_id, function_entry in self._functions.items():
                 if family_id == function_entry.family_id:
                     self._functions[function_id].family_id = new_family_id
-                    self._pichashes[function_entry.pichash].remove((family_id, function_entry.sample_id, function_id))
-                    self._pichashes[function_entry.pichash].add((new_family_id, function_entry.sample_id, function_id))
+                    if function_entry.pichash:
+                        self._pichashes[function_entry.pichash].remove((family_id, function_entry.sample_id, function_id))
+                        self._pichashes[function_entry.pichash].add((new_family_id, function_entry.sample_id, function_id))
         self._updateDbState()
         return True
 
@@ -566,7 +571,8 @@ class MemoryStorage(StorageInterface):
                     function_entry = self._addFunction(sample_entry, smda_function)
                     function_ids.append(function_entry.function_id)
                 self._sample_id_to_function_ids[sample_entry.sample_id] = function_ids
-                self._updateFamilyStats(family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))
+                # the functions stored, as deleteSample counts them: the report's statistics are its own claim
+                self._updateFamilyStats(family_id, +1, len(function_ids), int(sample_entry.is_library))
             else:
                 LOGGER.warning("Sample %s already existed, skipping.", smda_report.sha256)
         return sample_entry
@@ -577,7 +583,8 @@ class MemoryStorage(StorageInterface):
             sample_entry.sample_id = sample_id
             self._samples[sample_id] = sample_entry
             self._sample_by_sha256[sample_entry.sha256] = sample_id
-            self._updateFamilyStats(sample_entry.family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))
+            # its functions are counted as they are imported, not by the statistics the export states
+            self._updateFamilyStats(sample_entry.family_id, +1, 0, int(sample_entry.is_library))
             return sample_entry
         # the entry still carries the id it had in the export, which here may well be another sample's
         LOGGER.warning("Sample %s already existed, skipping.", sample_entry.sha256)
@@ -589,14 +596,19 @@ class MemoryStorage(StorageInterface):
         # only the sample this entry was imported as, as MongoDbStorage does
         if stored is None or stored.sha256 != sample_entry.sha256:
             return
+        num_functions_discarded = 0
         for function_id in self._sample_id_to_function_ids.pop(sample_id, []):
             function_entry = self._functions.pop(function_id, None)
-            if function_entry is not None and function_entry.pichash:
+            if function_entry is None:
+                continue
+            num_functions_discarded += 1
+            if function_entry.pichash:
                 self._pichashes.get(function_entry.pichash, set()).discard((function_entry.family_id, sample_id, function_id))
         del self._samples[sample_id]
         self._sample_by_sha256.pop(sample_entry.sha256, None)
-        # the mirror of importSampleEntry's increment; the family stays, as in MongoDbStorage
-        self._updateFamilyStats(sample_entry.family_id, -1, -sample_entry.statistics["num_functions"], -int(sample_entry.is_library))
+        # the mirror of the increments of importSampleEntry and of its functions' imports; the family
+        # stays, as in MongoDbStorage
+        self._updateFamilyStats(sample_entry.family_id, -1, -num_functions_discarded, -int(sample_entry.is_library))
         self._updateDbState()
 
     def importFunctionEntry(self, function_entry: "FunctionEntry") -> Optional["FunctionEntry"]:
@@ -613,6 +625,7 @@ class MemoryStorage(StorageInterface):
             if function_entry.pichash not in self._pichashes:
                 self._pichashes[function_entry.pichash] = set()
             self._pichashes[function_entry.pichash].add((function_entry.family_id, function_entry.sample_id, function_entry.function_id))
+        self._updateFamilyStats(function_entry.family_id, 0, 1, 0)
         return function_entry
 
     def importFunctionEntries(self, function_entries: List["FunctionEntry"]) -> Optional[List["FunctionEntry"]]:
@@ -630,6 +643,7 @@ class MemoryStorage(StorageInterface):
                 if function_entry.pichash not in self._pichashes:
                     self._pichashes[function_entry.pichash] = set()
                 self._pichashes[function_entry.pichash].add((function_entry.family_id, function_entry.sample_id, function_entry.function_id))
+            self._updateFamilyStats(function_entry.family_id, 0, 1, 0)
         return function_entries
 
     # TODO return type?
@@ -874,6 +888,8 @@ class MemoryStorage(StorageInterface):
 
     def getSampleBySha256(self, sha256: str, is_query=False) -> Optional["SampleEntry"]:
         sample_entry = None
+        if not isinstance(sha256, str):
+            return None
         if is_query:
             # query_samples are not covered by the _sample_by_sha256 index
             for query_sample_entry in self._query_samples.values():
@@ -919,7 +935,8 @@ class MemoryStorage(StorageInterface):
         if function_id not in self._functions:
             return None
         pichash = self._functions[function_id].pichash
-        if pichash is None:
+        # 0 is what a function without a PicHash is stored with, and never indexed
+        if not pichash:
             return None
         return {pichash: deepcopy(self._pichashes[pichash])}
 
@@ -928,7 +945,7 @@ class MemoryStorage(StorageInterface):
         for function_id in function_ids:
             if function_id in self._functions:
                 pichash = self._functions[function_id].pichash
-                if pichash is None:
+                if not pichash:
                     continue
                 # a hash over MINHASH_PICHASH_MAX_MATCHES keeps its key with no holders, as in MongoDbStorage
                 pichashes[pichash] = deepcopy(self._pichashes[pichash]) if self._isPicHashWithinMatchCount(pichash) else set()

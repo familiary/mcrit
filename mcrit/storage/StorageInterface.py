@@ -700,17 +700,17 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO can this happen, that the Function has no pichash?
-    # TODO Maybe remove this function, or restore original behavior?
-    # -> Dict[pichash, Set[Tuple[sample_id, function_id]]]
+    # -> Dict[pichash, Set[Tuple[family_id, sample_id, function_id]]]
     def getPicHashMatchesByFunctionId(self, function_id: int) -> Optional[Dict[int, Set[Tuple[int, int, int]]]]:
-        """Get the PicHash for a given function_id and also return all other sample_id/function_id pairs having the same PicHash
+        """Get the PicHash for a given function_id and also return all functions having the same PicHash
 
         Args:
             function_id: the function id for PicHash matching
 
         Returns:
-            None if the function_id does not exist, or does not have a pichash. Otherwise a dict containing the functions pichash as key and the following value: a set of (sample_id, function_id) having the given pichash
+            None if the function_id does not exist, or does not have a pichash (a function whose report
+            carried none is stored with 0). Otherwise a dict containing the functions pichash as key and
+            the following value: a set of (family_id, sample_id, function_id) having the given pichash
         """
         raise NotImplementedError
 

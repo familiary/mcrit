@@ -15,6 +15,64 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Security
+
+- A sample whose SMDA report had no timestamp (missing or empty) was stored, but reading it back
+  failed, so the sample listing, the sample itself, its family with samples, the export and every
+  matching job that reached it answered with an error, and the sample could not be deleted through
+  the API. A stored timestamp that cannot be read is now treated as no timestamp. Samples stored
+  earlier read back the same way, without a migration.
+
+- A sample whose SMDA report had no `statistics` was stored in full before submitting it failed with
+  a server error, and from then on every matching job that found a match in it failed with
+  `KeyError: 'num_functions'`. The family counters now count the functions that were stored instead
+  of the figure the report states, the matchers count a sample's functions when its statistics hold
+  none, and importing an export that holds such a sample works.
+
+- The function counter of a family could be set to any value by a report's
+  `statistics.num_functions`; a very large claim saturated it, after which every later report into
+  that family was stored without being counted or hashed. A family now counts the functions that
+  were actually stored, for submitted reports as well as for imports (the sample is counted when its
+  entry is imported and its functions as they are imported). A counter that is already off stays
+  so until `POST /recompute_family_stats` resets it from the stored functions.
+
+- A function in a submitted report whose offset is not one of its blocks, or an AArch64 prologue
+  with an operand such as `#-010`, made the fuzzy shingler raise, which failed every minhash batch
+  holding it (including `complete_minhashes`, `repair_minhashes` and `recalculate_minhashes`, the
+  last after it had already dropped all hashes). The shingler now treats such a function as having
+  no stack frame, and a function the shinglers still fail on is logged and left unhashed while the
+  rest of its batch is hashed.
+
+- The `sha256` of a submitted SMDA report is now checked to be 64 hex digits; anything else
+  (including a JSON object, which MongoDB read as a query operator and resolved to an existing
+  sample) is answered with 400 and nothing is stored. A report smda refuses as malformed is also
+  answered with 400 instead of a server error.
+
+- A function in a submitted report whose `pic_hash` is not an unsigned 64-bit integer is now
+  answered with 400 and nothing of the report is stored. Before, the in-memory storage stored -1,
+  2**64, 1.5, strings and booleans as they came, and a PicHash like `{"$ne": 0}` or `[1]` failed
+  with a 500 after the sample had already been partly stored.
+
+- Functions whose report carries no PicHash are stored with PicHash 0. The vs and vs-group matchers
+  and the MongoDB sample matching treated 0 as a hash like any other and reported every such
+  function as an exact match of every other one; the in-memory storage failed sample matching, and
+  moving such a sample or its family to another family, with `KeyError: 0`. On MongoDB, a query for
+  PicHash `0000000000000000` answered with every such function. A PicHash of 0 now never matches.
+  Cached matching results from before are recomputed on their next request.
+
+### Changed
+
+- **`POST /samples/binary` refuses `is_dump`, `bitness` and `base_addr` values it used to misread.**
+  `is_dump=yes` was read as false, so a dump was disassembled as an unmapped file; `bitness=16`
+  became 32 and an unparsable `base_addr` became 0, each without a word. They are now answered with
+  400 and nothing is enqueued. `is_dump` takes `true`/`True`/`1` or `false`/`False`/`0`, `bitness`
+  32 or 64, `base_addr` a hexadecimal address from 0 to 2**64 - 1, and a blank value (`is_dump=`)
+  still means the parameter is absent. A `filename` longer than 255 characters, a `family` or
+  `version` longer than 64, or any of them with a control character (a newline, a tab, a NUL, an
+  escape sequence) or a line separator, is refused the same way; other characters, spaces and
+  non-ASCII included, are stored as given, as before. A client that sent such a value and got a
+  sample anyway now has to correct it.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct
