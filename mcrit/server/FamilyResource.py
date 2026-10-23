@@ -127,9 +127,9 @@ class FamilyResource:
             resp.status = falcon.HTTP_202
         else:
             db_log_msg(self.index, req, f"FamilyResource.on_delete - failed - family_id: {family_id}, keep_samples={keep_samples}")
-            resp.data = jsonify({"status": "failed", "data": {"message": "Failed to delete family."}})
-            # TODO whats the correct code?
-            resp.status = falcon.HTTP_410
+            # not reached through the queue, which raises when it cannot queue a job
+            resp.data = jsonify({"status": "failed", "data": {"message": "Failed to queue the family deletion."}})
+            resp.status = falcon.HTTP_503
 
     @timing
     def on_get_collection(self, req, resp):

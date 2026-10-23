@@ -15,6 +15,13 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **`DELETE /samples/{sample_id}` answers 404 for an unknown sample (#295).** It queued a deletion
+  job for any id and answered 202 with its job id, and the job then did nothing. The families route
+  already checked first. Repeating the deletion of a sample, once its first deletion has run, is now
+  a 404 as well.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

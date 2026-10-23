@@ -91,15 +91,20 @@ class SampleResource:
 
     @timing
     def on_delete(self, req, resp, sample_id=None):
+        if not self.index.isSampleId(sample_id):
+            resp.data = jsonify({"status": "failed", "data": {"message": "We don't have a sample with that id."}})
+            resp.status = falcon.HTTP_404
+            db_log_msg(self.index, req, f"SampleResource.on_delete - failed - unknown sample_id: {sample_id}.")
+            return
         successful = self.index.deleteSample(sample_id, force_recalculation=True, username=get_username(req))
         if successful:
             resp.data = jsonify({"status": "successful", "data": successful})
             resp.status = falcon.HTTP_202
             db_log_msg(self.index, req, "SampleResource.on_delete - success.")
         else:
-            resp.data = jsonify({"status": "failed", "data": {"message": "Failed to delete sample."}})
-            # TODO whats the correct code?
-            resp.status = falcon.HTTP_400
+            # not reached through the queue, which raises when it cannot queue a job
+            resp.data = jsonify({"status": "failed", "data": {"message": "Failed to queue the sample deletion."}})
+            resp.status = falcon.HTTP_503
             db_log_msg(self.index, req, f"SampleResource.on_delete - failed - sample_id: {sample_id} not deleted.")
 
     @timing
