@@ -257,7 +257,9 @@ class MongoMatchingCacheDedupTest(MatchingCacheDedupTestBase, TestCase):
             if not wanted:
                 continue
             for document in storage._getDb()[collection_name].find({"function_id": {"$in": wanted}}, {"_id": 0, "function_id": 1, "sample_id": 1, "minhash": 1}):
-                minhashes[document["function_id"]] = bytes.fromhex(document["minhash"])
+                # stored as BSON binary, or as hex text by an MCRIT before that
+                stored = document["minhash"]
+                minhashes[document["function_id"]] = stored if isinstance(stored, bytes) else bytes.fromhex(stored)
                 sample_ids[document["function_id"]] = document["sample_id"]
         return minhashes, sample_ids
 
