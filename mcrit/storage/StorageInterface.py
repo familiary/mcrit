@@ -1121,9 +1121,30 @@ class StorageInterface:
         the rest of the index; how many functions had one (#142)."""
         raise NotImplementedError
 
-    def setMinHashVersionForSamples(self, smda_version: str, sample_ids: Optional[List[int]] = None, except_sample_ids: Optional[Iterable[int]] = None) -> None:
+    def setMinHashVersionForSamples(
+        self, smda_version: str, sample_ids: Optional[List[int]] = None, except_sample_ids: Optional[Iterable[int]] = None, finish_pending: bool = False
+    ) -> None:
         """Record which smda escaped the minhashes of the samples (all when None) (#142), and at
-        which shingler revision they were computed (#238); except_sample_ids are left as they are."""
+        which shingler revision they were computed (#238); except_sample_ids are left as they are.
+        With finish_pending, the samples also stop being pending (getSamplesWithPendingMinHashes):
+        only the callers that also drop their disassembly where configured finish a sample. Without
+        it, a pending sample stays pending as stored by this smda and the running shingler revision:
+        every caller stamps only once it rehashed all of the sample's functions it could."""
+        raise NotImplementedError
+
+    def getSamplesWithPendingMinHashes(self, threshold_version: str) -> List[int]:
+        """The samples nothing has finished since they were stored - submitted with deferred
+        hashing, or still waiting for (or having lost) their minhash job - by an smda at or above
+        the escaper compatibility threshold and the running shingler revision.
+        setMinHashVersionForSamples with finish_pending ends a sample's wait; imported samples and
+        those stored before the marker existed never wait."""
+        raise NotImplementedError
+
+    def getSamplesWithUnhashedFunctions(self, sample_ids: List[int]) -> Set[int]:
+        """Those of sample_ids that still hold a function large enough to hash, without a minhash,
+        whose disassembly is stored - one that has none cannot be hashed (repairMinHashes skips it
+        as well). Answered from the function ids, minhashes and sizes, and whether a disassembly is
+        stored, without loading function documents or disassembly."""
         raise NotImplementedError
 
     def getSamplesWithStaleMinHashes(self, threshold_version: str) -> List[int]:

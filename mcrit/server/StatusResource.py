@@ -83,7 +83,10 @@ class StatusResource:
 
     @timing
     def on_get_complete_minhashes(self, req, resp):
-        minhash_report = self.index.updateMinHashes(None, force_recalculation=True, username=get_username(req))
+        # finish_samples records the minhash version of what it hashed and drops its disassembly
+        # where configured, as hashing on submission does; a separate method name would take these
+        # jobs out of every listing that knows them as updateMinHashes, MCRITweb's job pages included
+        minhash_report = self.index.updateMinHashes(None, finish_samples=True, force_recalculation=True, username=get_username(req))
         resp.data = jsonify({"status": "successful", "data": minhash_report})
         db_log_msg(self.index, req, "StatusResource.on_get_complete_minhashes - success.")
         return

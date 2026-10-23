@@ -15,6 +15,35 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **`GET /complete_minhashes` now finishes the samples it hashes, as hashing on submission does
+  (#298).** It is how samples submitted with deferred hashing (`addReport` with
+  `calculate_hashes=False`) get their minhashes, but it never recorded which smda produced them and
+  never dropped their disassembly under `STORAGE_DROP_DISASSEMBLY`. Every such sample stayed in
+  `num_samples_with_stale_minhashes` on `/status` and was rehashed by the next `/repair_minhashes`,
+  and its `xcfg` stayed stored on an instance configured to drop it. A stored sample is now marked
+  `minhash_pending` (with a new sparse index) until hashing on submission or this job finishes it.
+  After hashing, the job finishes every pending sample with no function left to hash, whichever run
+  hashed it, so a retried, repeated or overlapping job and a sample with nothing large enough to
+  hash are finished too. `/repair_minhashes` and `recalculateMinHashes` record versions but leave
+  samples pending, as they never drop disassembly, now as hashed by the running smda; the next
+  complete finishes them. Functions without disassembly ([#42]) do not hold their sample back. A
+  function smda cannot rebuild fails the whole job, as before, and the job then finishes no sample.
+  Finishing reads only ids, sizes and whether disassembly is stored: 0.6 s and under 1 MB for 300
+  samples of 210,000 functions, before the disassembly is dropped. The job is still
+  `updateMinHashes`, now with `finish_samples=True`, so MCRITweb files it where it did, though its
+  parameters read `updateMinHashes(None, True)`. Upgrade the workers before the server: an older
+  worker fails the job with a `TypeError` on `finish_samples`. `StorageInterface` gains
+  `getSamplesWithPendingMinHashes` and `getSamplesWithUnhashedFunctions`, and
+  `setMinHashVersionForSamples` a `finish_pending` flag, which a storage of your own has to
+  implement. NOTE that samples stored before this release carry no marker and are never finished by
+  `/complete_minhashes`, including those it already hashed: nothing records which smda or shingler
+  revision computed their minhashes. They stay listed as stale until `/repair_minhashes` rehashes
+  them, and their `xcfg` stays stored either way. The same holds for a pending sample stored by an
+  smda older than the escaper compatibility threshold, or before the shingler revision changed,
+  until `/repair_minhashes` or `recalculateMinHashes` has rehashed it.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

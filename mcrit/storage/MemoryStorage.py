@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional,
 
 from packaging import version as packaging_version
 from picblocks.blockhasher import BlockHasher
+from smda.SmdaConfig import SmdaConfig
 
 from mcrit.index.SearchCursor import FullSearchCursor
 from mcrit.index.SearchQueryTree import AndNode, BaseVisitor, FilterSingleElementLists, NodeType, OrNode, PropagateNot, SearchConditionNode, SearchFieldResolver
@@ -167,6 +168,8 @@ class MemoryStorage(StorageInterface):
         self._bands = {band_number: {} for band_number in range(self._storage_config.STORAGE_NUM_BANDS)}
         self._minhash_versions: Dict[int, str] = {}
         self._minhash_shingler_revisions: Dict[int, int] = {}
+        # sample_id -> (smda version, shingler revision) it was stored by, until its minhashes are recorded
+        self._minhash_pending: Dict[int, Tuple[str, int]] = {}
         self._counters = defaultdict(lambda: 0)
         # initialize query sample/function ids
         if self._counters["query_samples"] == 0:
@@ -468,12 +471,37 @@ class MemoryStorage(StorageInterface):
         self._bands = {band_number: {} for band_number in self._bands}
         return num_deleted
 
-    def setMinHashVersionForSamples(self, smda_version: str, sample_ids: Optional[List[int]] = None, except_sample_ids: Optional[Iterable[int]] = None) -> None:
+    def setMinHashVersionForSamples(
+        self, smda_version: str, sample_ids: Optional[List[int]] = None, except_sample_ids: Optional[Iterable[int]] = None, finish_pending: bool = False
+    ) -> None:
         excepted = set(except_sample_ids or [])
         for sample_id in list(self._samples) if sample_ids is None else sample_ids:
             if sample_id in self._samples and sample_id not in excepted:
                 self._minhash_versions[sample_id] = smda_version
                 self._minhash_shingler_revisions[sample_id] = MINHASH_SHINGLER_REVISION
+                if finish_pending:
+                    self._minhash_pending.pop(sample_id, None)
+                elif sample_id in self._minhash_pending:
+                    self._minhash_pending[sample_id] = (smda_version, MINHASH_SHINGLER_REVISION)
+
+    def getSamplesWithPendingMinHashes(self, threshold_version: str) -> List[int]:
+        threshold = packaging_version.parse(threshold_version)
+        return sorted(
+            sample_id
+            for sample_id, (smda_version, shingler_revision) in self._minhash_pending.items()
+            if sample_id in self._samples and not self._isStaleMinHashVersion(smda_version, threshold) and shingler_revision == MINHASH_SHINGLER_REVISION
+        )
+
+    def getSamplesWithUnhashedFunctions(self, sample_ids: List[int]) -> Set[int]:
+        return {
+            sample_id
+            for sample_id in sample_ids
+            if sample_id in self._samples
+            and any(
+                not function_entry.minhash and function_entry.xcfg and self.isHashableBySize(function_entry.num_instructions, function_entry.num_blocks)
+                for function_entry in (self._functions[function_id] for function_id in self._sample_id_to_function_ids[sample_id])
+            )
+        }
 
     def getSamplesWithStaleMinHashes(self, threshold_version: str) -> List[int]:
         threshold = packaging_version.parse(threshold_version)
@@ -567,6 +595,7 @@ class MemoryStorage(StorageInterface):
                     function_ids.append(function_entry.function_id)
                 self._sample_id_to_function_ids[sample_entry.sample_id] = function_ids
                 self._updateFamilyStats(family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))
+                self._minhash_pending[sample_entry.sample_id] = (SmdaConfig().VERSION, MINHASH_SHINGLER_REVISION)
             else:
                 LOGGER.warning("Sample %s already existed, skipping.", smda_report.sha256)
         return sample_entry
@@ -1013,9 +1042,10 @@ class MemoryStorage(StorageInterface):
             self._functions[function_id].xcfg = {}
 
     def deleteXcfgForSampleId(self, sample_id: int) -> None:
-        for function_id, function_entry in self._functions.items():
-            if sample_id == function_entry.sample_id:
-                self._functions[function_id].xcfg = {}
+        if sample_id < 0:
+            return
+        for function_id in self._sample_id_to_function_ids.get(sample_id, []):
+            self._functions[function_id].xcfg = {}
 
     # TODO dict of what?
     def getContent(self) -> Dict[str, Any]:

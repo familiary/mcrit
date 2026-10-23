@@ -400,7 +400,7 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
 
     #### REDIRECTED TO WORKER ####
     """
-    def updateMinHashes(self, function_ids):
+    def updateMinHashes(self, function_ids, finish_samples=False):
     def rebuildIndex(self):
     def recomputeFamilyStats(self):
     def deleteOrphanedQueueFiles(self, dry_run=False):

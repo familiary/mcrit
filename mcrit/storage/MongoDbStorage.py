@@ -358,6 +358,8 @@ class MongoDbStorage(StorageInterface):
         self._getDb()["samples"].create_index([("pichash_smda_version", 1), ("smda_version", 1)])
         # and the distinct over the reports' versions it builds that count from
         self._getDb()["samples"].create_index("smda_version")
+        # the samples /complete_minhashes finishes; sparse, as only samples still pending carry it
+        self._getDb()["samples"].create_index("minhash_pending.smda_version", sparse=True)
         # and the count of samples the running smda found impossible to rehash; sparse, as few are, and
         # so the planner cannot pick it for the $ne both stale queries carry, which would read it whole
         self._getDb()["samples"].create_index("pichash_unrehashable_smda_version", sparse=True)
@@ -965,11 +967,67 @@ class MongoDbStorage(StorageInterface):
         self._getDb().samples.update_one({"sample_id": sample_id}, {"$unset": {"minhash_smda_version": "", "minhash_shingler_revision": ""}})
         return num_hashed
 
-    def setMinHashVersionForSamples(self, smda_version: str, sample_ids: Optional[List[int]] = None, except_sample_ids: Optional[Iterable[int]] = None) -> None:
+    def setMinHashVersionForSamples(
+        self, smda_version: str, sample_ids: Optional[List[int]] = None, except_sample_ids: Optional[Iterable[int]] = None, finish_pending: bool = False
+    ) -> None:
         query: Dict[str, Any] = {} if sample_ids is None else {"sample_id": {"$in": list(sample_ids)}}
         if except_sample_ids:
             query = {"$and": [query, {"sample_id": {"$nin": list(except_sample_ids)}}]}
-        self._getDb().samples.update_many(query, {"$set": {"minhash_smda_version": smda_version, "minhash_shingler_revision": MINHASH_SHINGLER_REVISION}})
+        update: Dict[str, Any] = {"$set": {"minhash_smda_version": smda_version, "minhash_shingler_revision": MINHASH_SHINGLER_REVISION}}
+        if finish_pending:
+            update["$unset"] = {"minhash_pending": ""}
+        self._getDb().samples.update_many(query, update)
+        if not finish_pending:
+            # still pending, now as hashed by this smda and shingler revision
+            pending = {"minhash_pending.smda_version": smda_version, "minhash_pending.shingler_revision": MINHASH_SHINGLER_REVISION}
+            self._getDb().samples.update_many({"$and": [query, {"minhash_pending": {"$exists": True}}]}, {"$set": pending})
+
+    def getSamplesWithPendingMinHashes(self, threshold_version: str) -> List[int]:
+        # few distinct versions are ever pending, so compare those rather than every document
+        threshold = version.parse(threshold_version)
+        has_marker = {"minhash_pending.smda_version": {"$exists": True}}
+        recorded = self._getDb().samples.distinct("minhash_pending.smda_version", has_marker)
+        compatible = [value for value in recorded if not self._isStaleMinHashVersion(value, threshold)]
+        if not compatible:
+            return []
+        query = {"minhash_pending.smda_version": {"$in": compatible}, "minhash_pending.shingler_revision": MINHASH_SHINGLER_REVISION}
+        return sorted(document["sample_id"] for document in self._getDb().samples.find(query, {"sample_id": 1, "_id": 0}))
+
+    # the first query for a sample's candidates is this small: before hashing, the first candidate
+    # already settles the sample; after it, there are none
+    _UNHASHED_PROBE_SIZE = 16
+    _UNHASHED_CHECK_BATCH_SIZE = 1000
+
+    def getSamplesWithUnhashedFunctions(self, sample_ids: List[int]) -> Set[int]:
+        hashable_query = self._hashableSizeQuery()
+        if hashable_query is None:
+            return set()
+        unhashed_sample_ids = set()
+        for sample_id in sample_ids:
+            if sample_id < 0:
+                continue
+            # one sample at a time, on the sample_id index
+            query = {"sample_id": sample_id, "minhash": "", **hashable_query}
+            probe = [document["function_id"] for document in self._getDb().functions.find(query, {"_id": 0, "function_id": 1}).limit(self._UNHASHED_PROBE_SIZE)]
+            if self._hasStoredXcfg(probe):
+                unhashed_sample_ids.add(sample_id)
+                continue
+            if len(probe) < self._UNHASHED_PROBE_SIZE:
+                continue
+            with self._getDb().functions.find(query, {"_id": 0, "function_id": 1}).batch_size(self._UNHASHED_CHECK_BATCH_SIZE) as cursor:
+                for function_ids in self._batchedIds(cursor, self._UNHASHED_CHECK_BATCH_SIZE):
+                    if self._hasStoredXcfg(function_ids):
+                        unhashed_sample_ids.add(sample_id)
+                        break
+        return unhashed_sample_ids
+
+    def _hasStoredXcfg(self, function_ids: List[int]) -> bool:
+        """Whether any of these (non-query) functions has disassembly in the xcfg collection, where
+        "{}" means none, as _attachXcfgBlobs reads it. A pending sample was stored by a release that
+        keeps disassembly there only, so an inline _xcfg (#137) is not looked for."""
+        if not function_ids:
+            return False
+        return self._getDb().xcfg.find_one({"_id": {"$in": function_ids}, "_xcfg": {"$nin": ["", "{}", None]}}, {"_id": 1}) is not None
 
     def _staleMinHashVersionQuery(self, threshold_version: str) -> Dict[str, Any]:
         """Samples carry few distinct recorded versions, so compare those instead of every document."""
@@ -1649,6 +1707,10 @@ class MongoDbStorage(StorageInterface):
                 self._addToPicHashCounts(function_dicts)
                 self._recordFunctionRange(sample_entry.sample_id, [document["function_id"] for document in function_dicts])
                 self._updateFamilyStats(family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))
+                # only once its functions are all written: finishing the sample earlier would record
+                # it as hashed and drop disassembly that is still to be hashed
+                pending = {"smda_version": SmdaConfig().VERSION, "shingler_revision": MINHASH_SHINGLER_REVISION}
+                self._getDb().samples.update_one({"sample_id": sample_entry.sample_id}, {"$set": {"minhash_pending": pending}})
                 self._updateDbState()
             else:
                 LOGGER.warning("Sample %s already existed, skipping.", smda_report.sha256)
