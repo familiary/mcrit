@@ -48,7 +48,7 @@ from mcrit.storage.FunctionEntry import FunctionEntry, smdaFunctionFromXcfg
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
 from mcrit.storage.MatchingCache import MatchingCache
 from mcrit.storage.SampleEntry import SampleEntry
-from mcrit.storage.StorageInterface import BinaryStream, StorageInterface
+from mcrit.storage.StorageInterface import BandDfSkips, BinaryStream, StorageInterface
 
 LOGGER = logging.getLogger(__name__)
 
@@ -2142,7 +2142,7 @@ class MongoDbStorage(StorageInterface):
             removed += self._getDb()["band_%d" % band_number].delete_many(residue).deleted_count
         return removed
 
-    def _collectBandHashTargets(self, function_id_to_minhash: Dict[int, "MinHash"]):
+    def _collectBandHashTargets(self, function_id_to_minhash: Dict[int, "MinHash"], skips: Optional[BandDfSkips] = None):
         """band_number -> set(band_hash) to query, and band_number -> band_hash -> query function_ids."""
         target_band_hashes_per_band = {band_number: set() for band_number in range(self._storage_config.STORAGE_NUM_BANDS)}
         band_hash_to_function_ids = {band_number: {} for band_number in range(self._storage_config.STORAGE_NUM_BANDS)}
@@ -2150,6 +2150,8 @@ class MongoDbStorage(StorageInterface):
             if not minhash.hasMinHash():
                 continue
             band_hashes = self.getBandHashesForMinHash(minhash)
+            if skips is not None:
+                skips.addLookups(function_id, len(band_hashes))
             for band_number, band_hash in sorted(band_hashes.items()):
                 target_band_hashes_per_band[band_number].add(band_hash)
                 if band_hash not in band_hash_to_function_ids[band_number]:
@@ -2170,7 +2172,9 @@ class MongoDbStorage(StorageInterface):
             raise ValueError(f"band_df_cutoff ({band_df_cutoff}) must not exceed STORAGE_BAND_BUCKET_SIZE ({bucket_size}).")
         return band_df_cutoff
 
-    def _bandLookupPipeline(self, band_hashes: List[int], band_df_cutoff: Optional[int] = None, df_index_complete: Optional[bool] = None) -> List[Dict[str, Any]]:
+    def _bandLookupPipeline(
+        self, band_hashes: List[int], band_df_cutoff: Optional[int] = None, df_index_complete: Optional[bool] = None, skipped_from: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """Aggregation returning the wanted band documents, dropping over-long posting lists.
 
         The cutoff is applied server-side rather than after the fetch on purpose: the cost of a
@@ -2178,6 +2182,11 @@ class MongoDbStorage(StorageInterface):
         millions of entries, so a client-side check would pay almost the whole price before
         discarding it. `df_index_complete` passes in the flag a caller already read, so a lookup
         over all bands reads the settings document once rather than once per band.
+
+        With `skipped_from` (the band collection's name) and the df index trusted, the hashes the
+        cutoff skips come back as well, as {band_hash, df} without a posting list (#201): a
+        $unionWith in the same command, answered from the (band_hash, df) index entries alone, so
+        no skipped band document is read and no extra round trip is made.
         """
         cutoff = self._bandDfCutoff(band_df_cutoff)
         if cutoff <= 0:
@@ -2192,7 +2201,12 @@ class MongoDbStorage(StorageInterface):
             # no bucket predicate here: with one, mongod prefers the (band_hash, bucket) index and
             # reads every over-cutoff bucket 0 before discarding it. _bandLookupHits drops the stray
             # upper bucket a df could admit instead.
-            return [{"$match": {"band_hash": {"$in": band_hashes}, "df": {"$lte": cutoff}}}]
+            pipeline: List[Dict[str, Any]] = [{"$match": {"band_hash": {"$in": band_hashes}, "df": {"$lte": cutoff}}}]
+            if skipped_from is not None:
+                # band_hash and df only, so the scan is covered: an over-cutoff posting list stays unread
+                skipped = [{"$match": {"band_hash": {"$in": band_hashes}, "df": {"$gt": cutoff}}}, {"$project": {"_id": 0, "band_hash": 1, "df": 1}}]
+                pipeline.append({"$unionWith": {"coll": skipped_from, "pipeline": skipped}})
+            return pipeline
         # no trustworthy df yet: fall back to measuring the list, which is correct but only
         # saves the transfer, not the read
         # Only bucket 0 is measured. Under bucketing a hash over the cutoff is split, and each of
@@ -2221,8 +2235,12 @@ class MongoDbStorage(StorageInterface):
         df_index_complete = cutoff > 0 and self.isBandDfIndexComplete()
         return cutoff, df_index_complete, bool(self._bandBucketSize()) and df_index_complete
 
-    def _bandLookupHits(self, band_number: int, band_hashes: List[int], plan: Tuple[int, bool, bool]):
+    def _bandLookupHits(self, band_number: int, band_hashes: List[int], plan: Tuple[int, bool, bool], on_skipped=None):
         """The band documents a candidate lookup reads: every posting of every hash the cutoff admits.
+
+        `on_skipped(band_hash, df)`, when given, is called once for each wanted hash the cutoff
+        skipped (#201); that needs the df index, without which the lookup cannot tell a skipped
+        hash from one the corpus does not hold, and nothing is reported.
 
         The df-indexed pipeline matches bucket 0 alone. For a hash that never spilled that is all
         of it, and a hash that spilled has a df the cutoff rejects - unless pulls shrank it back
@@ -2234,7 +2252,17 @@ class MongoDbStorage(StorageInterface):
         cutoff, df_index_complete, bucket_zero_only = plan
         collection = self._getDb()["band_%d" % band_number]
         shrunk = []
-        for hit in collection.aggregate(self._bandLookupPipeline(band_hashes, cutoff, df_index_complete)):
+        count_skipped = on_skipped is not None and cutoff > 0 and df_index_complete
+        skipped_from = collection.name if count_skipped else None
+        skipped = set()
+        for hit in collection.aggregate(self._bandLookupPipeline(band_hashes, cutoff, df_index_complete, skipped_from=skipped_from)):
+            # only the $unionWith returns a df over the cutoff, and never with a posting list
+            if count_skipped and (hit.get("df") or 0) > cutoff and "function_ids" not in hit:
+                # once per hash, should a stray df on an upper bucket match as well
+                if hit["band_hash"] not in skipped:
+                    skipped.add(hit["band_hash"])
+                    on_skipped(hit["band_hash"], hit["df"])
+                continue
             if bucket_zero_only and (hit.get("bucket") or 0) != 0:
                 # df belongs on bucket 0 alone; one found on a bucket above it - only switching
                 # bucketing back off, which is unsupported, stamps one - must not admit that bucket
@@ -2245,7 +2273,20 @@ class MongoDbStorage(StorageInterface):
         if shrunk:
             yield from collection.find({"band_hash": {"$in": shrunk}, "bucket": {"$gt": 0}}, {"_id": 0, "band_hash": 1, "function_ids": 1})
 
-    def _getCandidatesForMinHashesNumpy(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, as_arrays=False, band_df_cutoff=None):
+    def _skipCounter(self, skips: Optional[BandDfSkips], plan: Tuple[int, bool, bool], band_hash_to_function_ids: Dict[int, Set[int]]):
+        """The on_skipped callback for one band's lookup, counting into `skips`; None when not counting."""
+        if skips is None:
+            return None
+        if not getattr(self._storage_config, "STORAGE_BAND_DF_COUNT_SKIPS", True):
+            skips.markUnmeasured("disabled")
+            return None
+        cutoff, df_index_complete, _ = plan
+        if cutoff > 0 and not df_index_complete:
+            skips.markUnmeasured("band_df_index_incomplete")
+            return None
+        return lambda band_hash, df: skips.addSkipped(band_hash_to_function_ids[band_hash], df)
+
+    def _getCandidatesForMinHashesNumpy(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, as_arrays=False, band_df_cutoff=None, skips=None):
         """Variant C: accumulate band hits as int64 arrays instead of dict[qid][cid] -> count.
 
         Semantically identical to the dict version (np.unique(..., return_counts=True) counts
@@ -2254,11 +2295,12 @@ class MongoDbStorage(StorageInterface):
         posting list is *shared* by reference between all query functions that hit that band
         hash, so the inner O(pairs) Python loop disappears as well.
         """
-        target_band_hashes_per_band, band_hash_to_function_ids = self._collectBandHashTargets(function_id_to_minhash)
+        target_band_hashes_per_band, band_hash_to_function_ids = self._collectBandHashTargets(function_id_to_minhash, skips)
         hit_chunks = {}
         plan = self._bandLookupPlan(band_df_cutoff)
         for band_number, band_hashes in target_band_hashes_per_band.items():
-            for hit in self._bandLookupHits(band_number, list(band_hashes), plan):
+            on_skipped = self._skipCounter(skips, plan, band_hash_to_function_ids[band_number])
+            for hit in self._bandLookupHits(band_number, list(band_hashes), plan, on_skipped):
                 reference_function_ids = band_hash_to_function_ids[band_number][hit["band_hash"]]
                 # int64, not int32: function ids come from a counter that never reuses an id, so they
                 # pass 2**31 - 1 within a few million samples. numpy 2 then raises OverflowError, and
@@ -2284,7 +2326,9 @@ class MongoDbStorage(StorageInterface):
                 valid_candidates[function_id] = surviving.astype(np.int64, copy=False) if as_arrays else set(surviving.tolist())
         return valid_candidates
 
-    def getCandidateArraysForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None) -> Dict[int, "np.ndarray"]:
+    def getCandidateArraysForMinHashes(
+        self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None, skips: Optional[BandDfSkips] = None
+    ) -> Dict[int, "np.ndarray"]:
         """Candidates as sorted int64 arrays rather than sets.
 
         The accumulation already produces arrays and then boxes them into Python sets; a caller
@@ -2292,16 +2336,19 @@ class MongoDbStorage(StorageInterface):
         them again. Measured on a 361k-pair query against 10k samples, that round trip alone was
         most of a second.
         """
-        return self._getCandidatesForMinHashesNumpy(function_id_to_minhash, band_matches_required=band_matches_required, as_arrays=True, band_df_cutoff=band_df_cutoff)
+        return self._getCandidatesForMinHashesNumpy(function_id_to_minhash, band_matches_required=band_matches_required, as_arrays=True, band_df_cutoff=band_df_cutoff, skips=skips)
 
-    def getCandidatesForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None) -> Dict[int, Set[int]]:
+    def getCandidatesForMinHashes(
+        self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None, skips: Optional[BandDfSkips] = None
+    ) -> Dict[int, Set[int]]:
         if getattr(self._storage_config, "STORAGE_CANDIDATE_ACCUMULATION", "dict") == "numpy":
-            return self._getCandidatesForMinHashesNumpy(function_id_to_minhash, band_matches_required=band_matches_required, band_df_cutoff=band_df_cutoff)
+            return self._getCandidatesForMinHashesNumpy(function_id_to_minhash, band_matches_required=band_matches_required, band_df_cutoff=band_df_cutoff, skips=skips)
         candidates = {}
-        target_band_hashes_per_band, band_hash_to_function_ids = self._collectBandHashTargets(function_id_to_minhash)
+        target_band_hashes_per_band, band_hash_to_function_ids = self._collectBandHashTargets(function_id_to_minhash, skips)
         plan = self._bandLookupPlan(band_df_cutoff)
         for band_number, band_hashes in target_band_hashes_per_band.items():
-            for hit in self._bandLookupHits(band_number, list(band_hashes), plan):
+            on_skipped = self._skipCounter(skips, plan, band_hash_to_function_ids[band_number])
+            for hit in self._bandLookupHits(band_number, list(band_hashes), plan, on_skipped):
                 reference_function_ids = band_hash_to_function_ids[band_number][hit["band_hash"]]
                 for function_id in reference_function_ids:
                     if function_id not in candidates:
@@ -2320,15 +2367,18 @@ class MongoDbStorage(StorageInterface):
                     valid_candidates[function_id].add(other_id)
         return valid_candidates
 
-    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None) -> Set[int]:
+    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None, skips: Optional[BandDfSkips] = None) -> Set[int]:
         if not minhash.hasMinHash():
             return set()
         candidates = {}
         band_hashes = self.getBandHashesForMinHash(minhash)
+        if skips is not None:
+            skips.addLookups(0, len(band_hashes))
         plan = self._bandLookupPlan(band_df_cutoff)
         for band_number, band_hash in sorted(band_hashes.items()):
+            on_skipped = self._skipCounter(skips, plan, {band_hash: {0}})
             # every document, not the first: under bucketing a hash's postings span several
-            for band_document in self._bandLookupHits(band_number, [band_hash], plan):
+            for band_document in self._bandLookupHits(band_number, [band_hash], plan, on_skipped):
                 # a bucket 0 recreated to hold a hash's bookkeeping can carry no posting list
                 for function_id in band_document.get("function_ids") or []:
                     if function_id not in candidates:

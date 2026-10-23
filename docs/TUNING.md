@@ -228,9 +228,8 @@ where the traversal stops scaling; below that there is little left to win.
 `STORAGE_BAND_DF_CUTOFF` is a fixed number, and the posting lists it is compared against are not.
 Vocabulary grows sublinearly with the corpus (Heaps' law, V(n) = 1412.8 · n^0.7247 as fitted by
 `benchmarks/measure_growth.py`) while postings grow with the number of functions, so posting lists
-lengthen and the same cutoff skips a growing share of the index. Nothing on the query path says so:
-counting skipped postings per lookup would roughly double the index work of every band lookup. The
-measurement is a job instead:
+lengthen and the same cutoff skips a growing share of the index. Every matching report counts what
+the cutoff skipped of its own query (below); what it skips of the whole index is a job:
 
     curl http://localhost:8000/band_df_cutoff_coverage                      # the configured cutoff
     curl 'http://localhost:8000/band_df_cutoff_coverage?band_df_cutoff=500' # any other one
@@ -262,6 +261,55 @@ report comes back with `available: false` and says so, rather than counting df-l
 as empty. The postings of a bucketed hash whose bucket 0 is missing carry no df: the report does
 not count them, and with the cutoff on they are never served. `rebuild_band_df_index` repairs such
 a hash by recreating its bucket 0 from the buckets that remain.
+
+Per query, a matching report's `info.matching.candidate_generation` says what the cutoff and the
+shortlist left out of that job:
+
+| key | meaning |
+|---|---|
+| `band_lookups` | (query function, band) pairs looked up |
+| `band_lookups_skipped` | of those, the ones whose band hash was over the cutoff |
+| `postings_skipped` | band hits not fetched: the df of those hashes, summed per skipped lookup |
+| `query_functions_with_skipped_bands` | query functions that lost at least one band |
+| `query_functions_cut_off` | query functions the cutoff left with fewer unskipped bands than `band_matches_required`, where that is within the band count |
+| `shortlist_voted_samples`, `shortlist_dropped_samples` | samples stage 1 ranked, and those it did not keep |
+| `shortlist_dropped_candidates` | candidate functions outside the shortlist |
+| `degraded` | `query_functions_cut_off` is above 0: recall is at risk |
+
+A corpus function becomes a candidate by colliding with the query function on at least
+`band_matches_required` bands (2 by default), so a query function with fewer bands left than that
+cannot be found by the fuzzy path at all - only PicHash can still match it.
+`query_functions_cut_off` counts those: the functions the cutoff made unfindable. It is a necessary
+condition, not a sufficient one; a function left with enough bands may still not collide on them.
+The shortlist keys are `null` when no shortlist ran, and the whole entry is `null` when
+`band_matches_required` is 0. A shortlist dropping samples is what it is for, so it never sets
+`degraded`. A degraded job logs one INFO line, `Candidate generation degraded: ...`.
+
+Read the shares, and compare them for the same query over time: some code is common enough that
+skipping its bands is right, but a rising `band_lookups_skipped / band_lookups`, or more query
+functions cut off, is the cutoff starting to bite - re-measure recall then, as above. A repeated
+request is answered from the cached job, counts included, so comparing over time needs
+`force_recalculation`. A result whose counts went unmeasured because the df index was incomplete is
+never cached, so it is recounted once the index is rebuilt. Until `rebuild_band_df_index` completes,
+that means every repeated matching request with a cutoff is computed again rather than served from
+the cache - and on the slower `$size` lookup the band lookup falls back to without the df index.
+
+On MongoDB the cutoff is applied server-side and a skipped hash is never returned, so the lookup
+cannot tell it from one the corpus lacks. The band lookup's aggregation therefore asks for the
+skipped hashes as well, in a `$unionWith` answered from the `(band_hash, df)` index entries alone:
+no skipped posting list is read and there is no extra round trip, but the lookup's index seeks are
+repeated. Measured on a synthetic 20-band corpus (MongoDB 7.0, 1,000 query functions, 20,000
+lookups, 990 of them skipped), the band lookup took 0.137 s at best without the count and 0.172 s
+with it: about 35 ms per 1,000 query functions, under 2 µs per (function, band) pair, or a few
+percent of a whole query. MemoryStorage counts for free.
+
+`STORAGE_BAND_DF_COUNT_SKIPS` (default `True`) turns the count off: no `$unionWith`, the same
+lookup as before (0.141 s on that corpus), and reports say `band_df_skips_measured: false` with
+`band_df_skips_unmeasured_reason: "disabled"` and `null` skip counts. Without a trusted df (until
+`rebuild_band_df_index` has run) the reason is `band_df_index_incomplete`. A storage class whose
+candidate lookup does not take the count's argument (decided from its signature) is called without
+it; the reason is then `storage_unsupported`, and `band_lookups` is `null` as well. An unmeasured
+report is never `degraded`.
 
 There is no dynamic pruning (WAND/MaxScore) behind the cutoff: it would need posting lists sorted
 by function id, which the fill-order buckets of `STORAGE_BAND_BUCKET_SIZE` are not. Until that

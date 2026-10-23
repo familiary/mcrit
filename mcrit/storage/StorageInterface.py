@@ -45,6 +45,86 @@ BAND_DF_REFERENCE_CUTOFFS = (50, 100, 200, 500, 1000)
 BAND_DF_CUTOFF_MAX = 2**63 - 1
 
 
+class BandDfSkips:
+    """What the band df cutoff left out of one job's candidate generation (#201).
+
+    A candidate lookup that is handed one counts into it while it runs: every (query function,
+    band) pair it looks up, and those whose band hash it skipped for a posting list longer than
+    the cutoff, with that list's length. The coverage report says how much of the index a cutoff
+    skips; this says how much of one query it skipped, which is where a cutoff that has started
+    to bite shows first.
+
+    Counts are per query function id. A single-function lookup (getCandidatesForMinHash) counts
+    under function id 0, so per-function counts are only meaningful for one such call per object.
+    """
+
+    def __init__(self) -> None:
+        self.band_lookups = 0
+        self.band_lookups_skipped = 0
+        # band hits not fetched, summed per skipped lookup: a hash skipped for three query
+        # functions counts its df three times
+        self.postings_skipped = 0
+        self._bands_per_function: Dict[int, int] = {}
+        self._skipped_per_function: Dict[int, int] = {}
+        # why the skips could not be counted, or None when they were
+        self.unmeasured_reason: Optional[str] = None
+        # False when the lookup could not be handed this object at all, so not even the lookups
+        # were counted
+        self.lookups_counted = True
+
+    def addLookups(self, function_id: int, num_bands: int) -> None:
+        self.band_lookups += num_bands
+        self._bands_per_function[function_id] = self._bands_per_function.get(function_id, 0) + num_bands
+
+    def addSkipped(self, function_ids: Iterable[int], df: int) -> None:
+        """The band hash of a posting list `df` long was skipped for each of these query functions."""
+        for function_id in function_ids:
+            self.band_lookups_skipped += 1
+            self.postings_skipped += df
+            self._skipped_per_function[function_id] = self._skipped_per_function.get(function_id, 0) + 1
+
+    def markUnmeasured(self, reason: str) -> None:
+        self.unmeasured_reason = reason
+
+    def merge(self, other: "BandDfSkips") -> None:
+        self.band_lookups += other.band_lookups
+        self.band_lookups_skipped += other.band_lookups_skipped
+        self.postings_skipped += other.postings_skipped
+        for mine, theirs in ((self._bands_per_function, other._bands_per_function), (self._skipped_per_function, other._skipped_per_function)):
+            for function_id, count in theirs.items():
+                mine[function_id] = mine.get(function_id, 0) + count
+        self.unmeasured_reason = self.unmeasured_reason or other.unmeasured_reason
+        self.lookups_counted = self.lookups_counted and other.lookups_counted
+
+    def queryFunctionsCutOff(self, band_matches_required: int) -> int:
+        """Query functions the cutoff left with fewer unskipped bands than band_matches_required.
+
+        No corpus function can collect enough band hits to become such a function's candidate, so
+        the fuzzy path cannot find it at all; only PicHash can. A necessary condition only: a
+        function left with enough bands may still not collide on them. Only a requirement the
+        function could meet with every band counts: above its band count it is unfindable with or
+        without the cutoff, and that is not the cutoff's doing.
+        """
+        required = max(1, band_matches_required)
+        cut_off = 0
+        for function_id, skipped in self._skipped_per_function.items():
+            bands = self._bands_per_function.get(function_id, 0)
+            cut_off += skipped > 0 and required <= bands and bands - skipped < required
+        return cut_off
+
+    def toDict(self, band_matches_required: int = 1) -> Dict[str, Any]:
+        measured = self.unmeasured_reason is None
+        return {
+            "band_df_skips_measured": measured,
+            "band_df_skips_unmeasured_reason": self.unmeasured_reason,
+            "band_lookups": self.band_lookups if self.lookups_counted else None,
+            "band_lookups_skipped": self.band_lookups_skipped if measured else None,
+            "postings_skipped": self.postings_skipped if measured else None,
+            "query_functions_with_skipped_bands": len(self._skipped_per_function) if measured else None,
+            "query_functions_cut_off": self.queryFunctionsCutOff(band_matches_required) if measured else None,
+        }
+
+
 class BinaryStream(Protocol):
     """What openSampleBinary hands back: enough of a file to stream it out and close it.
 
@@ -102,13 +182,14 @@ class StorageInterface:
         raise NotImplementedError
 
     # -> Set[function_id]
-    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None) -> Set[int]:
+    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None, skips: Optional[BandDfSkips] = None) -> Set[int]:
         """Given a MinHash, return all candidates from all matching bands.
 
         Args:
             minhash: a MinHash
             band_matches_required: the number of bands a minhash needs to match before being considered a candidate
             band_df_cutoff: skip band hashes held by more functions than this; None uses STORAGE_BAND_DF_CUTOFF, 0 means no cutoff
+            skips: counts the lookups and what the cutoff skipped of them, when given (#201)
 
         Returns:
             candidates: a set of function_ids
@@ -116,13 +197,16 @@ class StorageInterface:
         raise NotImplementedError
 
     # -> Dict[function_id, Set[function_id]]
-    def getCandidatesForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None) -> Dict[int, Set[int]]:
+    def getCandidatesForMinHashes(
+        self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None, skips: Optional[BandDfSkips] = None
+    ) -> Dict[int, Set[int]]:
         """Given MinHashes by function_id, return all candidates from all matching bands.
 
         Args:
             function_id_to_minhash: a dict mapping a function_id to a MinHash.
             band_matches_required: the number of bands a minhash needs to match before being considered a candidate
             band_df_cutoff: skip band hashes held by more functions than this; None uses STORAGE_BAND_DF_CUTOFF, 0 means no cutoff
+            skips: counts the lookups and what the cutoff skipped of them, when given (#201)
 
         Returns:
             candidates: a dict mapping a function_id to a set of candidate function_ids.
@@ -968,10 +1052,10 @@ class StorageInterface:
     def getBandDfCutoffCoverage(self, band_df_cutoff: Optional[int] = None, progress_reporter=None) -> Dict[str, Any]:
         """Measure how much of the band index STORAGE_BAND_DF_CUTOFF skips, per band and in total.
 
-        The cutoff drops a band hash whose posting list is longer than it, and nothing on the query
-        path says how much that is: counting skipped postings per lookup would roughly double each
-        lookup's index work. This is the offline answer - how many band hashes and postings there
-        are, and how many of them sit in posting lists over the cutoff. As the corpus grows, posting
+        The cutoff drops a band hash whose posting list is longer than it. Each matching report
+        counts what that skipped of its own query (BandDfSkips, `info.matching.candidate_generation`);
+        this is the corpus-wide answer - how many band hashes and postings there are, and how many
+        of them sit in posting lists over the cutoff. As the corpus grows, posting
         lists lengthen and a fixed cutoff skips a growing share; this is how that becomes visible.
 
         Args:

@@ -123,6 +123,16 @@ class StorageConfig(ConfigInterface):
     # unaffected, and benchmarks/compare_quality.py measures what a given cutoff costs against
     # the uncapped result on a real corpus. See docs/scaling/ for measured numbers.
     STORAGE_BAND_DF_CUTOFF: int = 0
+    # Count, per matching job, the band lookups STORAGE_BAND_DF_CUTOFF skipped, and report them
+    # under info.matching.candidate_generation (#201). A fixed cutoff skips a growing share of a
+    # growing corpus; these counts show it on the queries it affects.
+    #
+    # MemoryStorage counts for free. MongoDB never returns a skipped hash, so the band lookup asks
+    # for them in the same aggregation, from the (band_hash, df) index entries alone (no band
+    # document is read). That repeats the lookup's index seeks: about 2 us per (query function,
+    # band) pair, measured as ~35 ms per 1,000 query functions on a synthetic 20-band corpus.
+    # False drops that probe; reports then say band_df_skips_measured: false, reason "disabled".
+    STORAGE_BAND_DF_COUNT_SKIPS: bool = True
     # Cap on how many function ids one band document may hold, splitting a posting list across
     # (band_hash, bucket) documents once it would exceed that. 0 keeps the single-document shape.
     #

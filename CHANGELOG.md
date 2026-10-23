@@ -15,6 +15,27 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- **Every matching report says what candidate generation left out of it** ([#201], #303), under
+  `info.matching.candidate_generation`: how many (query function, band) lookups
+  `STORAGE_BAND_DF_CUTOFF` skipped of how many, the band hits not fetched for them, the query
+  functions that lost a band, those it cut off (fewer bands left than `band_matches_required`, so
+  only PicHash can still match them) and what the shortlist dropped. `degraded` is true only when
+  the cutoff cut a query function off; shortlist drops are by design and never set it. A degraded
+  job logs one INFO line. This is the per-query side of the coverage report: a fixed cutoff starting
+  to bite shows on the queries it bites instead of recall eroding without a trace, and it is the
+  data that decides whether WAND/MaxScore is worth building. On MongoDB the skipped hashes come from
+  the `(band_hash, df)` index entries inside the band lookup's own aggregation (no band document
+  read, no extra round trip), which repeats the lookup's index seeks: on a synthetic 20-band corpus
+  the band lookup went from 0.137 s to 0.172 s per 1,000 query functions, under 2 µs per lookup. The
+  new setting `STORAGE_BAND_DF_COUNT_SKIPS` (default `True`) turns that off. Switched off, without a
+  trusted df, or with a storage class that predates the count, `band_df_skips_measured` is `false`
+  with the reason and the skip counts are `null`; a result left unmeasured by an incomplete df index
+  is not cached. Matches are unchanged and `RESULTS_VERSION` is not bumped: a report cached before
+  this has no `candidate_generation` key, which reads as "not measured", and comparing a query over
+  time needs `force_recalculation`.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

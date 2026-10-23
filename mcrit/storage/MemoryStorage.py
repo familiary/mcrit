@@ -24,7 +24,7 @@ from mcrit.storage.FunctionEntry import FunctionEntry
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
 from mcrit.storage.MatchingCache import MatchingCache, StorageBackedMatchingCache
 from mcrit.storage.SampleEntry import TIMESTAMP_FORMAT, SampleEntry
-from mcrit.storage.StorageInterface import BinaryStream, StorageInterface
+from mcrit.storage.StorageInterface import BandDfSkips, BinaryStream, StorageInterface
 
 if TYPE_CHECKING:  # pragma: no cover
     from smda.common.SmdaFunction import SmdaFunction
@@ -960,14 +960,20 @@ class MemoryStorage(StorageInterface):
 
     # -> Dict[function_id, Set[function_id]]
     # TODO optimize or move to interface
-    def getCandidatesForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None) -> Dict[int, Set[int]]:
+    def getCandidatesForMinHashes(
+        self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None, skips: Optional[BandDfSkips] = None
+    ) -> Dict[int, Set[int]]:
         candidates = {}
         for function_id, minhash in function_id_to_minhash.items():
-            candidates[function_id] = self.getCandidatesForMinHash(minhash, band_matches_required=band_matches_required, band_df_cutoff=band_df_cutoff)
+            candidates[function_id] = self._getCandidatesForMinHash(minhash, band_matches_required, band_df_cutoff, skips, function_id)
         return candidates
 
     # -> Set[function_id]
-    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None) -> Set[int]:
+    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None, skips: Optional[BandDfSkips] = None) -> Set[int]:
+        return self._getCandidatesForMinHash(minhash, band_matches_required, band_df_cutoff, skips, 0)
+
+    def _getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required, band_df_cutoff, skips: Optional[BandDfSkips], function_id: int) -> Set[int]:
+        """getCandidatesForMinHash, with the query function `skips` counts the lookups under."""
         if not minhash.hasMinHash():
             return set()
         # as in MongoDbStorage: the job's cutoff, else STORAGE_BAND_DF_CUTOFF, and a posting list
@@ -975,17 +981,29 @@ class MemoryStorage(StorageInterface):
         cutoff = getattr(self._storage_config, "STORAGE_BAND_DF_CUTOFF", 0) if band_df_cutoff is None else band_df_cutoff
         candidates = {}
         band_hashes = self.getBandHashesForMinHash(minhash)
+        if skips is not None:
+            skips.addLookups(function_id, len(band_hashes))
+            # counting is free here, but the switch means the same on every backend
+            if not getattr(self._storage_config, "STORAGE_BAND_DF_COUNT_SKIPS", True):
+                skips.markUnmeasured("disabled")
+                skips = None
         for band_number, band_hash in sorted(band_hashes.items()):
-            if band_hash in self._bands[band_number] and (cutoff <= 0 or len(self._bands[band_number][band_hash]) <= cutoff):
-                for function_id in self._bands[band_number][band_hash]:
-                    if function_id not in candidates:
-                        candidates[function_id] = 0
-                    candidates[function_id] += 1
+            posting_list = self._bands[band_number].get(band_hash)
+            if posting_list is None:
+                continue
+            if cutoff > 0 and len(posting_list) > cutoff:
+                if skips is not None:
+                    skips.addSkipped((function_id,), len(posting_list))
+                continue
+            for candidate_id in posting_list:
+                if candidate_id not in candidates:
+                    candidates[candidate_id] = 0
+                candidates[candidate_id] += 1
         # reduce candidates based on banding requirements
         valid_candidates = set([])
-        for function_id, hit_count in candidates.items():
+        for candidate_id, hit_count in candidates.items():
             if hit_count >= band_matches_required:
-                valid_candidates.add(function_id)
+                valid_candidates.add(candidate_id)
         return valid_candidates
 
     def getUnhashedFunctions(self, function_ids: Optional[List[int]] = None, only_function_ids=False) -> List[Union[int, "FunctionEntry"]]:

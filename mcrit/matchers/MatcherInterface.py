@@ -1,7 +1,9 @@
 import datetime
 import functools
+import inspect
 import logging
 import math
+import weakref
 from collections import Counter, defaultdict
 from timeit import default_timer as timer
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -12,6 +14,7 @@ import tqdm
 import mcrit.matchers.MatcherFlags as MatcherFlags
 from mcrit.libs.parallel import create_process_pool
 from mcrit.queue.QueueRemoteCalls import NoProgressReporter
+from mcrit.storage.StorageInterface import BandDfSkips
 
 if TYPE_CHECKING:  # pragma: no cover
     from mcrit.storage.FunctionEntry import FunctionEntry
@@ -70,6 +73,22 @@ def shortlistUnavailableReason(storage) -> Optional[str]:
     return None
 
 
+# per storage method (the function under a bound method): whether it takes the `skips` argument
+_ACCEPTS_SKIPS: "weakref.WeakKeyDictionary[Any, bool]" = weakref.WeakKeyDictionary()
+
+
+def acceptsSkips(getter) -> bool:
+    """Whether a candidate lookup takes `skips` (#201), by name or through **kwargs; cached per method."""
+    function = getattr(getter, "__func__", None)
+    if function is not None and function in _ACCEPTS_SKIPS:
+        return _ACCEPTS_SKIPS[function]
+    parameters = inspect.signature(getter).parameters.values()
+    accepts = any(parameter.name == "skips" or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+    if function is not None:
+        _ACCEPTS_SKIPS[function] = accepts
+    return accepts
+
+
 class MatcherInterface:
     # how many band votes one exact (PicHash) match is worth when ranking the shortlist
     _PICHASH_SHORTLIST_VOTE_WEIGHT = 4
@@ -117,6 +136,12 @@ class MatcherInterface:
         self._shortlist_candidate_cache: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None
         # the shortlist as a sorted array, for vectorised membership tests
         self._shortlist_array: Optional[np.ndarray] = None
+        # what candidate generation left out, for the report (#201): band lookups the df cutoff
+        # skipped, and samples and candidates the shortlist did not keep
+        self._band_df_skips = BandDfSkips()
+        self._shortlist_voted_samples: Optional[int] = None
+        self._shortlist_dropped_samples: Optional[int] = None
+        self._shortlist_dropped_candidates = 0
         if minhash_threshold is None:
             minhash_threshold = self._worker.config.MINHASH_CONFIG.MINHASH_MATCHING_THRESHOLD
         self._minhash_threshold = minhash_threshold
@@ -175,10 +200,21 @@ class MatcherInterface:
             function_id_to_minhash = {}
             for function_entry in self._function_entries[start:end]:
                 function_id_to_minhash[function_entry.function_id] = function_entry.getMinHash(minhash_bits=self._worker._minhash_config.MINHASH_SIGNATURE_BITS)
-            candidate_groups = self._storage.getCandidatesForMinHashes(
-                function_id_to_minhash, band_matches_required=self._band_matches_required, band_df_cutoff=self._band_df_cutoff
-            )
+            candidate_groups = self._lookupCandidates(self._storage.getCandidatesForMinHashes, function_id_to_minhash, self._band_df_skips)
         return self._restrictToShortlist(candidate_groups)
+
+    def _lookupCandidates(self, getter, function_id_to_minhash, skips: BandDfSkips):
+        """getter(...) with this job's knobs, counting what the df cutoff skipped into `skips` (#201).
+
+        A storage whose lookup predates the `skips` argument is called without it, decided from its
+        signature rather than by catching a TypeError, which would also swallow a real error inside
+        the count and run the lookup twice.
+        """
+        if acceptsSkips(getter):
+            return getter(function_id_to_minhash, band_matches_required=self._band_matches_required, band_df_cutoff=self._band_df_cutoff, skips=skips)
+        skips.markUnmeasured("storage_unsupported")
+        skips.lookups_counted = False
+        return getter(function_id_to_minhash, band_matches_required=self._band_matches_required, band_df_cutoff=self._band_df_cutoff)
 
     # ---- two-stage matching: shortlist the corpus samples worth matching exactly ----------
 
@@ -234,6 +270,8 @@ class MatcherInterface:
         # Python cost 1.2 s of voting plus 1.1 s of restriction on a 361k-pair query.
         cached_groups: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
         per_function_votes: List[np.ndarray] = []
+        # counted apart and kept only once stage 1 succeeds: a fallback bands the query again
+        stage_skips = BandDfSkips()
         chunk_size = max(1, min(self._worker.config.MINHASH_CONFIG.MINHASH_MATCHING_FUNCTION_BATCH_SIZE, 1000))
         for start_index in range(0, len(self._function_entries), chunk_size):
             function_id_to_minhash = {}
@@ -242,12 +280,7 @@ class MatcherInterface:
             # ask for arrays where storage can produce them: the accumulation is already
             # numpy, and boxing it into sets only to unbox it here is pure overhead
             array_getter = getattr(self._storage, "getCandidateArraysForMinHashes", None)
-            if array_getter is not None:
-                candidate_groups = array_getter(function_id_to_minhash, band_matches_required=self._band_matches_required, band_df_cutoff=self._band_df_cutoff)
-            else:
-                candidate_groups = self._storage.getCandidatesForMinHashes(
-                    function_id_to_minhash, band_matches_required=self._band_matches_required, band_df_cutoff=self._band_df_cutoff
-                )
+            candidate_groups = self._lookupCandidates(array_getter or self._storage.getCandidatesForMinHashes, function_id_to_minhash, stage_skips)
             for function_id, candidate_ids in candidate_groups.items():
                 if not len(candidate_ids):
                     continue
@@ -279,9 +312,12 @@ class MatcherInterface:
         for sample_id in self._otherArchitectureSampleIds(set(votes)):
             del votes[sample_id]
         shortlist = self._rankShortlist(votes, shortlist_size)
+        self._shortlist_voted_samples = len(votes)
+        self._shortlist_dropped_samples = len(votes) - len(shortlist)
         if self._sample_id is not None:
             shortlist.add(self._sample_id)
         self._shortlist_candidate_cache = cached_groups
+        self._band_df_skips.merge(stage_skips)
         LOGGER.info("Shortlisted %d of %d voted samples for exact matching", len(shortlist), len(votes))
         return shortlist
 
@@ -345,6 +381,7 @@ class MatcherInterface:
             if not candidates.size:
                 continue
             surviving = candidates[np.isin(sample_ids, self._shortlist_array)]
+            self._shortlist_dropped_candidates += int(candidates.size - surviving.size)
             if surviving.size:
                 restricted[function_id] = set(surviving.tolist())
         return restricted
@@ -470,6 +507,7 @@ class MatcherInterface:
                 minhash_matches = self._harmonizeMinHashMatches(self._sample_id, self._performMinHashMatching(candidate_groups, matching_cache))
                 all_minhash_matches.update(minhash_matches)
             LOGGER.info("Calculated MinHash matches.")
+            self._logCandidateGeneration()
         pichash_matches = self._dropOtherArchitectures(pichash_matches)
         all_minhash_matches = self._dropOtherArchitectures(all_minhash_matches)
         matching_report = self._craftResultDict(pichash_matches, all_minhash_matches)
@@ -1015,8 +1053,52 @@ class MatcherInterface:
         return matches_per_sample
 
     def fellBackUnforeseen(self) -> bool:
-        """Whether a knob could not be applied although the job's arguments did not say it would not be."""
+        """Whether the result depends on state its arguments do not name, so it must not be cached.
+
+        A knob that could not be applied although the job's arguments did not say it would not be
+        (#217), or skip counts left unmeasured because the band df index was incomplete when the job
+        ran (#201): once the index is rebuilt, the same request should be counted, not served this.
+        """
+        if self._band_df_skips.unmeasured_reason == "band_df_index_incomplete":
+            return True
         return self._shortlist_fallback is not None and self._shortlist_unavailable is None
+
+    def _getCandidateGenerationInfo(self) -> Optional[Dict[str, Any]]:
+        """What candidate generation left out of this job (#201), None when it looked up no bands.
+
+        The df cutoff and the shortlist bound the work per query by not looking at everything, and
+        nothing else in a report says how much they did not look at. `degraded` is True only when
+        recall is at risk from the cutoff: it left a query function fewer unskipped bands than
+        band_matches_required, so the fuzzy path cannot find it at all. Shortlist drops are by design and only reported. Counted inside
+        the loops that already run; on MongoDB the skipped hashes come back from the band lookup's
+        own aggregation, which needs the df index and STORAGE_BAND_DF_COUNT_SKIPS - without either,
+        `band_df_skips_measured` is False with the reason, those counts are None and `degraded`
+        False.
+        """
+        if self._band_matches_required <= 0:
+            return None
+        info = self._band_df_skips.toDict(self._band_matches_required)
+        info["shortlist_voted_samples"] = self._shortlist_voted_samples
+        info["shortlist_dropped_samples"] = self._shortlist_dropped_samples
+        info["shortlist_dropped_candidates"] = self._shortlist_dropped_candidates if self._sample_shortlist is not None else None
+        info["degraded"] = bool(info["query_functions_cut_off"])
+        return info
+
+    def _logCandidateGeneration(self) -> None:
+        """One INFO line when the cutoff put recall at risk (#201); silent otherwise."""
+        info = self._getCandidateGenerationInfo()
+        if not info or not info["degraded"]:
+            return
+        LOGGER.info(
+            "Candidate generation degraded: band df cutoff left %d query functions fewer than %d bands, so no MinHash candidate; it skipped %d of %d band "
+            "lookups (%d band hits not fetched) and touched %d query functions.",
+            info["query_functions_cut_off"],
+            self._band_matches_required,
+            info["band_lookups_skipped"],
+            info["band_lookups"],
+            info["postings_skipped"],
+            info["query_functions_with_skipped_bands"],
+        )
 
     def _getMatchingInfo(self) -> Dict[str, Any]:
         """The knobs this job was asked for and the ones it applied, with why any of them differ (#217).
@@ -1051,6 +1133,7 @@ class MatcherInterface:
                 "band_df_cutoff": band_df_cutoff if minhash_stage else None,
             },
             "fallbacks": fallbacks,
+            "candidate_generation": self._getCandidateGenerationInfo(),
         }
 
     def _craftResultDict(self, pichash_matches: HarmonizedMatches, minhash_matches: HarmonizedMatches, num_matches=None) -> Dict:
