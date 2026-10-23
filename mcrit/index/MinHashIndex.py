@@ -16,7 +16,7 @@ from mcrit.config.StorageConfig import StorageConfig
 from mcrit.index.MatchingParameters import applyMatchingPreset, resolveMatchingParams
 from mcrit.index.SearchCursor import FullSearchCursor, MinimalSearchCursor, sortSpec
 from mcrit.index.SearchQueryParser import SearchQueryParser
-from mcrit.libs.utility import compress_encode, decompress_decode
+from mcrit.libs.utility import compress_encode, compress_encode_fragments, decompress_decode
 from mcrit.matchers.MatcherQueryFunction import MatcherQueryFunction
 from mcrit.minhash.EscaperFingerprint import FINGERPRINT_UNAVAILABLE, getEscaperFingerprint, getEscaperFingerprints
 from mcrit.minhash.MinHash import MinHash
@@ -36,6 +36,11 @@ LOGGER = logging.getLogger(__name__)
 # the smda that this process will escape with; recorded alongside the escaper fingerprint so an
 # export or a status response says which smda produced the minhashes it describes
 SMDA_VERSION = SmdaConfig().VERSION
+
+# A cross compare of n samples makes n child jobs - with sample_group_only each of them reads the
+# n-1 other samples - and n*n matrices in its combine step, and its id list was bounded by nothing
+# but the length of a URL.
+MAX_CROSS_COMPARE_SAMPLES = 1000
 
 
 #### Helper methods for nested sort_by in search
@@ -158,6 +163,54 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         storage.setContent(storage_data["storage"])
 
     def getExportData(self, sample_ids=None, compress_data=False):
+        return self._collectExportData(sample_ids, compress_data, serialize=False)
+
+    def getExportJson(self, sample_ids=None, compress_data=False) -> List[bytes]:
+        """json.dumps(getExportData()), in pieces that joined are that text (GET /export sends them as they are).
+
+        Function entries are read from storage one batch at a time and serialised one by one, and every entry's text -
+        sample and function entries, family names and actors - is counted against STORAGE_MAX_EXPORT_SIZE before
+        it is kept. Only that text is kept, so the export holds what the cap counts plus one batch; a compressed export
+        counts a sample's text while it holds it for compression. getExportData() keeps Python objects instead,
+        several times the size the cap counts."""
+        exported_data = self._collectExportData(sample_ids, compress_data, serialize=True)
+        fragments = [b"{"]
+        for position, (key, value) in enumerate(exported_data.items()):
+            fragments.append(b"%s%s: " % (b", " if position else b"", json.dumps(key).encode()))
+            if key not in ("family_actors", "sample_entries", "function_entries"):
+                fragments.append(json.dumps(value).encode())
+                continue
+            # these hold the entries' text fragments already
+            fragments.append(b"{")
+            for entry_position, (entry_key, entry_fragments) in enumerate(value.items()):
+                fragments.extend([b", " if entry_position else b"", json.dumps(str(entry_key)).encode(), b": ", *entry_fragments])
+            fragments.append(b"}")
+        fragments.append(b"}")
+        return fragments
+
+    @staticmethod
+    def _serializeExportFunctions(storage, sample_id, compress_data, count):
+        """A sample's function entries as JSON text fragments, read and serialised one batch at a time, each counted
+        (count) before it is kept. Compressed, the text is counted while it is held and then replaced by the compressed
+        text, which is what stays."""
+        fragments = [b"{"]
+        num_functions = 0
+        for batch in storage.getFunctionsBySampleIdInBatches(sample_id):
+            for function_entry in batch:
+                fragment = b"%s%s: %s" % (b", " if num_functions else b"", json.dumps(str(function_entry.function_id)).encode(), json.dumps(function_entry.toDict()).encode())
+                count(len(fragment))
+                fragments.append(fragment)
+                num_functions += 1
+        fragments.append(b"}")
+        count(2)
+        if compress_data:
+            compressed = json.dumps(compress_encode_fragments(fragments)).encode()
+            count(len(compressed))
+            count(-sum(len(fragment) for fragment in fragments))
+            fragments = [compressed]
+        return fragments, num_functions
+
+    def _collectExportData(self, sample_ids, compress_data, serialize):
         storage = self.getStorage()
         exported_data = {
             "content": {"is_compressed": compress_data, "num_families": 0, "num_samples": 0, "num_functions": 0},
@@ -184,26 +237,39 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         exported_sample_entries = {}
         exported_function_entries = {}
         export_size = 0
+
+        def count(num_bytes):
+            # the JSON text of every entry, checked before the entry is kept; serialize keeps only that text, and
+            # then the count is what the export holds
+            nonlocal export_size
+            export_size += num_bytes
+            if export_size > self._storage_config.STORAGE_MAX_EXPORT_SIZE:
+                raise MemoryError("Export running beyond the allocated maximum, aborting operation.")
+
         # iterate over sample_ids and transform respective data
         for sample_id in storage.getSampleIds():
             if sample_ids and sample_id not in sample_ids:
                 continue
             sample_entry = storage.getSampleById(sample_id)
+            if sample_entry.family_id not in family_mapping:
+                count(len(json.dumps(sample_entry.family)))
             family_mapping[sample_entry.family_id] = sample_entry.family
-            exported_sample_entries[sample_entry.sha256] = sample_entry.toDict()
-            function_entries = storage.getFunctionsBySampleId(sample_id)
-            functions_dict = {function_entry.function_id: function_entry.toDict() for function_entry in function_entries}
-            exported_function_entries[sample_entry.sha256] = functions_dict
-            if compress_data:
-                compressed_encoded = compress_encode(json.dumps(functions_dict))
-                exported_function_entries[sample_entry.sha256] = compressed_encoded
-                export_size += len(compressed_encoded)
+            sample_dict = sample_entry.toDict()
+            sample_json = json.dumps(sample_dict)
+            count(len(sample_json))
+            if serialize:
+                exported_sample_entries[sample_entry.sha256] = [sample_json.encode()]
+                exported_function_entries[sample_entry.sha256], num_functions = self._serializeExportFunctions(storage, sample_id, compress_data, count)
             else:
-                export_size += len(json.dumps(functions_dict))
+                function_entries = storage.getFunctionsBySampleId(sample_id) or []
+                functions_dict = {function_entry.function_id: function_entry.toDict() for function_entry in function_entries}
+                functions_value = compress_encode(json.dumps(functions_dict)) if compress_data else functions_dict
+                count(len(json.dumps(functions_value)))
+                exported_sample_entries[sample_entry.sha256] = sample_dict
+                exported_function_entries[sample_entry.sha256] = functions_value
+                num_functions = len(function_entries)
             exported_data["content"]["num_samples"] += 1
-            exported_data["content"]["num_functions"] += len(function_entries)
-            if export_size > self._storage_config.STORAGE_MAX_EXPORT_SIZE:
-                raise MemoryError("Export running beyond the allocated maximum, aborting operation.")
+            exported_data["content"]["num_functions"] += num_functions
         exported_data["content"]["num_families"] = len(family_mapping)
         exported_data["family_mapping"] = family_mapping
         # the family attributes beyond the name (#57); an importer without this key ignores it
@@ -211,7 +277,9 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         for family_id in family_mapping:
             family_entry = storage.getFamily(family_id)
             if family_entry is not None and family_entry.actors:
-                exported_data["family_actors"][family_id] = list(family_entry.actors)
+                actors_json = json.dumps(list(family_entry.actors))
+                count(len(actors_json))
+                exported_data["family_actors"][family_id] = [actors_json.encode()] if serialize else list(family_entry.actors)
         exported_data["sample_entries"] = exported_sample_entries
         exported_data["function_entries"] = exported_function_entries
         return exported_data
@@ -571,6 +639,11 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         params.pop("shortlist_unavailable", None)
         if not sample_group_only:
             params["shortlist_size"] = 0
+        # a sample named twice is compared once: each vs-group child loads every other sample named,
+        # so a repeated id made it load that sample's functions once per repetition
+        sample_ids = list(dict.fromkeys(sample_ids))
+        if len(sample_ids) > MAX_CROSS_COMPARE_SAMPLES:
+            raise ValueError(f"A cross compare takes at most {MAX_CROSS_COMPARE_SAMPLES} samples.")
         for id in sample_ids:
             if sample_group_only:
                 job_id = self.getMatchesForSampleVsGroup(id, [sid for sid in sample_ids if sid != id], force_recalculation=force_recalculation, username=username, **params)

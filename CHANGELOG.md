@@ -15,6 +15,66 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Security
+
+- **A cross compare takes every sample it names once, and at most 1,000 of them.** With
+  `sample_group_only=true` each child job held the functions and disassembly of every other sample
+  named at once, a repeated id once per repetition: naming a sample of 1,000 functions 40 times in a
+  103-byte path made one child hold 41,000 function entries for +495 MiB. Repeated ids are now
+  dropped before the child jobs are made, and a vs-group child reads the other samples one at a time
+  without their disassembly, keeping their function ids and the functions sharing a PicHash with its
+  own. Reports are unchanged. The id list was bounded only by the length of a URL; more than 1,000
+  distinct samples (`MAX_CROSS_COMPARE_SAMPLES` in `mcrit.index.MinHashIndex`) now answer 400.
+
+- **The plain `mcrit worker` stops a matching or unique-blocks job after `QUEUE_WORKER_JOB_TIMEOUT`
+  seconds** (default 3600, `0` for no limit). Its heartbeat kept a job claimed however long it ran,
+  so a job a request can make long held the worker as long. The matching jobs (sample, vs, vs-group,
+  cross, query) and unique blocks now fail after the limit and are retried like any failing job, up
+  to `QUEUE_MAX_ATTEMPTS` times, as a `spawningworker` job process is after
+  `QUEUE_SPAWNINGWORKER_CHILDREN_TIMEOUT`. They only read the index. Binary submission and the
+  minhash updates are not timed, as an interruption between storing a function's minhash and its band
+  postings would leave it out of fuzzy matching with nothing to repair it, and neither is corpus
+  maintenance (`rebuild*`, `recalculate*`, `repair*`, `doDbCleanup`, deletions, modifications), which
+  takes as long as the corpus is large. Needs `SIGALRM` (POSIX) and the worker in the main thread;
+  otherwise it warns and runs unbounded.
+
+- **A unique-blocks request with a large `covers_required` no longer holds a worker for hours.**
+  When `covers_required` is more than the blocks can reach, the greedy cover selects every unique
+  block, rescanning and resorting all of them, with a list lookup against those already selected,
+  for each one: cubic in the number of blocks. `GET
+  /uniqueblocks/samples/{id}?covers_required=1000000000` for 2,000 unique blocks took 33 s against
+  0.07 s at the default 10. The cover now keeps its candidates in a heap and re-scores only the one
+  on top; it selects the same blocks in the same order, so results and `RESULTS_VERSION` are
+  unchanged.
+
+- **A full band posting list no longer drops whole samples from the index.** Without
+  `STORAGE_BAND_BUCKET_SIZE` a band hash is one document, which MongoDB refuses to grow past 16 MiB
+  (about 1.35 million function ids). Copies of one function share all their band hashes, so a
+  function submitted over and over fills them. Each later sample holding that function then failed
+  its minhash job at the first full band with every band after it left unwritten, and the job's
+  retry found the minhashes stored and stamped the sample as indexed. The refused postings are now
+  left out, with an entry in the `error` collection and a warning naming the band and the hash, and
+  the rest of the sample is indexed. A function holding a full hash is still not found through that
+  band; `STORAGE_BAND_BUCKET_SIZE` lifts the cap (docs/TUNING.md). Main already has the bucketing,
+  off by default, so the default is unchanged.
+
+- **`STORAGE_MAX_EXPORT_SIZE` bounds what an export holds.** The cap counted the JSON size of each
+  sample's function entries, while `GET /export` held them as Python objects, loaded a sample's
+  functions all at once, left family names and actors uncounted, and for `compress=true` counted
+  only the compressed text: an uncompressed export held about 11 times the bytes it counted (346 MiB against 32.3 MB on 360 samples), and `GET /export/{ids}` answered
+  500 past the cap. Both routes now read a sample's functions 1,000 at a time
+  (`getFunctionsBySampleIdInBatches`), keep only the entries' JSON text, count all of it before
+  keeping it and send it as it is. Past the cap both routes answer `{"status": "failed"}`. The
+  response is the same JSON; `MinHashIndex.getExportData()` still returns Python objects,
+  `getExportJson()` the text.
+
+- **A cross compare of about a thousand samples that share no code failed in its last step.**
+  `MatcherCross` ordered the clustering tree with one recursive call per tree level, and samples
+  that share no code cluster into a chain as deep as there are samples, so `combineMatchesToCross`
+  raised `RecursionError` at Python's default limit, leaving the result `null`. The tree is now
+  walked with an explicit stack in the same order, so every cross compare that finished before
+  yields the same result.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

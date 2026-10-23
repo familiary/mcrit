@@ -2,7 +2,9 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import time
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from functools import wraps
 from typing import Iterator, List, Optional
@@ -307,11 +309,13 @@ def _createJobPayload(method_name, params, grid_params, descriptor):
 
 
 # Marks Functions within a QueueRemoteCallee
-def Remote(progress=False, file_locations=[], kwfile_locations=[], json_locations=[], kwjson_locations=[], results_version=None):
+def Remote(progress=False, file_locations=[], kwfile_locations=[], json_locations=[], kwjson_locations=[], results_version=None, time_limited=False):
     def change_function(function):
         function.remote = True
         function.progressor = progress
         function.results_version = results_version
+        # whether a plain worker's QUEUE_WORKER_JOB_TIMEOUT applies: for jobs whose cost a request controls
+        function.time_limited = time_limited
         function.file_locations = file_locations
         function.kwfile_locations = kwfile_locations
         function.json_locations = json_locations
@@ -319,6 +323,35 @@ def Remote(progress=False, file_locations=[], kwfile_locations=[], json_location
         return function
 
     return change_function
+
+
+class JobTimeoutExceeded(BaseException):
+    """Raised inside a job that ran longer than its worker allows (QUEUE_WORKER_JOB_TIMEOUT).
+
+    A BaseException, so that the `except Exception` blocks of the job's own code do not swallow it.
+    """
+
+
+@contextmanager
+def job_deadline(seconds):
+    """Raise JobTimeoutExceeded in the block once it has run for ``seconds``; 0 is no limit.
+
+    Uses SIGALRM, so it only works in the main thread of a POSIX process, and leaves no alarm armed.
+    """
+    if seconds <= 0:
+        yield
+        return
+
+    def expire(signum, frame):
+        raise JobTimeoutExceeded(f"The job ran longer than QUEUE_WORKER_JOB_TIMEOUT ({seconds} s) and was stopped.")
+
+    previous_handler = signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 # Class to be extended
@@ -329,6 +362,8 @@ class QueueRemoteCallee(BaseRemoteCallerClass):
         self.queue.clean()
         self._alive = True
         self.t_last_cleanup = time.time()
+        # seconds a job may run before it is stopped, 0 for no limit; set by the plain worker's run()
+        self._job_timeout = 0
         # NOTE: the profiling variant is kept in a separate attribute rather than rebinding
         # _executeJob itself, so the method keeps its normal signature.
         self._executeJobProfiled = self.profiling_wrapper(self._executeJobImpl, profiling_path) if profiling_path is not None else None
@@ -383,7 +418,10 @@ class QueueRemoteCallee(BaseRemoteCallerClass):
             LOGGER.debug("kwparams: %s", kwparams)
             kwparams["progress_reporter"] = JobProgressReporter(job, 0.1)
         LOGGER.debug("EXECUTE JOB: %s", job_payload)
-        result = method(*params, **kwparams)
+        # only the job's own work is timed, so the alarm cannot cut into the queue's bookkeeping; maintenance
+        # jobs run as long as their corpus needs and are not timed
+        with job_deadline(self._job_timeout if getattr(method, "time_limited", False) else 0):
+            result = method(*params, **kwparams)
         LOGGER.debug("FINISHED JOB: %s", job_payload)
         return result
 
@@ -419,7 +457,7 @@ class QueueRemoteCallee(BaseRemoteCallerClass):
                 # ensure we always have a job_id for finished job payloads
                 job.result = self._storeJobResult(job, result)
                 LOGGER.info("Finished Remote Job: %s", job)
-        except Exception:
+        except (Exception, JobTimeoutExceeded):
             # the failure may include the Job.__exit__ error() write itself (e.g. the
             # database went away mid-job), in which case the job is still locked by us
             # with its release lost - reconcile before the next claim

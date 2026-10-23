@@ -1741,15 +1741,34 @@ class MongoDbStorage(StorageInterface):
             self._updateFamilyStats(sample_entry.family_id, -1, -sample_entry.statistics["num_functions"], -int(sample_entry.is_library))
         self._updateDbState()
 
-    def getFunctionsBySampleId(self, sample_id: int) -> Optional[List["FunctionEntry"]]:
+    def getFunctionsBySampleId(self, sample_id: int, with_xcfg: bool = True) -> Optional[List["FunctionEntry"]]:
         if not self.isSampleId(sample_id):
             return None
+        # inline `_xcfg` of pre-migration documents is left out along with the separate blobs
+        projection = {"_id": 0} if with_xcfg else {"_id": 0, "_xcfg": 0}
         if sample_id < 0:
-            function_dicts = list(self._getDb().query_functions.find({"sample_id": sample_id}, {"_id": 0}))
+            function_dicts = list(self._getDb().query_functions.find({"sample_id": sample_id}, projection))
         else:
-            function_dicts = list(self._getDb().functions.find({"sample_id": sample_id}, {"_id": 0}))
+            function_dicts = list(self._getDb().functions.find({"sample_id": sample_id}, projection))
+        return self._toFunctionEntries(function_dicts, with_xcfg)
+
+    def getFunctionsBySampleIdInBatches(self, sample_id: int, batch_size: int = 1000) -> Iterator[List["FunctionEntry"]]:
+        if not self.isSampleId(sample_id):
+            return
+        collection = self._getDb().query_functions if sample_id < 0 else self._getDb().functions
+        function_dicts = []
+        for function_dict in collection.find({"sample_id": sample_id}, {"_id": 0}, batch_size=batch_size):
+            function_dicts.append(function_dict)
+            if len(function_dicts) >= batch_size:
+                yield self._toFunctionEntries(function_dicts)
+                function_dicts = []
+        if function_dicts:
+            yield self._toFunctionEntries(function_dicts)
+
+    def _toFunctionEntries(self, function_dicts: List[Dict], with_xcfg: bool = True) -> List["FunctionEntry"]:
         functions = []
-        self._attachXcfgBlobs(function_dicts)
+        if with_xcfg:
+            self._attachXcfgBlobs(function_dicts)
         for f in function_dicts:
             self._decodeFunction(f)
             functions.append(FunctionEntry.fromDict(f))
@@ -1961,6 +1980,33 @@ class MongoDbStorage(StorageInterface):
         """How many postings one band document may hold, or 0 for the single-document shape."""
         return max(0, int(getattr(self._storage_config, "STORAGE_BAND_BUCKET_SIZE", 0) or 0))
 
+    # what mongod answers a $push that would take a document past 16 MiB: 17419 ("Resulting document
+    # after update is larger than 16777216"), 10334 (BSONObjectTooLarge) on some versions
+    _DOCUMENT_FULL_CODES = (10334, 17419)
+
+    @classmethod
+    def _isFullBandDocumentError(cls, error: BulkWriteError) -> bool:
+        """Whether every write the bulk refused was refused for growing a document past the cap."""
+        write_errors = error.details.get("writeErrors", [])
+        return bool(write_errors) and not error.details.get("writeConcernErrors") and all(write_error.get("code") in cls._DOCUMENT_FULL_CODES for write_error in write_errors)
+
+    def _dropPostingsForFullBandDocuments(self, band_number: int, error: BulkWriteError) -> None:
+        """Leave out the postings of band hashes whose single document is full, and say so.
+
+        Under STORAGE_BAND_BUCKET_SIZE = 0 a band hash is one document, which takes no further posting
+        once it nears MongoDB's 16 MiB cap - about 1.35 million function ids. Copies of one function
+        share all their band hashes, so submitting a function over and over fills its documents. The
+        bulk is unordered, so every other posting of the batch is in and only the refused ones (and
+        their df) are missing. Raising here instead failed the sample at the first full band and
+        skipped every band after it, for all of its functions, and the job's retry - finding the
+        minhashes already stored - then stamped the sample as indexed. STORAGE_BAND_BUCKET_SIZE lifts
+        the cap.
+        """
+        full_hashes = [write_error.get("op", {}).get("q", {}).get("band_hash") for write_error in error.details["writeErrors"]]
+        message = "Band %d: %d band hash(es) at the 16 MiB document cap take no further postings; set STORAGE_BAND_BUCKET_SIZE to split them." % (band_number, len(full_hashes))
+        self._dbLogError(message, details={"band_number": band_number, "band_hashes": full_hashes[:100]})
+        LOGGER.warning("%s Hashes: %s", message, full_hashes[:10])
+
     def _updateBands(self, band_hashes: Dict[int, Dict[int, List[int]]], method="push") -> int:
         if method not in ["push", "pull"]:
             raise ValueError(f"MongoDbStorage._updateBands() can only do 'push' and 'pull', not '{method}'.")
@@ -1983,7 +2029,12 @@ class MongoDbStorage(StorageInterface):
                     band_updates.append(UpdateMany({"band_hash": band_hash}, {"$pull": {"function_ids": {"$in": function_ids}}}))
             if band_updates:
                 collection = self._getDb()["band_%d" % band_number]
-                collection.bulk_write(band_updates, ordered=False)
+                try:
+                    collection.bulk_write(band_updates, ordered=False)
+                except BulkWriteError as error:
+                    if method != "push" or not self._isFullBandDocumentError(error):
+                        raise
+                    self._dropPostingsForFullBandDocuments(band_number, error)
                 if method == "pull":
                     # a posting list the pull emptied is removed, not kept as a tombstone; scoped to
                     # the hashes just touched, so it is one indexed delete per band (#149)

@@ -45,12 +45,32 @@ def generate_segmented_sequence(weights, sequence_length):
     return sequence
 
 
+# base64.b85encode holds a list entry per 4 input bytes, about 40 times the input: encoded a slice at a time (a
+# multiple of 4 bytes, so the result is the same), it holds that for one slice only
+B85_SLICE_SIZE = 1 << 18
+
+
+def b85encode_sliced(data) -> str:
+    view = memoryview(data)
+    return b"".join(base64.b85encode(view[start : start + B85_SLICE_SIZE]) for start in range(0, len(view), B85_SLICE_SIZE)).decode()
+
+
+def compress_encode_fragments(fragments):
+    """compress_encode of the UTF-8 text the byte fragments join to, compressed as they come instead of joined first."""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+        with zip_file.open("content", "w") as content:
+            for fragment in fragments:
+                content.write(fragment)
+    return b85encode_sliced(zip_buffer.getvalue())
+
+
 def compress_encode(content):
     zip_buffer = io.BytesIO()
     zip_base64 = ""
     with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
         zip_file.writestr("content", content)
-    zip_base64 = base64.b85encode(zip_buffer.getvalue()).decode()
+    zip_base64 = b85encode_sliced(zip_buffer.getvalue())
     return zip_base64
 
 
