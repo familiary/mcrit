@@ -82,7 +82,6 @@ class Worker(QueueRemoteCallee):
         return self
 
     def __exit__(self, *args):
-        # TODO unregister our worker_id from all in-progress jobs found in the queue
         self.queue.unregisterWorker()
         self.queue.release_all_jobs()
 
@@ -438,7 +437,6 @@ class Worker(QueueRemoteCallee):
                     num_updated += len(minhashes)
                     LOGGER.info("Updated minhashes for %d function entries.", len(minhashes))
                 progress_reporter.step()
-        # TODO if we do deferred calculation for a batch of minhashes, we might have to clear them here or address this where else updateMinHashes is used
         return num_updated
 
     # Reports PROGRESS

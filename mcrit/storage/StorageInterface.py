@@ -471,19 +471,16 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO remove this?
     def clearMatchingCache(self) -> None:
-        """Clears the temporary matching cache
+        """Compatibility hook; matcher-owned caches are released with their matcher.
 
         Returns:
             None
         """
         raise NotImplementedError
 
-    # TODO: make a MatchingCacheInterface for all backends.
-    # TODO rename -> get?
     def createMatchingCache(self, function_ids: List[int], allow_self_return: bool = False, previous: Optional["MatchingCache"] = None) -> "MatchingCache":
-        """Creates a temporary matching cache, for a list of function_ids
+        """Create a temporary matching cache for a list of function_ids.
 
         Args:
             function_ids: list of function ids
@@ -538,7 +535,6 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO check if a minhash can ever not have a function id
     def addMinHash(self, minhash: "MinHash") -> bool:
         """Add a MinHash object to the respective functions in storage.
 
@@ -563,17 +559,21 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO dict of what?
     def getContent(self) -> Dict[str, Any]:
+        """Return a JSON-compatible storage snapshot.
+
+        The mapping contains ``families``, ``samples``, ``functions`` and ``bands`` keyed by
+        their IDs, plus optional ``smda_extras`` and base64-encoded ``sample_binaries``.
+        Older snapshots may omit the optional keys.
+        """
         raise NotImplementedError
 
-    # TODO dict of what?
     def addContent(self, content: Dict[str, Any]) -> None:
-        # remaps ids, filters sha256
+        """Import a snapshot mapping, remapping IDs and filtering duplicate sample hashes."""
         raise NotImplementedError
 
-    # TODO dict of what?
     def setContent(self, content: Dict[str, Any]) -> None:
+        """Replace storage from a snapshot mapping returned by :meth:`getContent`."""
         raise NotImplementedError
 
     def addFamily(self, family_name: str) -> int:
@@ -687,7 +687,6 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO find out if it is really possible that a Function Object has no MinHash.
     def getMinHashByFunctionId(self, function_id: int) -> Optional[bytes]:
         """Get the MinHash's bytes of a function, if the function exists and has a MinHash object.
 
@@ -700,9 +699,6 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO can this happen, that the Function has no pichash?
-    # TODO Maybe remove this function, or restore original behavior?
-    # -> Dict[pichash, Set[Tuple[sample_id, function_id]]]
     def getPicHashMatchesByFunctionId(self, function_id: int) -> Optional[Dict[int, Set[Tuple[int, int, int]]]]:
         """Get the PicHash for a given function_id and also return all other sample_id/function_id pairs having the same PicHash
 
@@ -776,15 +772,21 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    def getStats(self, with_pichash=True) -> Dict[str, Union[int, Dict[int, int]]]:
-        """Get statistics for the stored data, as a dict with counts per type of entry.
+    def getStats(self, with_pichash=True) -> Dict[str, Any]:
+        """Get storage status and entry counts.
+
+        The mapping includes ``db_state``, ``db_timestamp``, and integer counts for families,
+        samples, query samples, functions, query functions, bands, and pichashes. The timestamp
+        is a :class:`datetime.datetime` in MemoryStorage and a formatted string in MongoDbStorage.
+        ``num_pichashes`` is ``None`` when ``with_pichash`` is false, indicating it was not
+        computed.
 
         Args:
             with_pichash: (optional) if False, skip the (potentially expensive) aggregation of
                 unique pichashes and report the field "num_pichashes" as None instead.
 
         Returns:
-            a dict with statistics describing the stored data
+            backend-specific status values and storage counts
         """
         raise NotImplementedError
 

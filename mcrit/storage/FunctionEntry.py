@@ -65,8 +65,10 @@ class FunctionEntry:
     function_id: int
     family_id: int
     sample_id: int
-    minhash: bytes  # TODO rename -> minhash_bytes? minhash_hex?
-    minhash_shingle_composition: Optional[Dict] = None  # FIXME MongoDbStorage fails without this, ... why?
+    # Stored as raw bytes; changing the attribute name would affect serialized data and callers.
+    minhash: bytes
+    # Optional metadata; toDict writes an empty mapping when absent, which MongoDbStorage expects.
+    minhash_shingle_composition: Optional[Dict] = None
     # inherited from sample
     architecture: str
     # smda information

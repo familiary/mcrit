@@ -16,7 +16,7 @@ class TreeThreeTraceShingler(AbstractShingler):
         """:returns: 3 traces for tree"""
         adjtree = AdjacentTreeBuilder.generateAdjacentTreeFromGraph(function_object, self._config.SHINGLER_TREE_LABEL_STRATEGY)
         trace_shingles = []
-        # TODO @Paul rewrite this
+        # Archived experimental encoding retained for compatibility with old index configs.
         for _, lvl in adjtree.tree_lvls.items():
             for node in lvl:
                 if node.children == {}:

@@ -15,6 +15,10 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+- Removed resolved worker teardown and storage comments, documented the storage snapshot mapping,
+  and clarified that the archived shinglers retain experimental feature encodings. No matching
+  behavior or public API names changed.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

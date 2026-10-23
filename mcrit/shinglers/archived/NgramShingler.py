@@ -13,10 +13,8 @@ class NgramShingler(AbstractShingler):
         self._weight = weight
 
     def _generateByteSequences(self, function_object):
-        # TODO scale with function size
-        # maybe introduce mutation (duplicate sequences and prefix with some index)
-        # maybe use both escaped and unescaped sequences
-        # use scoring for ngrams to cap number of sequences
+        # This archived implementation uses a fixed three-instruction window and has no
+        # sequence cap; changing its feature set would require explicit reindexing.
         byte_sequences = []
         part_size = 3
         for _, block in sorted(function_object.blocks.items()):

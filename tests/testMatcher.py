@@ -320,8 +320,7 @@ class MatcherTestSuite(unittest.TestCase):
     }
     maxDiff = None
     # sample2
-    # TODO mark s.th as library,
-    # TODO make s.th a pic+min match
+    # This fixture intentionally covers a plain sample without library or combined-hash matches.
     sample_summary_entry_2_expected = {
         "sample_id": 0,
         "family": "test_family",

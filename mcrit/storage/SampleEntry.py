@@ -31,7 +31,6 @@ class SampleEntry:
     statistics: Dict[str, int]
     timestamp: Optional[datetime.datetime]
 
-    # TODO -> rename to fromSmdaReport
     def __init__(self, smda_report: Optional["SmdaReport"], sample_id=-1, family_id=0):
         self.sample_id = sample_id
         self.family_id = family_id

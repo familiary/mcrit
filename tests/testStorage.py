@@ -564,7 +564,7 @@ class MemoryStorageTest(TestCase):
 
     def testSampleHandling(self):
         self.storage.clearStorage()
-        # TODO: different samples required, because addSmdaReport wont accept identical hashes
+        # addSmdaReport rejects duplicate SHA256 values, so each fixture report gets a distinct hash.
         with open(self.example_file_path) as fjson:
             smda_json = json.load(fjson)
         smda_report_a = SmdaReport.fromDict(smda_json)
@@ -672,14 +672,11 @@ class MemoryStorageTest(TestCase):
 
     def testFunctionHandling(self):
         self.storage.clearStorage()
-        # TODO use SmdaReport.fromFile
-        with open(self.example_file_path) as fjson:
-            smda_json = json.load(fjson)
-        smda_report_a = SmdaReport.fromDict(smda_json)
+        smda_report_a = SmdaReport.fromFile(self.example_file_path)
         assert smda_report_a is not None
         smda_report_a.sha256 = 64 * "a"
         smda_report_a.family = "family_1"
-        smda_report_b = SmdaReport.fromDict(smda_json)
+        smda_report_b = SmdaReport.fromFile(self.example_file_path)
         assert smda_report_b is not None
         smda_report_b.family = "family_1"
         smda_report_b.sha256 = 64 * "b"
@@ -757,7 +754,6 @@ class MemoryStorageTest(TestCase):
         self.assertEqual(pichashes, self.storage.getPicHashMatchesByFunctionIds([1, 1, 1000]))
 
         # minhash tests
-        # TODO check if MinHash initialization works
         minhash_a = MinHash(function_id=1, minhash_signature=[0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39], minhash_bits=8)
         minhash_b = MinHash(function_id=3, minhash_signature=[0x30, 0x31, 0x30, 0x33, 0x30, 0x30, 0x30, 0x37, 0x38, 0x39], minhash_bits=8)
         function_entry = self.storage.getFunctionById(1)
