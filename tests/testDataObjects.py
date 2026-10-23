@@ -59,6 +59,24 @@ class MinHashingTestSuite(unittest.TestCase):
         as_entry = SampleEntry.fromDict(as_dict)
         self.assertEqual(as_entry.sample_id, sample_entry.sample_id)
 
+    def testSampleEntrySha256Verified(self):
+        # #270: the flag survives toDict/fromDict in all three states, and an entry without it -
+        # a sample stored before it was recorded, or one sent by an older server - is unknown
+        THIS_FILE_PATH = str(os.path.abspath(__file__))
+        PROJECT_ROOT = str(os.path.abspath(os.sep.join([THIS_FILE_PATH, "..", ".."])))
+        with open(os.sep.join([PROJECT_ROOT, "tests", "example_report.smda"])) as fjson:
+            smda_report = SmdaReport.fromDict(json.load(fjson))
+        assert smda_report is not None
+        self.assertIsNone(SampleEntry(smda_report).sha256_verified)
+        for sha256_verified in (True, False, None):
+            as_dict = json.loads(json.dumps(SampleEntry(smda_report, sample_id=0, family_id=0, sha256_verified=sha256_verified).toDict()))
+            self.assertIs(sha256_verified, as_dict["sha256_verified"])
+            self.assertIs(sha256_verified, SampleEntry.fromDict(as_dict).sha256_verified)
+        # a sample stored, or answered by a server, from before the field
+        as_dict = SampleEntry(smda_report, sample_id=0, family_id=0).toDict()
+        del as_dict["sha256_verified"]
+        self.assertIsNone(SampleEntry.fromDict(as_dict).sha256_verified)
+
     def testMatchingResult(self):
         THIS_FILE_PATH = str(os.path.abspath(__file__))
         PROJECT_ROOT = str(os.path.abspath(os.sep.join([THIS_FILE_PATH, "..", ".."])))

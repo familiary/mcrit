@@ -1607,7 +1607,7 @@ class MongoDbStorage(StorageInterface):
         if label_updates:
             self._getDb().functions.bulk_write(label_updates, ordered=False)
 
-    def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False) -> Optional["SampleEntry"]:
+    def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False, sha256_verified=False) -> Optional["SampleEntry"]:
         assert smda_report.sha256 is not None
         sample_entry = None
         if isQuery:
@@ -1628,7 +1628,7 @@ class MongoDbStorage(StorageInterface):
         else:
             if not self.getSampleBySha256(smda_report.sha256):
                 family_id = self.addFamily(smda_report.family or "")
-                sample_entry = SampleEntry(smda_report, sample_id=self._useCounter("samples"), family_id=family_id)
+                sample_entry = SampleEntry(smda_report, sample_id=self._useCounter("samples"), family_id=family_id, sha256_verified=sha256_verified)
                 # its hashes are computed right here, by the running smda and picblocks
                 self._dbInsert("samples", {**sample_entry.toDict(), "pichash_smda_version": SmdaConfig().VERSION, "picblockhash_version": PICBLOCKS_VERSION})
                 self._insertSmdaExtras(sample_entry.sample_id, SampleEntry.smdaExtrasOf(smda_report))
@@ -1658,6 +1658,8 @@ class MongoDbStorage(StorageInterface):
         if not self.getSampleBySha256(sample_entry.sha256):
             sample_id = self._useCounter("samples")
             sample_entry.sample_id = sample_id
+            # whatever the export says: this instance has never seen the sample's bytes (#270)
+            sample_entry.sha256_verified = False
             self._dbInsert("samples", sample_entry.toDict())
             self._ensureFamilyDocument(sample_entry.family_id, sample_entry.family)
             self._updateFamilyStats(sample_entry.family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))

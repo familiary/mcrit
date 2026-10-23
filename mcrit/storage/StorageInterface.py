@@ -168,7 +168,7 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False) -> Optional["SampleEntry"]:
+    def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False, sha256_verified=False) -> Optional["SampleEntry"]:
         """Add a SMDA report to storage to create its sample representation and return corresponding SampleEntry object.
         This also adds the sample's functions. If the sample's family is not in storage yet, it will be added.
         If a sample with the same SHA256 already exists in storage, smda_report is not added and None is returned.
@@ -176,6 +176,8 @@ class StorageInterface:
         Args:
             smda_report: the SmdaReport to add to the storage
             isQuery: True if this SmdaReport is associated with a matching query and its data shall not be persisted in the main DB
+            sha256_verified: True only if MCRIT disassembled smda_report itself from bytes of its sha256, rather than
+                taking the report as submitted (#270); recorded on the sample, ignored for a query
 
         Returns:
             A SampleEntry corresponding to smda_report or None, if SmdaReport was already added.
@@ -202,6 +204,7 @@ class StorageInterface:
     def importSampleEntry(self, sample_entry: "SampleEntry") -> Optional["SampleEntry"]:
         """Import a sample_entry to storage based on a previously exported SampleEntry.
         We assume that the family_id was already remapped by the MinHashIndex, meaning that only the sample_id needs to be adjusted
+        The sample is stored as sha256_verified False, whatever the export states: this instance has not seen its bytes.
         If a sample with the same SHA256 already exists in storage, sample_entry is not added and None is returned.
 
         Args:

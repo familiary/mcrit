@@ -542,7 +542,7 @@ class MemoryStorage(StorageInterface):
                 assert matched_function_id is not None
                 self._functions[matched_function_id].function_labels.append(new_function_entry_label)
 
-    def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False) -> Optional["SampleEntry"]:
+    def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False, sha256_verified=False) -> Optional["SampleEntry"]:
         assert smda_report.sha256 is not None
         sample_entry = None
         if isQuery:
@@ -557,7 +557,7 @@ class MemoryStorage(StorageInterface):
         else:
             if not self.getSampleBySha256(smda_report.sha256):
                 family_id = self.addFamily(smda_report.family or "")
-                sample_entry = SampleEntry(smda_report, sample_id=self._useCounter("samples"), family_id=family_id)
+                sample_entry = SampleEntry(smda_report, sample_id=self._useCounter("samples"), family_id=family_id, sha256_verified=sha256_verified)
                 self._samples[sample_entry.sample_id] = sample_entry
                 self._sample_by_sha256[sample_entry.sha256] = sample_entry.sample_id
                 self._smda_extras[sample_entry.sample_id] = SampleEntry.smdaExtrasOf(smda_report)
@@ -575,6 +575,8 @@ class MemoryStorage(StorageInterface):
         if not self.getSampleBySha256(sample_entry.sha256):
             sample_id = self._useCounter("samples")
             sample_entry.sample_id = sample_id
+            # whatever the export says: this instance has never seen the sample's bytes (#270)
+            sample_entry.sha256_verified = False
             self._samples[sample_id] = sample_entry
             self._sample_by_sha256[sample_entry.sha256] = sample_id
             self._updateFamilyStats(sample_entry.family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))

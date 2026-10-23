@@ -1,5 +1,7 @@
+import hashlib
 import io
 import json
+import os
 import unittest
 from types import SimpleNamespace
 from typing import Any, cast
@@ -7,11 +9,14 @@ from unittest.mock import MagicMock, patch
 
 import falcon
 import falcon.testing
+from smda.common.SmdaReport import SmdaReport
 
 from mcrit.client.McritClient import McritClient, McritNotFound, McritServerError
 from mcrit.config.StorageConfig import StorageConfig
 from mcrit.index.MinHashIndex import MinHashIndex
 from mcrit.server.SampleResource import SampleResource
+from mcrit.storage.SampleEntry import SampleEntry
+from mcrit.storage.StorageFactory import StorageFactory
 from mcrit.Worker import Worker
 
 from .context import config
@@ -139,7 +144,7 @@ class WorkerKeepsBinariesTest(unittest.TestCase):
         sample_entry = MagicMock()
         sample_entry.sample_id = 42
         sample_entry.toDict.return_value = {"sample_id": 42}
-        setattr(worker, "_addReport", lambda report: sample_entry)
+        setattr(worker, "_addReport", lambda report, **kwargs: sample_entry)
         return worker, storage
 
     def test_the_binary_is_kept_only_when_configured(self):
@@ -175,6 +180,87 @@ class WorkerKeepsBinariesTest(unittest.TestCase):
             result = worker.addBinarySample(b"MZ", "a.exe", "fam", "1", False, None, None)
             storage.storeSampleBinary.assert_not_called()
             self.assertNotIn("binary_stored", result)
+
+
+class Sha256VerifiedTest(unittest.TestCase):
+    """#270: a sample is verified only when MCRIT disassembled it from the bytes itself"""
+
+    BINARY = b"MZ\x90\x00 a binary"
+
+    @staticmethod
+    def _report(sha256):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_report.smda")) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        report.sha256 = sha256
+        return report
+
+    def _addBinarySample(self, storage, report):
+        worker = Worker(queue=MagicMock(), config=config, storage=storage)
+        with patch("mcrit.Worker.Disassembler") as disassembler:
+            disassembler.return_value.disassembleUnmappedBuffer.return_value = report
+            return worker.addBinarySample(self.BINARY, "a.exe", "fam", "1", False, None, None)
+
+    def test_a_sample_disassembled_from_the_upload_is_verified(self):
+        storage = StorageFactory.getStorage(config)
+        binary_sha256 = hashlib.sha256(self.BINARY).hexdigest()
+        result = self._addBinarySample(storage, self._report(binary_sha256))
+        self.assertIs(True, result["sample_info"]["sha256_verified"])
+        stored = storage.getSampleBySha256(binary_sha256)
+        assert stored is not None
+        self.assertIs(True, stored.sha256_verified)
+
+    def test_a_report_hashing_other_bytes_than_the_upload_is_not(self):
+        # smda hashes what it was handed; should that ever differ from the upload, the sample is
+        # keyed by bytes MCRIT has not checked against the request
+        storage = StorageFactory.getStorage(config)
+        result = self._addBinarySample(storage, self._report(64 * "d"))
+        self.assertIs(False, result["sample_info"]["sha256_verified"])
+
+    def test_a_submitted_report_is_not_verified(self):
+        index = MinHashIndex(config)
+        result = index.addReport(self._report(64 * "e"), calculate_hashes=False)
+        self.assertIs(False, result["sample_info"]["sha256_verified"])
+        result = index.addReportJson(self._report(64 * "f").toDict(), calculate_hashes=False)
+        self.assertIs(False, result["sample_info"]["sha256_verified"])
+
+    def test_a_binary_for_an_unverified_sample_is_kept_without_verifying_it(self):
+        storage = StorageFactory.getStorage(config)
+        binary_sha256 = hashlib.sha256(self.BINARY).hexdigest()
+        sample_entry = storage.addSmdaReport(self._report(binary_sha256))
+        assert sample_entry is not None
+        worker = Worker(queue=MagicMock(), config=config, storage=storage)
+        worker._storage_config = SimpleNamespace(STORAGE_KEEP_SUBMITTED_BINARIES=True, STORAGE_MONGODB_CLEANUP_TTL=1)
+        with patch("mcrit.Worker.Disassembler") as disassembler:
+            result = worker.addBinarySample(self.BINARY, "a.exe", "fam", "1", False, None, None)
+            disassembler.assert_not_called()
+        self.assertTrue(result["binary_stored"])
+        self.assertIs(False, result["sample_info"]["sha256_verified"])
+        stored = storage.getSampleById(sample_entry.sample_id)
+        assert stored is not None
+        self.assertIs(False, stored.sha256_verified)
+
+    def _conflictFor(self, sha256_verified):
+        index = MagicMock()
+        sample_entry = SampleEntry(self._report(64 * "a"), sample_id=5, family_id=1, sha256_verified=sha256_verified)
+        index.getSampleBySha256.return_value = sample_entry
+        req = falcon.Request(falcon.testing.create_environ(path="/samples/binary", method="POST", body=self.BINARY))
+        resp = falcon.Response()
+        SampleResource(index).on_post_submit_binary(req, resp)
+        self.assertEqual(falcon.HTTP_409, resp.status)
+        index.addBinarySample.assert_not_called()
+        assert resp.data is not None
+        data = json.loads(resp.data)["data"]
+        self.assertEqual(5, data["sample_id"])
+        self.assertIs(sha256_verified, data["sha256_verified"])
+        return data["message"]
+
+    def test_the_conflict_says_when_the_existing_sample_is_unverified(self):
+        message = self._conflictFor(False)
+        self.assertEqual("Conflict: Binary already exists as sample with ID: 5, indexed from a submitted report or an import rather than this binary (unverified).", message)
+        # verified, or stored before this was recorded: the conflict reads as it always did
+        for sha256_verified in (True, None):
+            self.assertEqual("Conflict: Binary already exists as sample with ID: 5.", self._conflictFor(sha256_verified))
 
 
 if __name__ == "__main__":

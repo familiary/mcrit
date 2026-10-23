@@ -26,15 +26,20 @@ class SampleEntry:
     is_library: bool
     filename: str
     sha256: str
+    # True: MCRIT disassembled the sample from bytes of this sha256 itself; False: the sha256 is
+    # what a submitted or imported report states; None: not known, a sample stored before this was
+    # recorded, or a query sample (#270)
+    sha256_verified: Optional[bool]
     smda_version: str
     summary: Optional[str]
     statistics: Dict[str, int]
     timestamp: Optional[datetime.datetime]
 
     # TODO -> rename to fromSmdaReport
-    def __init__(self, smda_report: Optional["SmdaReport"], sample_id=-1, family_id=0):
+    def __init__(self, smda_report: Optional["SmdaReport"], sample_id=-1, family_id=0, sha256_verified: Optional[bool] = None):
         self.sample_id = sample_id
         self.family_id = family_id
+        self.sha256_verified = sha256_verified
         if smda_report:
             self.architecture = smda_report.architecture or ""
             self.base_addr = smda_report.base_addr or 0
@@ -141,6 +146,7 @@ class SampleEntry:
             "is_library": self.is_library,
             "sample_id": self.sample_id,
             "sha256": self.sha256,
+            "sha256_verified": self.sha256_verified,
             "smda_version": self.smda_version,
             "statistics": self.statistics,
             "timestamp": self.timestamp.strftime(TIMESTAMP_FORMAT) if self.timestamp is not None else None,
@@ -164,6 +170,8 @@ class SampleEntry:
         sample_entry.is_library = entry_dict["is_library"]
         sample_entry.filename = entry_dict["filename"]
         sample_entry.sha256 = entry_dict["sha256"]
+        # a sample stored, or an entry sent by a server, from before this was recorded has none
+        sample_entry.sha256_verified = entry_dict.get("sha256_verified")
         sample_entry.smda_version = entry_dict["smda_version"]
         sample_entry.statistics = entry_dict["statistics"]
         # a report submitted with an empty timestamp is stored with none

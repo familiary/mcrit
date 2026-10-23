@@ -15,6 +15,22 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- **Samples carry `sha256_verified`: whether MCRIT disassembled them itself from bytes of that
+  sha256 (#270, #297).** It is `true` for a sample indexed from a `POST /samples/binary` upload, and
+  `false` for one indexed from a submitted SMDA report (`POST /samples`, the IDA plugin) or brought
+  in by `POST /import` - whatever the export states, since this instance never saw the bytes.
+  Samples stored before this release have no value and read as `null`, as do query samples and
+  samples an older release imports from a newer export. The field is part of every sample listing,
+  `GET /samples/sha256/{sha256}`, search results, job results and exports. A binary upload whose
+  sha256 is already an unverified sample is still refused with 409, but the message now says the
+  sample was indexed from a report or an import rather than this binary, and the answer carries
+  `sample_id` and `sha256_verified`. A binary job that finds such a sample anyway (one that raced a
+  report submission) keeps the bytes under `STORAGE_KEEP_SUBMITTED_BINARIES` without marking the
+  sample verified, as its disassembly is still the report's. This is groundwork for checking or
+  replacing such samples against the real binary, which #270 leaves open.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

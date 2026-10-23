@@ -138,12 +138,12 @@ class Worker(QueueRemoteCallee):
     def deleteSample(self, sample_id, progress_reporter=NoProgressReporter()):
         return self._storage.deleteSample(sample_id)
 
-    def _addReport(self, smda_report, calculate_hashes=True, calculate_matches=False) -> Optional["SampleEntry"]:
+    def _addReport(self, smda_report, calculate_hashes=True, calculate_matches=False, sha256_verified=False) -> Optional["SampleEntry"]:
         sample_entry = self._storage.getSampleBySha256(smda_report.sha256)
         if sample_entry:
             LOGGER.info("Sample is already present in database: %s", sample_entry)
             return sample_entry
-        sample_entry = self._storage.addSmdaReport(smda_report)
+        sample_entry = self._storage.addSmdaReport(smda_report, sha256_verified=sha256_verified)
         if not sample_entry:
             return None
         LOGGER.info("Added %s", sample_entry)
@@ -163,7 +163,10 @@ class Worker(QueueRemoteCallee):
             result = {"sample_info": sample_entry.toDict()}
             if self._storage_config.STORAGE_KEEP_SUBMITTED_BINARIES and not self._storage.hasSampleBinary(sample_entry.sample_id):
                 # a retried job (the sample was committed, storing the binary was not) or a
-                # sample submitted before binaries were kept: complete it here
+                # sample submitted before binaries were kept: complete it here. A sample indexed
+                # from a submitted report (one that raced this job; the upload route refuses a
+                # known sha256) gets these bytes too, but stays unverified: its disassembly is the
+                # report's, not one made from them (#270)
                 result["binary_stored"] = self._storage.storeSampleBinary(sample_entry.sample_id, binary)
             return result
         config = SmdaConfig()
@@ -180,7 +183,8 @@ class Worker(QueueRemoteCallee):
             SMDA_REPORT.family = family
         if version is not None:
             SMDA_REPORT.version = version
-        sample_entry = self._addReport(SMDA_REPORT)
+        # smda hashes the buffer it was given; the sample is only as verified as that hash is the upload's
+        sample_entry = self._addReport(SMDA_REPORT, sha256_verified=SMDA_REPORT.sha256 == binary_sha256)
         LOGGER.info("Disassembled and indexed sample: %s", sample_entry)
         if sample_entry is None:
             return None

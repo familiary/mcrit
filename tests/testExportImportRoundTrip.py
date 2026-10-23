@@ -54,7 +54,8 @@ class ExportImportRoundTripMixin(unittest.TestCase):
         with open(EXAMPLE_REPORT) as fjson:
             report = SmdaReport.fromDict(json.load(fjson))
         assert report is not None
-        sample_entry = index.getStorage().addSmdaReport(report)
+        # as if disassembled from the binary, so the export carries a verified sample (#270)
+        sample_entry = index.getStorage().addSmdaReport(report, sha256_verified=True)
         assert sample_entry is not None
         # a job on the local queue: fetching the result runs it
         index.getResultForJob(index.updateMinHashesForSample(sample_entry.sample_id, force_recalculation=True))
@@ -75,6 +76,9 @@ class ExportImportRoundTripMixin(unittest.TestCase):
         self.assertEqual(sample_entry.family, imported.family)
         self.assertEqual(sample_entry.filename, imported.filename)
         self.assertEqual(sample_entry.statistics, imported.statistics)
+        # the export tells what the source knew; the target never saw the bytes (#270)
+        self.assertIs(True, export_data["sample_entries"][sample_entry.sha256]["sha256_verified"])
+        self.assertIs(False, imported.sha256_verified)
         source_functions = by_offset(source.getStorage().getFunctionsBySampleId(sample_entry.sample_id))
         target_functions = by_offset(target.getStorage().getFunctionsBySampleId(imported.sample_id))
         self.assertEqual(set(source_functions), set(target_functions))
