@@ -15,6 +15,13 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Changed
+
+- **TODO comments the code already resolves are removed**, and `StorageInterface.getContent` and
+  `setContent` document the snapshot they hold. `clearMatchingCache`, a no-op in both storages, and
+  the `addContent` stub, which neither storage implemented, are gone from the storage interface;
+  nothing in MCRIT or MCRITweb called them. No behaviour changes.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

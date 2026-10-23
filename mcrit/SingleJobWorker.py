@@ -55,7 +55,6 @@ class SingleJobWorker(Worker):
         return self
 
     def __exit__(self, *args):
-        # TODO unregister our worker_id from all in-progress jobs found in the queue
         self.queue.unregisterWorker()
         self.queue.release_all_jobs()
 

@@ -3144,11 +3144,6 @@ class MongoDbStorage(StorageInterface):
             )
         return evicted
 
-    def clearMatchingCache(self) -> None:
-        # the matching cache is owned by the matcher that created it and dies with that
-        # matcher; the storage object holds no reference to it, so there is nothing to clear
-        return
-
     def getFamilyId(self, family_name: str) -> Optional[int]:
         family_document = self._getDb().families.find_one({"family_name": family_name})
         if family_document is None:

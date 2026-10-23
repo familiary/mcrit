@@ -471,19 +471,8 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO remove this?
-    def clearMatchingCache(self) -> None:
-        """Clears the temporary matching cache
-
-        Returns:
-            None
-        """
-        raise NotImplementedError
-
-    # TODO: make a MatchingCacheInterface for all backends.
-    # TODO rename -> get?
     def createMatchingCache(self, function_ids: List[int], allow_self_return: bool = False, previous: Optional["MatchingCache"] = None) -> "MatchingCache":
-        """Creates a temporary matching cache, for a list of function_ids
+        """Create a temporary matching cache for a list of function_ids.
 
         Args:
             function_ids: list of function ids
@@ -538,7 +527,6 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO check if a minhash can ever not have a function id
     def addMinHash(self, minhash: "MinHash") -> bool:
         """Add a MinHash object to the respective functions in storage.
 
@@ -563,17 +551,22 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO dict of what?
     def getContent(self) -> Dict[str, Any]:
+        """Return a JSON-compatible storage snapshot.
+
+        The mapping contains ``families``, ``samples`` and ``functions`` keyed by their IDs and
+        ``bands`` keyed by band number, then band hash. It also has ``smda_extras`` and
+        base64-encoded ``sample_binaries``, which older snapshots may omit.
+
+        Only MemoryStorage implements this; MongoDbStorage raises NotImplementedError.
+        """
         raise NotImplementedError
 
-    # TODO dict of what?
-    def addContent(self, content: Dict[str, Any]) -> None:
-        # remaps ids, filters sha256
-        raise NotImplementedError
-
-    # TODO dict of what?
     def setContent(self, content: Dict[str, Any]) -> None:
+        """Replace storage from a snapshot mapping returned by :meth:`getContent`.
+
+        Only MemoryStorage implements this; MongoDbStorage raises NotImplementedError.
+        """
         raise NotImplementedError
 
     def addFamily(self, family_name: str) -> int:
@@ -687,7 +680,6 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO find out if it is really possible that a Function Object has no MinHash.
     def getMinHashByFunctionId(self, function_id: int) -> Optional[bytes]:
         """Get the MinHash's bytes of a function, if the function exists and has a MinHash object.
 

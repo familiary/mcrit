@@ -202,7 +202,6 @@ class MemoryStorage(StorageInterface):
         """For MemoryStorage, this is a dummy function and we do not persist logging messages"""
         logging.info(event_msg)
 
-    # TODO check if this works
     def deleteSample(self, sample_id: int) -> bool:
         if not self.isSampleId(sample_id):
             return False
@@ -632,7 +631,6 @@ class MemoryStorage(StorageInterface):
                 self._pichashes[function_entry.pichash].add((function_entry.family_id, function_entry.sample_id, function_entry.function_id))
         return function_entries
 
-    # TODO return type?
     def getLibraryInfoForSampleId(self, sample_id: int) -> Optional[Dict[str, str]]:
         if sample_id not in self._samples:
             return None
@@ -725,13 +723,8 @@ class MemoryStorage(StorageInterface):
         cache_data["sample_id_to_func_ids"] = sample_to_func_ids
         return cache_data
 
-    def clearMatchingCache(self) -> None:
-        """no dedicated cache - no cleanup"""
-        return
-
     def getSampleIds(self) -> List[int]:
-        # TODO is deepcopy necessary?
-        return deepcopy(list(self._samples.keys()))
+        return list(self._samples)
 
     def getSamplesByFamilyId(self, family_id: int) -> Optional[List[SampleEntry]]:
         if family_id not in self._families:
@@ -739,8 +732,7 @@ class MemoryStorage(StorageInterface):
         return [self._samples[sample_id] for sample_id in self._samples if self._samples[sample_id].family_id == family_id]
 
     def getFamilyIds(self) -> List[int]:
-        # TODO is deepcopy necessary?
-        return deepcopy(list(self._families.keys()))
+        return list(self._families)
 
     def isSampleId(self, sample_id: int) -> bool:
         return sample_id in self._samples or sample_id in self._query_samples
@@ -959,7 +951,6 @@ class MemoryStorage(StorageInterface):
         return None
 
     # -> Dict[function_id, Set[function_id]]
-    # TODO optimize or move to interface
     def getCandidatesForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None) -> Dict[int, Set[int]]:
         candidates = {}
         for function_id, minhash in function_id_to_minhash.items():
@@ -1017,7 +1008,6 @@ class MemoryStorage(StorageInterface):
             if sample_id == function_entry.sample_id:
                 self._functions[function_id].xcfg = {}
 
-    # TODO dict of what?
     def getContent(self) -> Dict[str, Any]:
         content = {
             "families": {family_id: family.toDict() for family_id, family in self._families.items()},
@@ -1033,7 +1023,6 @@ class MemoryStorage(StorageInterface):
         }
         return content
 
-    # TODO dict of what?
     def setContent(self, content: Dict[str, Any]) -> None:
         self._families = {int(k): FamilyEntry.fromDict(v) for k, v in content["families"].items()}
         self._samples = {int(k): SampleEntry.fromDict(v) for k, v in content["samples"].items()}
