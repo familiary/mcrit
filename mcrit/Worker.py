@@ -158,40 +158,197 @@ class Worker(QueueRemoteCallee):
     def addBinarySample(self, binary, filename, family, version, is_dump, base_address, bitness, progress_reporter=NoProgressReporter()):
         binary_sha256 = hashlib.sha256(binary).hexdigest()
         sample_entry = self._storage.getSampleBySha256(binary_sha256)
+        job_id = self._jobIdOf(progress_reporter)
+        if sample_entry and sample_entry.sha256_verified is not True:
+            # indexed from a report that only states this hash: replaced by the bytes' disassembly (#270)
+            return self._replaceReportedSample(sample_entry, binary, binary_sha256, filename, family, version, is_dump, base_address, bitness, job_id=job_id)
         if sample_entry:
-            LOGGER.info("Sample is already known with ID: %d", sample_entry.sample_id)
-            result = {"sample_info": sample_entry.toDict()}
-            if self._storage_config.STORAGE_KEEP_SUBMITTED_BINARIES and not self._storage.hasSampleBinary(sample_entry.sample_id):
-                # a retried job (the sample was committed, storing the binary was not) or a
-                # sample submitted before binaries were kept: complete it here. A sample indexed
-                # from a submitted report (one that raced this job; the upload route refuses a
-                # known sha256) gets these bytes too, but stays unverified: its disassembly is the
-                # report's, not one made from them (#270)
-                result["binary_stored"] = self._storage.storeSampleBinary(sample_entry.sample_id, binary)
-            return result
-        config = SmdaConfig()
-        SMDA_REPORT = None
-        DISASSEMBLER = Disassembler(config)
+            return self._knownSampleResult(sample_entry, binary)
+        return self._indexNewBinary(binary, binary_sha256, filename, family, version, is_dump, base_address, bitness, job_id=job_id)
+
+    @staticmethod
+    def _jobIdOf(progress_reporter) -> Optional[str]:
+        """The queue job a call runs as, which a remote call's progress reporter is made for."""
+        job = getattr(progress_reporter, "_job", None)
+        return str(job.job_id) if job is not None else None
+
+    def _knownSampleResult(self, sample_entry: "SampleEntry", binary: bytes) -> Dict[str, Any]:
+        LOGGER.info("Sample is already known with ID: %d", sample_entry.sample_id)
+        result: Dict[str, Any] = {"sample_info": sample_entry.toDict()}
+        if self._storage_config.STORAGE_KEEP_SUBMITTED_BINARIES and not self._storage.hasSampleBinary(sample_entry.sample_id):
+            # a retried job (the sample was committed, storing the binary was not) or a
+            # sample submitted before binaries were kept: complete it here
+            result["binary_stored"] = self._storage.storeSampleBinary(sample_entry.sample_id, binary)
+        return result
+
+    @staticmethod
+    def _disassemble(binary, filename, family, version, is_dump, base_address, bitness) -> SmdaReport:
         LOGGER.info("Disassembling...")
+        disassembler = Disassembler(SmdaConfig())
         if is_dump:
-            SMDA_REPORT = DISASSEMBLER.disassembleBuffer(binary, base_addr=base_address, bitness=bitness)
+            smda_report = disassembler.disassembleBuffer(binary, base_addr=base_address, bitness=bitness)
         else:
-            SMDA_REPORT = DISASSEMBLER.disassembleUnmappedBuffer(binary)
+            smda_report = disassembler.disassembleUnmappedBuffer(binary)
         if filename is not None:
-            SMDA_REPORT.filename = filename
+            smda_report.filename = filename
         if family is not None:
-            SMDA_REPORT.family = family
+            smda_report.family = family
         if version is not None:
-            SMDA_REPORT.version = version
+            smda_report.version = version
+        return smda_report
+
+    def _indexNewBinary(self, binary, binary_sha256, filename, family, version, is_dump, base_address, bitness, job_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        smda_report = self._disassemble(binary, filename, family, version, is_dump, base_address, bitness)
         # smda hashes the buffer it was given; the sample is only as verified as that hash is the upload's
-        sample_entry = self._addReport(SMDA_REPORT, sha256_verified=SMDA_REPORT.sha256 == binary_sha256)
+        sample_entry = self._addReport(smda_report, sha256_verified=smda_report.sha256 == binary_sha256)
         LOGGER.info("Disassembled and indexed sample: %s", sample_entry)
         if sample_entry is None:
             return None
-        result = {"sample_info": sample_entry.toDict()}
+        if sample_entry.sha256_verified is not True and smda_report.sha256 == binary_sha256:
+            # a report submitted under this hash won the race with this job: replace it as well
+            return self._replaceReportedSample(
+                sample_entry, binary, binary_sha256, filename, family, version, is_dump, base_address, bitness, smda_report=smda_report, job_id=job_id
+            )
+        result: Dict[str, Any] = {"sample_info": sample_entry.toDict()}
         if self._storage_config.STORAGE_KEEP_SUBMITTED_BINARIES:
             # the raw submission, for whatever wants the bytes later (#95)
             result["binary_stored"] = self._storage.storeSampleBinary(sample_entry.sample_id, binary)
+        return result
+
+    @staticmethod
+    def compareWithStoredFunctions(stored_pichashes: Dict[int, int], stored_base_addr: int, smda_report: SmdaReport) -> Dict[str, Any]:
+        """How far a binary's disassembly agrees with a stored sample's functions (#270): those at
+        the same offset from the base address with the same PicHash, as a share of the larger of
+        the two function sets. For information only, the upload replaces the sample either way.
+        One pass over the binary's functions against the stored ones by offset."""
+        stored_by_offset = {offset - stored_base_addr: pichash for offset, pichash in stored_pichashes.items()}
+        binary_base_addr = smda_report.base_addr or 0
+        num_matched = 0
+        num_binary_functions = 0
+        for smda_function in smda_report.getFunctions():
+            num_binary_functions += 1
+            if smda_function.pic_hash and stored_by_offset.get((smda_function.offset or 0) - binary_base_addr) == smda_function.pic_hash:
+                num_matched += 1
+        num_larger = max(num_binary_functions, len(stored_by_offset))
+        return {
+            "agreement": num_matched / num_larger if num_larger else 1.0,
+            "matched_functions": num_matched,
+            "binary_functions": num_binary_functions,
+            "stored_functions": len(stored_by_offset),
+        }
+
+    def _claimReportedSample(self, sample_id: int, token: str, job_id: Optional[str]) -> str:
+        """Claim a sample for replacing its analysis, taking over the claim of a job that ended."""
+        stale_after = getattr(self._queue_config, "QUEUE_VERIFICATION_CLAIM_TIMEOUT", 60 * 60)
+        claim = self._storage.claimSampleVerification(sample_id, token, job_id, stale_after)
+        if claim != "busy":
+            return claim
+        held = self._storage.getSampleVerificationClaim(sample_id)
+        if held is None:
+            # released in between
+            return self._storage.claimSampleVerification(sample_id, token, job_id, stale_after)
+        if self._isClaimingJobOver(held.get("job_id"), job_id):
+            return self._storage.claimSampleVerification(sample_id, token, job_id, stale_after, dead_token=held["token"])
+        return "busy"
+
+    def _isClaimingJobOver(self, claiming_job_id: Optional[str], own_job_id: Optional[str]) -> bool:
+        """Whether the queue job that holds a claim no longer runs: finished, failed, or released
+        for another attempt. Without a job id to look up, only the claim's timeout tells."""
+        if claiming_job_id is None:
+            return False
+        if claiming_job_id == own_job_id:
+            # an earlier attempt of this very job
+            return True
+        try:
+            job = self.queue.get_job(claiming_job_id)
+        except Exception:
+            LOGGER.warning("Could not look up job %s holding a sample claim.", claiming_job_id, exc_info=True)
+            return False
+        return job is None or bool(job.is_finished) or bool(job.is_failed) or not job.locked_by
+
+    def _replaceReportedSample(
+        self,
+        sample_entry: "SampleEntry",
+        binary,
+        binary_sha256,
+        filename,
+        family,
+        version,
+        is_dump,
+        base_address,
+        bitness,
+        smda_report: Optional[SmdaReport] = None,
+        job_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Replace the analysis of a sample indexed from a submitted report by its binary's (#270).
+
+        A report only states the hash of the bytes it was made from. Once the bytes are uploaded,
+        their disassembly takes the place of the reported analysis under the same sample_id, so
+        that sha256_verified vouches for the analysis being MCRIT's own of those bytes. The labels
+        of functions found at the same offset from the base address are carried over. The family,
+        version and filename the upload names win, otherwise the sample keeps its own, as it holds
+        them when the swap ends, and so it does its is_library and component. How far the report
+        agreed with the disassembly is part of the result, for information.
+        """
+        sample_id = sample_entry.sample_id
+        token = f"{self._worker_id}:{uuid.uuid4()}"
+        claim = self._claimReportedSample(sample_id, token, job_id)
+        if claim == "missing":
+            # deleted since it was looked up: the upload is a new sample after all
+            return self._indexNewBinary(binary, binary_sha256, filename, family, version, is_dump, base_address, bitness, job_id=job_id)
+        if claim == "verified":
+            current = self._storage.getSampleById(sample_id)
+            if current is None:
+                return self._indexNewBinary(binary, binary_sha256, filename, family, version, is_dump, base_address, bitness, job_id=job_id)
+            return self._knownSampleResult(current, binary)
+        if claim == "busy":
+            LOGGER.info("Sample %d is being replaced by another job.", sample_id)
+            return {"sample_info": sample_entry.toDict(), "verification": {"status": "in_progress"}}
+        verification: Dict[str, Any] = {}
+        try:
+            if claim == "resume":
+                # a job that died swapping had the bytes disassembled already: finish its swap
+                # with what this upload says about the sample
+                verification["resumed"] = True
+            else:
+                if smda_report is None:
+                    smda_report = self._disassemble(binary, filename, family, version, is_dump, base_address, bitness)
+                if smda_report.sha256 != binary_sha256:
+                    self._storage.releaseSampleVerification(sample_id, token)
+                    return {"sample_info": sample_entry.toDict(), "verification": {"status": "unverified", "reason": "the disassembly hashes other bytes than the upload"}}
+                if not self._storage.renewSampleVerification(sample_id, token):
+                    return self._unreplacedResult(sample_id, verification)
+                current = self._storage.getSampleById(sample_id)
+                stored_base_addr = current.base_addr if current is not None else 0
+                verification.update(self.compareWithStoredFunctions(self._storage.getFunctionPicHashesBySampleId(sample_id), stored_base_addr, smda_report))
+                if not self._storage.stageSampleAnalysis(sample_id, smda_report, token) or not self._storage.renewSampleVerification(sample_id, token):
+                    return self._unreplacedResult(sample_id, verification)
+            verification.update(self._storage.swapSampleAnalysis(sample_id, token, filename=filename, family=family, version=version))
+        except Exception:
+            self._storage.releaseSampleVerification(sample_id, token)
+            raise
+        if verification["status"] != "replaced":
+            return self._unreplacedResult(sample_id, verification)
+        LOGGER.info("Sample %d replaced by the disassembly of its binary: %s", sample_id, verification)
+        self.updateMinHashesForSample(sample_id)
+        return self._verificationResult(sample_id, binary, verification)
+
+    def _unreplacedResult(self, sample_id: int, verification: Dict[str, Any]) -> Dict[str, Any]:
+        """The result of a replacement that stopped, its claim gone to deleteSample or another job."""
+        sample_entry = self._storage.getSampleById(sample_id)
+        if "status" not in verification or verification["status"] == "replaced":
+            verification["status"] = "claim_lost" if sample_entry is not None else "sample_deleted"
+        LOGGER.info("Sample %d was not replaced: %s", sample_id, verification["status"])
+        return {"sample_info": sample_entry.toDict() if sample_entry is not None else None, "verification": {**verification, "sample_id": sample_id}}
+
+    def _verificationResult(self, sample_id: int, binary: bytes, verification: Dict[str, Any]) -> Dict[str, Any]:
+        sample_entry = self._storage.getSampleById(sample_id)
+        if sample_entry is None:
+            # deleted right after its swap
+            return self._unreplacedResult(sample_id, {**verification, "status": "sample_deleted"})
+        result: Dict[str, Any] = {"sample_info": sample_entry.toDict(), "verification": verification}
+        if self._storage_config.STORAGE_KEEP_SUBMITTED_BINARIES:
+            result["binary_stored"] = self._storage.storeSampleBinary(sample_id, binary)
         return result
 
     QUERY_JOB_METHODS = ("getMatchesForUnmappedBinary", "getMatchesForMappedBinary", "getMatchesForSmdaReport")

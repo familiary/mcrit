@@ -23,13 +23,59 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   in by `POST /import` - whatever the export states, since this instance never saw the bytes.
   Samples stored before this release have no value and read as `null`, as do query samples and
   samples an older release imports from a newer export. The field is part of every sample listing,
-  `GET /samples/sha256/{sha256}`, search results, job results and exports. A binary upload whose
-  sha256 is already an unverified sample is still refused with 409, but the message now says the
-  sample was indexed from a report or an import rather than this binary, and the answer carries
-  `sample_id` and `sha256_verified`. A binary job that finds such a sample anyway (one that raced a
-  report submission) keeps the bytes under `STORAGE_KEEP_SUBMITTED_BINARIES` without marking the
-  sample verified, as its disassembly is still the report's. This is groundwork for checking or
-  replacing such samples against the real binary, which #270 leaves open.
+  `GET /samples/sha256/{sha256}`, search results, job results and exports. The 409 answer to a
+  binary upload of a known sha256 carries `sample_id` and `sha256_verified`.
+- **A binary uploaded for a sample indexed from a report replaces its analysis with MCRIT's own
+  disassembly of the bytes (#270, #306).** `POST /samples/binary` answers 409 only for a sample that
+  is `sha256_verified: true`. For one that is `false` or `null` it queues the job, which
+  disassembles the binary and swaps the result in under the same `sample_id`, however well the
+  report agreed. The old functions go with their minhashes, band entries, pichash counts,
+  picblockhash index entries, function ranges and disassembly; the new ones are hashed. Labels move
+  to the new function at the same offset from the base address, as they are right before the swap.
+  Family, version and filename are the upload's when it names them, otherwise what the sample holds
+  when the swap ends, and so are `is_library` and `component`; a change made while the job runs is
+  kept. Afterwards `sha256_verified: true` vouches that the stored analysis is MCRIT's disassembly
+  of those bytes, not for the metadata. The job result's `verification` gives the old and new
+  function counts, how many labels were carried over or dropped, and, for information, how far the
+  report agreed: the share of functions at the same offset with the same PicHash, of the larger set.
+  The new analysis is staged in `functions_staging`, `xcfg_staging` and `smda_extras_staging` first,
+  where no reader looks, and a failure there leaves the sample as it was. The swap then writes the
+  new functions under the sample before it removes the old ones: from then until the old ones are
+  gone, a reader sees both function sets under the sample, never none. A job that dies in between
+  leaves both in place until the next upload of the binary finishes the swap; `verify_corpus` lists
+  such a sample under `unfinished_replacements`. A claim on the sample lets one job at a time
+  replace it, so a second upload meanwhile gets `in_progress`. It records the queue job: the claim
+  of a job the queue shows finished or failed is taken over at once, one it shows running only after
+  `QUEUE_VERIFICATION_CLAIM_TIMEOUT` (default 3600 s). What the upload says about the sample is
+  recorded when the swap begins and applied only after that, so a job that loses its claim before
+  leaves the sample as it was, and the upload finishing a swap applies its own metadata, else the
+  recorded one. If adding the new functions' pichash counts fails, or the job dies there, the count
+  index is marked incomplete instead of trusting counts that may be partial, and
+  `MongoDbStorage.rebuildPicHashCountIndex()` rebuilds it. `deleteSample` takes the claim over
+  first, so that a job under way stops: a sample deleted meanwhile stays deleted, and the result
+  says `sample_deleted`. Only a deletion that lands while the job copies the new functions in, with
+  the job dying before it checks its claim again, can leave functions under the deleted sample id;
+  `verify_corpus` lists them under `functions_without_sample`. NOTE that an IDA plugin report has a
+  function set of its own: labels on functions smda does not find at the same offset are dropped,
+  and counted in the result. On 76 Malpedia binaries of 26 families, against their smda 5.0.1
+  disassembly, smda 4.8.0 and 4.9.0 reports agreed to at least 0.992 and 5.0.1 with tail call
+  resolution to at least 0.942, while the report of another sample of the same family agreed to at
+  most 0.264. Offsets are compared from the base address: disassembled at bases 0x1000000 and
+  0x10000000 higher, an icedid dump kept all 170 of its PicHashes at the same relative offsets, a
+  conti dump 246 of 250.
+- **`python -m mcrit.migrations.verify_corpus` checks a corpus for data older releases let in (#270,
+  #306).** It writes nothing. It reports samples whose stored functions do not number their
+  `statistics.num_functions`, functions without a sample or of another family than their sample's,
+  MinHashes of another length than the configured signature, and stored binaries whose sha256 is not
+  their sample's (`--hash-binaries` hashes the bytes instead of trusting the recorded hash). It also
+  reports family counters that disagree with samples and functions, replacements an upload left
+  unfinished, deletions that died after claiming their sample, and staged documents no sample
+  records any more, and counts samples by `sha256_verified`. It prints JSON and exits with 1 when it
+  finds a problem, like `migrate_xcfg_split --mode verify`. It runs one aggregation over
+  `functions`, projected to three fields before grouping by sample, and projected scans of the rest.
+  It never reads disassembly, and its memory grows with the number of samples, not functions: on a
+  synthetic corpus of 3M functions in 12,000 samples it took 5.7 s and 92 MB, against 2.2 s for 1M.
+  See [docs/migration-v1.7.0.md](docs/migration-v1.7.0.md#checking-a-corpus-for-older-data).
 
 ## [1.16.0] - 2026-10-16
 

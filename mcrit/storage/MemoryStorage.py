@@ -6,6 +6,7 @@ import io
 import logging
 import operator
 import re
+import time
 import uuid
 from collections import defaultdict
 from copy import copy, deepcopy
@@ -176,6 +177,8 @@ class MemoryStorage(StorageInterface):
         # caches
         self._sample_by_sha256 = {}
         self._sample_id_to_function_ids = defaultdict(list)
+        # sample_id -> the claim of the job replacing its analysis, and what that job staged (#270)
+        self._verification_claims: Dict[int, Dict[str, Any]] = {}
         unknown_family_id = self.addFamily("")
         assert unknown_family_id == 0
 
@@ -216,27 +219,10 @@ class MemoryStorage(StorageInterface):
             self._smda_extras.pop(sample_id, None)
             return True
         for function_id in function_ids:
-            function_entry = self._functions[function_id]
-            minhash = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
-            # remove function
-            del self._functions[function_id]
-            # remove pichash entries
-            if function_entry.pichash:
-                self._pichashes[function_entry.pichash].remove((function_entry.family_id, sample_id, function_id))
-            # remove minhash entries, if necessary
-            if not minhash or not minhash.hasMinHash():
-                continue
-            band_hashes = self.getBandHashesForMinHash(minhash)
-            for band_number, band_hash in sorted(band_hashes.items()):
-                if band_hash not in self._bands[band_number]:
-                    continue
-                # delete function id from bandhash
-                self._bands[band_number][band_hash].remove(function_id)
-                # delete bandhash if empty
-                if not self._bands[band_number][band_hash]:
-                    del self._bands[band_number][band_hash]
+            self._removeFunction(function_id, sample_id)
         # remove references
         del self._sample_id_to_function_ids[sample_id]
+        self._verification_claims.pop(sample_id, None)
         # in case to samples with same sha256 are added and then removed, it could crash, so remove entry safely
         self._sample_by_sha256.pop(self._samples[sample_id].sha256, None)
 
@@ -252,6 +238,127 @@ class MemoryStorage(StorageInterface):
         if sample_entry.family_id != 0 and not any(s.family_id == sample_entry.family_id for s in self._samples.values()):
             self._families.pop(sample_entry.family_id, None)
         return True
+
+    def getFunctionPicHashesBySampleId(self, sample_id: int) -> Dict[int, int]:
+        if sample_id not in self._samples:
+            return {}
+        return {self._functions[function_id].offset: self._functions[function_id].pichash for function_id in self._sample_id_to_function_ids[sample_id]}
+
+    def _heldClaim(self, sample_id: int, token: str) -> Optional[Dict[str, Any]]:
+        claim = self._verification_claims.get(sample_id)
+        if claim is None or claim["token"] != token or sample_id not in self._samples:
+            return None
+        return claim
+
+    def getSampleVerificationClaim(self, sample_id: int) -> Optional[Dict[str, Any]]:
+        claim = self._verification_claims.get(sample_id)
+        if claim is None:
+            return None
+        # a swap here is a single call, never left half done
+        return {"token": claim["token"], "job_id": claim["job_id"], "claimed_at": claim["claimed_at"], "swap_started": False}
+
+    def claimSampleVerification(self, sample_id: int, token: str, job_id: Optional[str], stale_after: float, dead_token: Optional[str] = None) -> str:
+        sample_entry = self._samples.get(sample_id)
+        if sample_entry is None:
+            return "missing"
+        if sample_entry.sha256_verified is True:
+            return "verified"
+        claim = self._verification_claims.get(sample_id)
+        if claim is not None and claim["token"] not in (token, dead_token) and time.time() - claim["claimed_at"] < stale_after:
+            return "busy"
+        # what a dead job staged goes with its claim
+        self._verification_claims[sample_id] = {"token": token, "job_id": job_id, "claimed_at": time.time(), "staged": None}
+        return "claimed"
+
+    def renewSampleVerification(self, sample_id: int, token: str) -> bool:
+        claim = self._heldClaim(sample_id, token)
+        if claim is None:
+            return False
+        claim["claimed_at"] = time.time()
+        return True
+
+    def releaseSampleVerification(self, sample_id: int, token: str) -> None:
+        if self._heldClaim(sample_id, token) is not None:
+            del self._verification_claims[sample_id]
+
+    def stageSampleAnalysis(self, sample_id: int, smda_report: "SmdaReport", token: str) -> bool:
+        claim = self._heldClaim(sample_id, token)
+        if claim is None:
+            return False
+        assert smda_report.sha256 == self._samples[sample_id].sha256
+        new_entry = SampleEntry(smda_report, sample_id=sample_id, family_id=0, sha256_verified=True)
+        # built aside, nothing reads them before the swap
+        function_entries = [self._buildFunctionEntry(new_entry, smda_function) for smda_function in smda_report.getFunctions()]
+        claim["staged"] = (new_entry, function_entries, SampleEntry.smdaExtrasOf(smda_report))
+        return True
+
+    def swapSampleAnalysis(self, sample_id: int, token: str, filename: Optional[str] = None, family: Optional[str] = None, version: Optional[str] = None) -> Dict[str, Any]:
+        claim = self._heldClaim(sample_id, token)
+        if claim is None:
+            return {"status": "sample_deleted" if sample_id not in self._samples else "claim_lost"}
+        assert claim["staged"] is not None
+        new_entry, new_function_entries, smda_extras = claim["staged"]
+        # the sample as it is now, not as it was when the job began
+        current_entry = self._samples[sample_id]
+        if family is not None and family != current_entry.family:
+            self.modifySample(sample_id, {"family_name": family})
+        family_id = current_entry.family_id
+        old_function_ids = list(self._sample_id_to_function_ids[sample_id])
+        labels_by_offset = {}
+        for function_id in old_function_ids:
+            function_entry = self._functions[function_id]
+            if function_entry.function_labels:
+                labels_by_offset[function_entry.offset - current_entry.base_addr] = function_entry.function_labels
+        labels_carried = 0
+        new_offsets = set()
+        for function_entry in new_function_entries:
+            function_entry.family_id = family_id
+            relative_offset = function_entry.offset - new_entry.base_addr
+            new_offsets.add(relative_offset)
+            function_entry.function_labels = [deepcopy(label) for label in labels_by_offset.get(relative_offset, [])]
+            labels_carried += len(function_entry.function_labels)
+        labels_dropped = sum(len(labels) for offset, labels in labels_by_offset.items() if offset not in new_offsets)
+        for function_id in old_function_ids:
+            self._removeFunction(function_id, sample_id)
+        for function_entry in new_function_entries:
+            self._registerFunction(function_entry)
+        self._sample_id_to_function_ids[sample_id] = [function_entry.function_id for function_entry in new_function_entries]
+        new_entry.family_id = family_id
+        new_entry.family = current_entry.family
+        new_entry.filename = filename if filename is not None else current_entry.filename
+        new_entry.version = version if version is not None else current_entry.version
+        new_entry.is_library = current_entry.is_library
+        new_entry.component = current_entry.component
+        self._samples[sample_id] = new_entry
+        self._smda_extras[sample_id] = smda_extras
+        # the new functions are unhashed, whatever escaper hashed the old ones
+        self._minhash_versions.pop(sample_id, None)
+        self._minhash_shingler_revisions.pop(sample_id, None)
+        self._updateFamilyStats(family_id, 0, len(new_function_entries) - len(old_function_ids), 0)
+        del self._verification_claims[sample_id]
+        self._updateDbState()
+        return {
+            "status": "replaced",
+            "old_num_functions": len(old_function_ids),
+            "new_num_functions": len(new_function_entries),
+            "labels_carried": labels_carried,
+            "labels_dropped": labels_dropped,
+        }
+
+    def _removeFunction(self, function_id: int, sample_id: int) -> None:
+        """Remove a regular function along with its pichash and band entries."""
+        function_entry = self._functions.pop(function_id)
+        if function_entry.pichash:
+            self._pichashes[function_entry.pichash].discard((function_entry.family_id, sample_id, function_id))
+        minhash = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
+        if not minhash or not minhash.hasMinHash():
+            return
+        for band_number, band_hash in sorted(self.getBandHashesForMinHash(minhash).items()):
+            if band_hash not in self._bands[band_number]:
+                continue
+            self._bands[band_number][band_hash].remove(function_id)
+            if not self._bands[band_number][band_hash]:
+                del self._bands[band_number][band_hash]
 
     def modifySample(self, sample_id: int, update_information: dict) -> bool:
         if not self.isSampleId(sample_id):
@@ -656,8 +763,13 @@ class MemoryStorage(StorageInterface):
             function_entry = FunctionEntry(sample_entry, smda_function, -1 * self._useCounter("query_functions"), minhash=minhash)
             self._query_functions[function_entry.function_id] = function_entry
             return function_entry
-        else:
-            function_entry = FunctionEntry(sample_entry, smda_function, self._useCounter("functions"), minhash=minhash)
+        function_entry = self._buildFunctionEntry(sample_entry, smda_function, minhash=minhash)
+        self._registerFunction(function_entry, minhash=minhash)
+        return function_entry
+
+    def _buildFunctionEntry(self, sample_entry: "SampleEntry", smda_function: "SmdaFunction", minhash: Optional["MinHash"] = None) -> "FunctionEntry":
+        """A regular function's entry with its block hashes, not yet stored."""
+        function_entry = FunctionEntry(sample_entry, smda_function, self._useCounter("functions"), minhash=minhash)
         image_lower = sample_entry.base_addr
         image_upper = image_lower + sample_entry.binary_size
         picblockhashes = []
@@ -666,6 +778,10 @@ class MemoryStorage(StorageInterface):
                 block_entry["hash"] = hash_entry["hash"]
                 picblockhashes.append(block_entry)
         function_entry.picblockhashes = picblockhashes
+        return function_entry
+
+    def _registerFunction(self, function_entry: "FunctionEntry", minhash: Optional["MinHash"] = None) -> None:
+        """Store a regular function built by _buildFunctionEntry, with its pichash and band entries."""
         self._functions[function_entry.function_id] = function_entry
         if minhash and minhash.hasMinHash():
             minhash.function_id = function_entry.function_id
@@ -673,8 +789,7 @@ class MemoryStorage(StorageInterface):
         if function_entry.pichash:
             if function_entry.pichash not in self._pichashes:
                 self._pichashes[function_entry.pichash] = set()
-            self._pichashes[function_entry.pichash].add((function_entry.family_id, sample_entry.sample_id, function_entry.function_id))
-        return function_entry
+            self._pichashes[function_entry.pichash].add((function_entry.family_id, function_entry.sample_id, function_entry.function_id))
 
     def addMinHash(self, minhash: "MinHash") -> bool:
         if minhash.function_id is None:

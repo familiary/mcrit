@@ -296,6 +296,93 @@ class StorageInterface:
         """
         raise NotImplementedError
 
+    def getFunctionPicHashesBySampleId(self, sample_id: int) -> Dict[int, int]:
+        """The PicHash of each of a sample's functions by offset, read without their disassembly (#270).
+
+        Args:
+            sample_id: the id of the sample
+
+        Returns:
+            {offset: pichash}, empty for an unknown sample
+        """
+        raise NotImplementedError
+
+    # Replacing a sample indexed from a submitted report by the disassembly of its binary (#270).
+    #
+    # One job at a time holds a claim on the sample, recorded with it so that it holds across
+    # workers: claimSampleVerification, renewed by renewSampleVerification at each phase. The job
+    # stages the new analysis where no reader looks (stageSampleAnalysis), then swaps it in under
+    # the sample's id (swapSampleAnalysis). Every step of both checks the claim first, so a job
+    # that lost it - to deleteSample, which takes it over, or to an upload that judged it dead -
+    # stops, and removes what it wrote that no one else would.
+
+    def getSampleVerificationClaim(self, sample_id: int) -> Optional[Dict[str, Any]]:
+        """The claim held on a sample: {"token", "job_id", "claimed_at" (epoch seconds), "swap_started"}, or None."""
+        raise NotImplementedError
+
+    def claimSampleVerification(self, sample_id: int, token: str, job_id: Optional[str], stale_after: float, dead_token: Optional[str] = None) -> str:
+        """Claim an unverified sample for replacing its analysis by its binary's.
+
+        A claim is taken over when it is older than stale_after seconds, or when its token is
+        dead_token, which the caller passes once it has found the job holding it finished or
+        failed. What the job before staged is discarded then, unless it had begun the swap,
+        which is to be finished instead.
+
+        Args:
+            sample_id: the id of the sample
+            token: identifies the claiming job in the calls that follow
+            job_id: the queue job the claim is held for, recorded for the next claimant to check
+            stale_after: seconds after which another job's claim counts as abandoned
+            dead_token: a claim token known to belong to a job that ended
+
+        Returns:
+            "claimed" when token now holds the claim; "resume" when it does, and the job before
+            had begun to swap in an analysis that swapSampleAnalysis has to finish; "verified"
+            when the sample is verified already, "busy" when another job holds a live claim,
+            "missing" when there is no such sample.
+        """
+        raise NotImplementedError
+
+    def renewSampleVerification(self, sample_id: int, token: str) -> bool:
+        """Date a claim to now; False if token no longer holds it."""
+        raise NotImplementedError
+
+    def releaseSampleVerification(self, sample_id: int, token: str) -> None:
+        """Give up a claim without changing the sample. What was staged under it is discarded,
+        unless its swap had begun, which stays recorded for the next upload to finish at once.
+        A claim token no longer holds is left alone."""
+        raise NotImplementedError
+
+    def stageSampleAnalysis(self, sample_id: int, smda_report: "SmdaReport", token: str) -> bool:
+        """Store smda_report's functions, disassembly and extras for a claimed sample where no
+        reader sees them, recorded on the sample; a failure discards them.
+
+        Returns:
+            False when token does not hold the claim (anything staged is discarded then)
+        """
+        raise NotImplementedError
+
+    def swapSampleAnalysis(self, sample_id: int, token: str, filename: Optional[str] = None, family: Optional[str] = None, version: Optional[str] = None) -> Dict[str, Any]:
+        """Swap the analysis staged for a claimed sample in for its current one, keeping its sample_id.
+
+        The new functions are stored under the sample first, carrying over the labels of the
+        functions at the same offset relative to the base address, as they are right before the
+        old ones go; then the old functions go with everything derived from them (band entries,
+        pichash counts, the picblockhash index, function ranges, disassembly); then the sample
+        takes the new analysis' fields and is marked sha256_verified. Until then a reader may
+        see both function sets under the sample, never none. filename, family and version
+        replace the sample's when given; otherwise, and for is_library and component, it keeps
+        what it holds when the swap ends. The new functions are unhashed. Family counters move
+        by the functions actually written and removed.
+
+        Returns:
+            {"status": "replaced", "old_num_functions", "new_num_functions", "labels_carried",
+            "labels_dropped"}; {"status": "sample_deleted"} when the sample was deleted meanwhile,
+            with nothing of the new analysis left behind; {"status": "claim_lost"} when another
+            job took the claim over.
+        """
+        raise NotImplementedError
+
     def getSampleIds(self) -> List[int]:
         """Return a list of all sample_ids.
 

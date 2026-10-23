@@ -166,6 +166,8 @@ class WorkerKeepsBinariesTest(unittest.TestCase):
             worker, storage = self._worker(keep=True)
             known = MagicMock()
             known.sample_id = 7
+            # disassembled from these bytes before; an unverified one is checked instead (#270)
+            known.sha256_verified = True
             known.toDict.return_value = {"sample_id": 7}
             storage.getSampleBySha256.return_value = known
             storage.hasSampleBinary.return_value = False
@@ -224,43 +226,29 @@ class Sha256VerifiedTest(unittest.TestCase):
         result = index.addReportJson(self._report(64 * "f").toDict(), calculate_hashes=False)
         self.assertIs(False, result["sample_info"]["sha256_verified"])
 
-    def test_a_binary_for_an_unverified_sample_is_kept_without_verifying_it(self):
-        storage = StorageFactory.getStorage(config)
-        binary_sha256 = hashlib.sha256(self.BINARY).hexdigest()
-        sample_entry = storage.addSmdaReport(self._report(binary_sha256))
-        assert sample_entry is not None
-        worker = Worker(queue=MagicMock(), config=config, storage=storage)
-        worker._storage_config = SimpleNamespace(STORAGE_KEEP_SUBMITTED_BINARIES=True, STORAGE_MONGODB_CLEANUP_TTL=1)
-        with patch("mcrit.Worker.Disassembler") as disassembler:
-            result = worker.addBinarySample(self.BINARY, "a.exe", "fam", "1", False, None, None)
-            disassembler.assert_not_called()
-        self.assertTrue(result["binary_stored"])
-        self.assertIs(False, result["sample_info"]["sha256_verified"])
-        stored = storage.getSampleById(sample_entry.sample_id)
-        assert stored is not None
-        self.assertIs(False, stored.sha256_verified)
-
-    def _conflictFor(self, sha256_verified):
+    def _submitFor(self, sha256_verified):
         index = MagicMock()
         sample_entry = SampleEntry(self._report(64 * "a"), sample_id=5, family_id=1, sha256_verified=sha256_verified)
         index.getSampleBySha256.return_value = sample_entry
+        index.addBinarySample.return_value = "job"
         req = falcon.Request(falcon.testing.create_environ(path="/samples/binary", method="POST", body=self.BINARY))
         resp = falcon.Response()
         SampleResource(index).on_post_submit_binary(req, resp)
-        self.assertEqual(falcon.HTTP_409, resp.status)
-        index.addBinarySample.assert_not_called()
         assert resp.data is not None
-        data = json.loads(resp.data)["data"]
-        self.assertEqual(5, data["sample_id"])
-        self.assertIs(sha256_verified, data["sha256_verified"])
-        return data["message"]
+        return index, resp.status, json.loads(resp.data)["data"]
 
-    def test_the_conflict_says_when_the_existing_sample_is_unverified(self):
-        message = self._conflictFor(False)
-        self.assertEqual("Conflict: Binary already exists as sample with ID: 5, indexed from a submitted report or an import rather than this binary (unverified).", message)
-        # verified, or stored before this was recorded: the conflict reads as it always did
-        for sha256_verified in (True, None):
-            self.assertEqual("Conflict: Binary already exists as sample with ID: 5.", self._conflictFor(sha256_verified))
+    def test_only_a_verified_sample_refuses_the_upload(self):
+        index, status, data = self._submitFor(True)
+        self.assertEqual(falcon.HTTP_409, status)
+        index.addBinarySample.assert_not_called()
+        self.assertEqual({"message": "Conflict: Binary already exists as sample with ID: 5.", "sample_id": 5, "sha256_verified": True}, data)
+        # indexed from a report or an import, or stored before this was recorded: the job checks
+        # the sample against the binary (#270)
+        for sha256_verified in (False, None):
+            index, status, data = self._submitFor(sha256_verified)
+            self.assertEqual(falcon.HTTP_202, status)
+            self.assertEqual("job", data)
+            index.addBinarySample.assert_called_once()
 
 
 if __name__ == "__main__":

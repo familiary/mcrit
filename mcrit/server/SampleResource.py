@@ -191,19 +191,17 @@ class SampleResource:
         binary = req.stream.read()
         binary_sha256 = hashlib.sha256(binary).hexdigest()
         sample_entry = self.index.getSampleBySha256(binary_sha256)
-        if sample_entry is None:
+        # a sample indexed from a report that merely states this sha256 is checked against the
+        # binary by the job, and replaced by its analysis where they disagree (#270)
+        if sample_entry is None or sample_entry.sha256_verified is not True:
             job_id = self.index.addBinarySample(binary, filename, family, version, is_dump, base_address, bitness, force_recalculation=True, username=get_username(req))
             resp.data = jsonify({"status": "successful", "data": job_id})
             resp.status = falcon.HTTP_202
             db_log_msg(self.index, req, f"SampleResource.on_post_submit_binary - success - with job_id: {job_id}.")
         else:
-            message = f"Conflict: Binary already exists as sample with ID: {sample_entry.sample_id}"
-            if sample_entry.sha256_verified is False:
-                # its sha256 is only what a submitted or imported report stated; still refused,
-                # but visibly so (#270)
-                message += ", indexed from a submitted report or an import rather than this binary (unverified)"
+            message = f"Conflict: Binary already exists as sample with ID: {sample_entry.sample_id}."
             # the sample and its state as fields too, so a client need not parse the message
-            resp.data = jsonify({"status": "failed", "data": {"message": message + ".", "sample_id": sample_entry.sample_id, "sha256_verified": sample_entry.sha256_verified}})
+            resp.data = jsonify({"status": "failed", "data": {"message": message, "sample_id": sample_entry.sample_id, "sha256_verified": sample_entry.sha256_verified}})
             resp.status = falcon.HTTP_409
             db_log_msg(self.index, req, "SampleResource.on_post_submit_binary - failed - sample exists already.")
 

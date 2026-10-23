@@ -241,6 +241,13 @@ class MongoDbStorage(StorageInterface):
     # keys collapses to as few as one count document, so tying the two together would make the
     # write batch follow how repetitive the corpus is rather than how large a write should be.
     _PICHASH_COUNT_WRITE_BATCH = 10000
+    # What replacing a reported sample's analysis stages (#270): functions, disassembly and extras
+    # under a staging id the sample records, apart from the collections every reader uses, so that
+    # no matching, search or export sees them before they are swapped in under the sample's id.
+    _STAGING_FUNCTIONS = "functions_staging"
+    _STAGING_XCFG = "xcfg_staging"
+    _STAGING_SMDA_EXTRAS = "smda_extras_staging"
+    _STAGING_COLLECTIONS = (_STAGING_FUNCTIONS, _STAGING_XCFG, _STAGING_SMDA_EXTRAS)
 
     _database: Optional["Database"]
 
@@ -395,6 +402,9 @@ class MongoDbStorage(StorageInterface):
         # the SMDA report's extras, stored apart from the sample documents (#94)
         for collection in ("smda_extras", "query_smda_extras"):
             self._getDb()[collection].create_index([("sample_id", 1), ("chunk", 1)], unique=True)
+        # what a replacement of a sample's analysis staged is found and discarded by its staging id (#270)
+        for collection in self._STAGING_COLLECTIONS:
+            self._getDb()[collection].create_index("staging_id")
         # stored binaries are keyed by content: one file per sha256, naming every sample it belongs to (#95).
         # Partial, so that a file retired for deletion (its sha256 cleared) does not hold the key.
         self._getDb()[self._BINARIES_BUCKET + ".files"].create_index("metadata.sha256", unique=True, partialFilterExpression={"metadata.sha256": {"$type": "string"}})
@@ -498,7 +508,7 @@ class MongoDbStorage(StorageInterface):
     _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
     # collections whose documents are droppable when oversized: a function without its stored
     # disassembly is still a function, one that cannot be inserted takes the whole sample down
-    _DROPPABLE_WHEN_OVERSIZED = ("xcfg", "query_xcfg")
+    _DROPPABLE_WHEN_OVERSIZED = ("xcfg", "query_xcfg", "xcfg_staging")
 
     @staticmethod
     def _describeDocument(document: Dict) -> Dict[str, Any]:
@@ -883,6 +893,32 @@ class MongoDbStorage(StorageInterface):
             # remove sample
             self._getDb().query_samples.delete_one({"sample_id": sample_id})
             return True
+        db = self._getDb()
+        # the claim on the sample is taken first: a replacement of its analysis under way (#270)
+        # stops at its next step, and what it recorded tells which of its writes are counted
+        claimed = db.samples.find_one_and_update(
+            {"sample_id": sample_id},
+            {"$set": {"verification.token": f"deleteSample:{uuid.uuid4()}", "verification.deleting": True, "verification.claimed_at": datetime.datetime.now(datetime.UTC)}},
+            projection={"_id": 0, "family_id": 1, "is_library": 1, "verification": 1},
+        )
+        if claimed is None:
+            return False
+        # the family and library flag the counters are decremented by are read with the claim, not
+        # before it: a replacement moves the sample's family only while it holds the claim
+        family_id = claimed.get("family_id", 0)
+        is_library = bool(claimed.get("is_library"))
+        verification = claimed.get("verification") or {}
+        swap = verification.get("swap") or {}
+        function_id_range = verification.get("staging_function_ids")
+        if verification.get("staging_id") is not None:
+            self._discardStaging(verification["staging_id"])
+        # the functions a replacement wrote under the sample, if any, apart from the old ones:
+        # they are in the counters only as far as the replacement recorded counting them
+        new_functions: Optional[Dict[str, Any]] = None
+        old_functions: Dict[str, Any] = {"sample_id": sample_id}
+        if function_id_range:
+            new_functions = {"sample_id": sample_id, "function_id": {"$gte": function_id_range[0], "$lte": function_id_range[1]}}
+            old_functions = {"sample_id": sample_id, "function_id": {"$not": {"$gte": function_id_range[0], "$lte": function_id_range[1]}}}
         function_minhashes = self._getFunctionMinHashesBySampleId(sample_id)
         self._pullBandEntries(function_minhashes)
         # drop this sample from the picblockhash index while its functions still exist to be read
@@ -896,26 +932,434 @@ class MongoDbStorage(StorageInterface):
         # decrement leaves the counts too high, as before this fix, until rebuildPicHashCountIndex
         # runs. One that dies after the decrement leaves them too low, since the sample's functions
         # are still stored but no longer counted, until a retry completes the delete.
-        claim = self._getDb().samples.update_one({"sample_id": sample_id, "pichash_counts_removed": {"$ne": True}}, {"$set": {"pichash_counts_removed": True}})
+        claim = db.samples.update_one({"sample_id": sample_id, "pichash_counts_removed": {"$ne": True}}, {"$set": {"pichash_counts_removed": True}})
         if claim.modified_count:
-            self._removeSampleFromPicHashCounts(sample_id)
-        self._getDb()[self._FUNCTION_RANGE_COLLECTION].delete_many({"sample_id": sample_id})
+            if not swap.get("old_pichashes_uncounted"):
+                self._removeFromPicHashCounts(old_functions)
+            if new_functions is not None and swap.get("new_pichashes_counted"):
+                self._removeFromPicHashCounts(new_functions)
+        db[self._FUNCTION_RANGE_COLLECTION].delete_many({"sample_id": sample_id})
 
         # remove functions
         self._deleteXcfgForFunctionIds([function_minhash["function_id"] for function_minhash in function_minhashes])
-        num_functions_deleted = self._getDb().functions.delete_many({"sample_id": sample_id}).deleted_count
+        # update family stats by what was actually removed, not by what the sample claimed (#151)
+        num_functions_deleted = 0
+        if new_functions is None:
+            num_functions_deleted = db.functions.delete_many({"sample_id": sample_id}).deleted_count
+        else:
+            # each by the family it is in, which a replacement under way may have left mixed
+            self._deleteFunctionsCounted(old_functions)
+            if swap.get("new_counted"):
+                self._deleteFunctionsCounted(new_functions)
+            else:
+                db.functions.delete_many(new_functions)
         # remove sample
         # the report's extras before the sample document, as for a query sample: an interrupted
         # deletion leaves a sample to delete again, never extras nothing refers to (#94)
         self._deleteSmdaExtras(sample_id)
-        num_samples_deleted = self._getDb().samples.delete_one({"sample_id": sample_id}).deleted_count
+        num_samples_deleted = db.samples.delete_one({"sample_id": sample_id}).deleted_count
+        if function_id_range:
+            # a write of the replacement under way when the claim was taken can land after the
+            # sweep above; the replacement removes what lands later still, once it sees the sample gone
+            self._purgeDeletedSample(sample_id, function_id_range)
         # the raw submission goes with the sample it belongs to (#95)
         self.deleteSampleBinary(sample_id)
-        # update family stats by what was actually removed, not by what the sample claimed (#151)
-        self._updateFamilyStats(sample_entry.family_id, -num_samples_deleted, -num_functions_deleted, -int(sample_entry.is_library and num_samples_deleted))
-        self._deleteFamilyIfEmpty(sample_entry.family_id)
+        self._updateFamilyStats(family_id, -num_samples_deleted, -num_functions_deleted, -int(is_library and num_samples_deleted))
+        self._deleteFamilyIfEmpty(family_id)
         self._updateDbState()
         return True
+
+    ###############################################################################
+    # Replacing a reported sample's analysis by the disassembly of its binary (#270)
+    ###############################################################################
+
+    # The fields of a sample document a replacement takes from the binary's disassembly. The others
+    # are what the sample says about itself, which the swap keeps or takes from the upload.
+    _ANALYSIS_FIELDS = ("architecture", "base_addr", "binary_size", "binweight", "bitness", "sha256", "smda_version", "statistics", "timestamp")
+
+    def getFunctionPicHashesBySampleId(self, sample_id: int) -> Dict[int, int]:
+        pichashes = {}
+        if sample_id < 0:
+            return pichashes
+        for document in self._getDb().functions.find({"sample_id": sample_id}, {"_id": 0, "offset": 1, "_pichash": 1}):
+            encoded_pichash = document.get("_pichash")
+            pichashes[decode_two_complement(document["offset"])] = int(encoded_pichash, 16) if isinstance(encoded_pichash, str) else 0
+        return pichashes
+
+    @staticmethod
+    def _expiredClaimTime() -> datetime.datetime:
+        """What a claim is dated to that any upload may take over at once."""
+        return datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC)
+
+    def _holdsClaim(self, sample_id: int, token: str) -> bool:
+        return self._getDb().samples.find_one({"sample_id": sample_id, "verification.token": token}, {"_id": 1}) is not None
+
+    def _discardStaging(self, staging_id: int) -> None:
+        db = self._getDb()
+        for collection in self._STAGING_COLLECTIONS:
+            db[collection].delete_many({"staging_id": staging_id})
+
+    def getSampleVerificationClaim(self, sample_id: int) -> Optional[Dict[str, Any]]:
+        document = self._getDb().samples.find_one({"sample_id": sample_id, "verification.token": {"$exists": True}}, {"_id": 0, "verification": 1})
+        if document is None:
+            return None
+        verification = document["verification"]
+        claimed_at = verification.get("claimed_at")
+        return {
+            "token": verification["token"],
+            "job_id": verification.get("job_id"),
+            # stored without a zone, as UTC
+            "claimed_at": claimed_at.replace(tzinfo=datetime.UTC).timestamp() if claimed_at else 0.0,
+            "swap_started": "swap" in verification,
+        }
+
+    def claimSampleVerification(self, sample_id: int, token: str, job_id: Optional[str], stale_after: float, dead_token: Optional[str] = None) -> str:
+        db = self._getDb()
+        now = datetime.datetime.now(datetime.UTC)
+        takeover: List[Dict[str, Any]] = [
+            {"verification.token": {"$exists": False}},
+            {"verification.token": token},
+            {"verification.claimed_at": {"$lt": now - datetime.timedelta(seconds=stale_after)}},
+        ]
+        if dead_token is not None:
+            takeover.append({"verification.token": dead_token})
+        # never from deleteSample, which takes the claim to stop a replacement under way
+        claimable = {"sample_id": sample_id, "sha256_verified": {"$ne": True}, "verification.deleting": {"$ne": True}, "$or": takeover}
+        # only the claim itself is replaced: what the job before staged or began to swap in stays
+        # recorded beside it, so that a takeover dying in turn leaves it recorded as well
+        previous = db.samples.find_one_and_update(
+            claimable, {"$set": {"verification.token": token, "verification.job_id": job_id, "verification.claimed_at": now}}, projection={"_id": 0, "verification": 1}
+        )
+        if previous is None:
+            sample_document = db.samples.find_one({"sample_id": sample_id}, {"_id": 0, "sha256_verified": 1})
+            if sample_document is None:
+                return "missing"
+            return "verified" if sample_document.get("sha256_verified") is True else "busy"
+        verification = previous.get("verification") or {}
+        if "swap" in verification:
+            # the old analysis may be partly gone already: the only way on is forward
+            LOGGER.warning("Sample %d: an earlier job began to replace its analysis; finishing it (#270).", sample_id)
+            return "resume"
+        if verification.get("staging_id") is not None:
+            self._discardStaging(verification["staging_id"])
+            db.samples.update_one(
+                {"sample_id": sample_id, "verification.token": token},
+                {"$unset": {"verification.staging_id": "", "verification.staging_function_ids": "", "verification.staged": ""}},
+            )
+        return "claimed"
+
+    def renewSampleVerification(self, sample_id: int, token: str) -> bool:
+        renewed = self._getDb().samples.update_one(
+            {"sample_id": sample_id, "verification.token": token}, {"$set": {"verification.claimed_at": datetime.datetime.now(datetime.UTC)}}
+        )
+        return bool(renewed.matched_count)
+
+    def releaseSampleVerification(self, sample_id: int, token: str) -> None:
+        db = self._getDb()
+        held = {"sample_id": sample_id, "verification.token": token}
+        document = db.samples.find_one(held, {"_id": 0, "verification": 1})
+        if document is None:
+            return
+        verification = document["verification"]
+        if "swap" in verification:
+            # past the point of no return: the swap stays recorded and the claim expired, so that
+            # the next upload of this binary finishes it straight away
+            db.samples.update_one(held, {"$set": {"verification.claimed_at": self._expiredClaimTime(), "verification.job_id": None}})
+            return
+        if verification.get("staging_id") is not None:
+            self._discardStaging(verification["staging_id"])
+        db.samples.update_one(held, {"$unset": {"verification": ""}})
+
+    def stageSampleAnalysis(self, sample_id: int, smda_report: "SmdaReport", token: str) -> bool:
+        db = self._getDb()
+        holds = {"sample_id": sample_id, "verification.token": token, "verification.swap": {"$exists": False}}
+        sample_document = db.samples.find_one(holds, {"_id": 0, "sha256": 1})
+        if sample_document is None:
+            return False
+        assert smda_report.sha256 == sample_document["sha256"]
+        smda_functions = list(smda_report.getFunctions())
+        staging_id = self._useCounter("staging")
+        function_ids = list(self._useCounterBulk("functions", len(smda_functions)))
+        # recorded before anything is written, so that whoever finds it - this job on a failure,
+        # the next claimant, deleteSample - discards what was staged
+        staging = {"verification.staging_id": staging_id, "verification.staging_function_ids": [function_ids[0], function_ids[-1]] if function_ids else None}
+        if not db.samples.update_one(holds, {"$set": staging}).matched_count:
+            return False
+        holds_staging = {**holds, "verification.staging_id": staging_id}
+        staged_entry = SampleEntry(smda_report, sample_id=sample_id, family_id=0)
+        try:
+            function_documents = []
+            xcfg_documents = []
+            for function_id, smda_function in zip(function_ids, smda_functions):
+                function_document = self._getFunctionDocument(staged_entry, smda_function, function_id)
+                xcfg_blob = function_document.pop("_xcfg", None)
+                if xcfg_blob:
+                    xcfg_documents.append({"_id": function_id, "staging_id": staging_id, "_xcfg": xcfg_blob})
+                function_document["staging_id"] = staging_id
+                function_documents.append(function_document)
+            self._dbInsertMany(self._STAGING_XCFG, xcfg_documents)
+            self._dbInsertMany(self._STAGING_FUNCTIONS, function_documents)
+            blob = json.dumps(SampleEntry.smdaExtrasOf(smda_report))
+            size = self._SMDA_EXTRAS_CHUNK_CHARS
+            pieces = [blob[start : start + size] for start in range(0, len(blob), size)] or [""]
+            self._dbInsertMany(
+                self._STAGING_SMDA_EXTRAS, [{"staging_id": staging_id, "chunk": index, "num_chunks": len(pieces), "_extras": piece} for index, piece in enumerate(pieces)]
+            )
+            analysis = {field: value for field, value in staged_entry.toDict().items() if field in self._ANALYSIS_FIELDS}
+            staged = db.samples.update_one(holds_staging, {"$set": {"verification.staged": analysis}}).matched_count
+        except Exception:
+            self._discardStaging(staging_id)
+            db.samples.update_one(holds_staging, {"$unset": {"verification.staging_id": "", "verification.staging_function_ids": ""}})
+            raise
+        if not staged:
+            # the claim went elsewhere meanwhile, and whoever took it may have discarded the
+            # staging before this job had written all of it
+            self._discardStaging(staging_id)
+            return False
+        return True
+
+    def _abandonSwap(self, sample_id: int, staging_id: int, function_id_range: Optional[List[int]], written_documents: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """A swap that lost its claim stops here, removing what it wrote that no one else will.
+        written_documents are the new functions it indexed, whose index entries it may have written
+        after deleteSample read the functions it removes them by."""
+        verification = self._getDb().samples.find_one({"sample_id": sample_id}, {"_id": 0, "verification": 1})
+        if verification is None:
+            # deleted meanwhile: deleteSample removed what it found, this removes what was
+            # written after, so that nothing is left under the sample id
+            self._purgeDeletedSample(sample_id, function_id_range, written_documents)
+            self._discardStaging(staging_id)
+            LOGGER.info("Sample %d was deleted while its analysis was being replaced.", sample_id)
+            return {"status": "sample_deleted"}
+        if (verification.get("verification") or {}).get("staging_id") != staging_id:
+            # the claimant after this job dropped its staging, or finished its swap already
+            self._discardStaging(staging_id)
+        LOGGER.info("Sample %d: another job took over replacing its analysis.", sample_id)
+        return {"status": "claim_lost"}
+
+    def _purgeDeletedSample(self, sample_id: int, function_id_range: Optional[List[int]], written_documents: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Remove whatever is still stored under a deleted sample's id, with its index entries.
+
+        Only for a sample whose document is gone: a write under way when deleteSample ran can land
+        after it. Counters are left alone, deleteSample settles them from what the swap recorded.
+        """
+        db = self._getDb()
+        function_documents = list(db.functions.find({"sample_id": sample_id}, {"_id": 0, "function_id": 1, "_picblockhashes": 1}))
+        self._pullSampleFromPicBlockHashes(sample_id, self._picBlockHashesOfDocuments(function_documents + list(written_documents or [])))
+        self._deleteXcfgForFunctionIds([document["function_id"] for document in function_documents])
+        if function_id_range:
+            # the staged disassembly merged in, whether or not its function document was
+            db.xcfg.delete_many({"_id": {"$gte": function_id_range[0], "$lte": function_id_range[1]}})
+        db.functions.delete_many({"sample_id": sample_id})
+        db[self._FUNCTION_RANGE_COLLECTION].delete_many({"sample_id": sample_id})
+        self._deleteSmdaExtras(sample_id)
+
+    def _isBeingDeleted(self, sample_id: int) -> bool:
+        document = self._getDb().samples.find_one({"sample_id": sample_id}, {"_id": 0, "verification.deleting": 1})
+        return document is None or bool((document.get("verification") or {}).get("deleting"))
+
+    def _markSwapStep(self, sample_id: int, token: str, step: str, value: Any = True) -> bool:
+        """Record a step of a swap as done, once: True only for the call that recorded it."""
+        recorded = self._getDb().samples.update_one(
+            {"sample_id": sample_id, "verification.token": token, f"verification.swap.{step}": {"$exists": False}}, {"$set": {f"verification.swap.{step}": value}}
+        )
+        return bool(recorded.modified_count)
+
+    def swapSampleAnalysis(self, sample_id: int, token: str, filename: Optional[str] = None, family: Optional[str] = None, version: Optional[str] = None) -> Dict[str, Any]:
+        db = self._getDb()
+        holds = {"sample_id": sample_id, "verification.token": token, "verification.staged": {"$exists": True}}
+        document = db.samples.find_one(holds, {"_id": 0, "base_addr": 1, "family": 1, "family_id": 1, "verification": 1})
+        if document is None:
+            # nothing written by this call; what was staged went with the claim or the sample
+            return {"status": "claim_lost" if self.isSampleId(sample_id) else "sample_deleted"}
+        staging_id = document["verification"]["staging_id"]
+        function_id_range = document["verification"].get("staging_function_ids")
+        staged_analysis = document["verification"]["staged"]
+        new_base_addr = decode_two_complement(staged_analysis["base_addr"])
+
+        new_documents: List[Dict[str, Any]] = []
+
+        def lost() -> Dict[str, Any]:
+            return self._abandonSwap(sample_id, staging_id, function_id_range, new_documents)
+
+        # 1. the point of no return: from here on the swap is finished, by this job or the next
+        # claimant. What the upload says about the sample is recorded with it, and applied only
+        # after it, so that a job losing its claim before leaves the sample as it was
+        self._markSwapStep(sample_id, token, "started", {"old_base_addr": document["base_addr"], "upload": {"family": family, "filename": filename, "version": version}})
+        if function_id_range:
+            first_function_id, last_function_id = function_id_range
+            new_functions: Dict[str, Any] = {"sample_id": sample_id, "function_id": {"$gte": first_function_id, "$lte": last_function_id}}
+            old_functions: Dict[str, Any] = {"sample_id": sample_id, "function_id": {"$not": {"$gte": first_function_id, "$lte": last_function_id}}}
+        else:
+            new_functions = {"sample_id": sample_id, "function_id": {"$in": []}}
+            old_functions = {"sample_id": sample_id}
+        swap_document = db.samples.find_one(holds, {"_id": 0, "verification.swap": 1})
+        if swap_document is None:
+            return lost()
+        swap = swap_document["verification"]["swap"]
+        # a resuming upload's own metadata wins, what the job before it recorded stands in
+        recorded_upload = swap["started"].get("upload") or {}
+        family = family if family is not None else recorded_upload.get("family")
+        filename = filename if filename is not None else recorded_upload.get("filename")
+        version = version if version is not None else recorded_upload.get("version")
+        if family is not None:
+            # moved to as modifySample does it, functions and counters alike; a no-op once done
+            self.modifySample(sample_id, {"family_name": family})
+        family_document = db.samples.find_one(holds, {"_id": 0, "family_id": 1})
+        if family_document is None:
+            return lost()
+        # the family the new functions are written in, fixed once, so that a job finishing the
+        # swap writes and counts them in the same one
+        self._markSwapStep(sample_id, token, "family_id", family_document["family_id"])
+        family_document = db.samples.find_one(holds, {"_id": 0, "verification.swap.family_id": 1})
+        if family_document is None:
+            return lost()
+        family_id = family_document["verification"]["swap"]["family_id"]
+        # 2. the new functions under the sample id, from where no reader looked. A reader sees
+        # both function sets under the sample from here until step 4 removes the old ones
+        db[self._STAGING_FUNCTIONS].aggregate(
+            [
+                {"$match": {"staging_id": staging_id}},
+                {"$set": {"sample_id": sample_id, "family_id": family_id}},
+                {"$unset": "staging_id"},
+                {"$merge": {"into": "functions", "on": "_id", "whenMatched": "keepExisting", "whenNotMatched": "insert"}},
+            ]
+        )
+        db[self._STAGING_XCFG].aggregate(
+            [{"$match": {"staging_id": staging_id}}, {"$unset": "staging_id"}, {"$merge": {"into": "xcfg", "on": "_id", "whenMatched": "keepExisting", "whenNotMatched": "insert"}}]
+        )
+        if not self._holdsClaim(sample_id, token):
+            return lost()
+        new_documents.extend(db.functions.find(new_functions, {"_id": 0, "function_id": 1, "sample_id": 1, "offset": 1, "_pichash": 1, "_picblockhashes": 1}))
+        # counted once each, in the family they were written in: a move by modifySample in
+        # between moves them out of it with their count
+        if self._markSwapStep(sample_id, token, "new_counted"):
+            self._updateFamilyStats(family_id, 0, len(new_documents), 0)
+        # the pichash counts in two marks, around the increments: deleteSample takes out only
+        # counts recorded as added, and a job that lost its claim to it after adding them takes
+        # them out itself. Both would race on removing the count documents a decrement empties
+        counted_here = self._markSwapStep(sample_id, token, "new_pichashes_counting")
+        if counted_here:
+            try:
+                self._addToPicHashCounts(new_documents)
+            except Exception:
+                # not counted after all, as far as this job knows: the next claimant counts them.
+                # An unordered add may have landed in part, which that would count twice, so the
+                # counts are not trusted until rebuilt either way
+                self._setPicHashCountIndexComplete(False)
+                db.samples.update_one({"sample_id": sample_id, "verification.token": token}, {"$unset": {"verification.swap.new_pichashes_counting": ""}})
+                raise
+        elif "new_pichashes_counting" in swap and "new_pichashes_counted" not in swap:
+            # a job died adding them, and an unordered add may have landed in part: the counts
+            # are not trusted until rebuilt, rather than left too low for the cutoff to read
+            LOGGER.warning("Sample %d: pichash counts of a replacement may be partial; marking the count index for a rebuild (#270).", sample_id)
+            self._setPicHashCountIndexComplete(False)
+        if not self._markSwapStep(sample_id, token, "new_pichashes_counted") and not self._holdsClaim(sample_id, token):
+            if counted_here and self._isBeingDeleted(sample_id):
+                self._uncountPicHashes(new_documents)
+            return lost()
+        self._addToPicBlockHashIndex(new_documents)
+        self._recordFunctionRange(sample_id, [new_document["function_id"] for new_document in new_documents])
+        staged_extras = list(db[self._STAGING_SMDA_EXTRAS].find({"staging_id": staging_id}, {"_id": 0, "staging_id": 0}).sort("chunk", 1))
+        if not self._holdsClaim(sample_id, token):
+            return lost()
+        if staged_extras:
+            self._deleteSmdaExtras(sample_id)
+            self._dbInsertMany("smda_extras", [{**extras_document, "sample_id": sample_id} for extras_document in staged_extras])
+        if not self._holdsClaim(sample_id, token):
+            return lost()
+        # all of it is under the sample now; the rest of the swap reads it from there
+        self._discardStaging(staging_id)
+        # 3. labels, by offset from the base address, as they are right before the old functions go
+        if "labels" not in swap:
+            old_base_addr = decode_two_complement(swap["started"]["old_base_addr"])
+            new_function_ids = {decode_two_complement(new_document["offset"]) - new_base_addr: new_document["function_id"] for new_document in new_documents}
+            labels_by_offset = {
+                decode_two_complement(old_document["offset"]) - old_base_addr: old_document["function_labels"]
+                for old_document in db.functions.find({**old_functions, "function_labels.0": {"$exists": True}}, {"_id": 0, "offset": 1, "function_labels": 1})
+            }
+            carried = [(new_function_ids[offset], labels) for offset, labels in labels_by_offset.items() if offset in new_function_ids]
+            labels = {
+                "old_num_functions": db.functions.count_documents(old_functions),
+                "labels_carried": sum(len(function_labels) for _, function_labels in carried),
+                "labels_dropped": sum(len(function_labels) for offset, function_labels in labels_by_offset.items() if offset not in new_function_ids),
+            }
+            if not self._holdsClaim(sample_id, token):
+                return lost()
+            if carried:
+                # added to, not set: a label put on a new function meanwhile stays
+                db.functions.bulk_write(
+                    [UpdateOne({"function_id": function_id}, {"$addToSet": {"function_labels": {"$each": function_labels}}}) for function_id, function_labels in carried],
+                    ordered=False,
+                )
+            self._markSwapStep(sample_id, token, "labels", labels)
+            swap["labels"] = labels
+        # 4. the old functions, with what is derived from them; read before their pichash counts
+        # are claimed, so that exactly what was there is uncounted
+        if not self._holdsClaim(sample_id, token):
+            return lost()
+        old_documents = list(db.functions.find(old_functions, {"_id": 0, "function_id": 1, "minhash": 1, "_pichash": 1, "_picblockhashes": 1}))
+        if self._markSwapStep(sample_id, token, "old_pichashes_uncounted"):
+            self._uncountPicHashes(old_documents)
+        old_block_hashes = set(self._picBlockHashesOfDocuments(old_documents)) - set(self._picBlockHashesOfDocuments(new_documents))
+        self._pullSampleFromPicBlockHashes(sample_id, sorted(old_block_hashes))
+        self._pullBandEntries(old_documents)
+        if function_id_range:
+            db[self._FUNCTION_RANGE_COLLECTION].delete_many(
+                {"sample_id": sample_id, "$or": [{"first_function_id": {"$lt": function_id_range[0]}}, {"first_function_id": {"$gt": function_id_range[1]}}]}
+            )
+        else:
+            db[self._FUNCTION_RANGE_COLLECTION].delete_many({"sample_id": sample_id})
+        self._deleteXcfgForFunctionIds([old_document["function_id"] for old_document in old_documents])
+        self._deleteFunctionsCounted(old_functions)
+        # 5. the sample takes the new analysis, and is verified
+        sample_update = {**staged_analysis, "sha256_verified": True, "pichash_smda_version": SmdaConfig().VERSION, "picblockhash_version": PICBLOCKS_VERSION}
+        if filename is not None:
+            sample_update["filename"] = filename
+        if version is not None:
+            sample_update["version"] = version
+        finished = db.samples.update_one(
+            holds,
+            {
+                "$set": sample_update,
+                # the new functions are unhashed, and nothing is known yet about rehashing them
+                "$unset": {"verification": "", "minhash_smda_version": "", "minhash_shingler_revision": "", "pichash_unrehashable_smda_version": ""},
+            },
+        )
+        if not finished.matched_count:
+            return lost()
+        # 6. functions written in a family the sample has left meanwhile follow it
+        self._moveFunctionsToSampleFamily(sample_id)
+        self._updateDbState()
+        return {"status": "replaced", "new_num_functions": len(new_documents), **swap["labels"]}
+
+    def _deleteFunctionsCounted(self, function_filter: Dict[str, Any]) -> int:
+        """Delete the functions function_filter selects, uncounting each from the family it is in."""
+        db = self._getDb()
+        num_deleted = 0
+        # by family as stored when deleted, so that a concurrent family move counts each once
+        for _ in range(3):
+            family_ids = db.functions.distinct("family_id", function_filter)
+            if not family_ids:
+                break
+            for family_id in family_ids:
+                num_family_deleted = db.functions.delete_many({**function_filter, "family_id": family_id}).deleted_count
+                if num_family_deleted:
+                    self._updateFamilyStats(family_id, 0, -num_family_deleted, 0)
+                    num_deleted += num_family_deleted
+        return num_deleted
+
+    def _moveFunctionsToSampleFamily(self, sample_id: int) -> None:
+        db = self._getDb()
+        sample_document = db.samples.find_one({"sample_id": sample_id}, {"_id": 0, "family_id": 1})
+        if sample_document is None:
+            return
+        family_id = sample_document["family_id"]
+        for other_family_id in db.functions.distinct("family_id", {"sample_id": sample_id, "family_id": {"$ne": family_id}}):
+            num_moved = db.functions.update_many({"sample_id": sample_id, "family_id": other_family_id}, {"$set": {"family_id": family_id}}).modified_count
+            if num_moved:
+                self._updateFamilyStats(other_family_id, 0, -num_moved, 0)
+                self._updateFamilyStats(family_id, 0, num_moved, 0)
+            self._deleteFamilyIfEmpty(other_family_id)
 
     def _deleteFamilyIfEmpty(self, family_id: int) -> None:
         # judged by the samples that exist, not by a counter that may have drifted (#151)
@@ -1545,6 +1989,7 @@ class MongoDbStorage(StorageInterface):
             "smda_extras",
             "query_smda_extras",
             "picblockhashes",
+            *self._STAGING_COLLECTIONS,
             "sample_binaries.files",
             "sample_binaries.chunks",
             self._PICHASH_COUNT_COLLECTION,
@@ -2709,11 +3154,23 @@ class MongoDbStorage(StorageInterface):
         delete matches `df <= 0` per document, so a count raised again by a concurrent insert in
         between is left alone.
         """
+        self._removeFromPicHashCounts({"sample_id": sample_id})
+
+    def _removeFromPicHashCounts(self, function_filter: Dict[str, Any]) -> None:
+        """_removeSampleFromPicHashCounts for the functions function_filter selects."""
+        if not self.isPicHashCountIndexComplete():
+            return
+        self._uncountPicHashes(self._getDb().functions.find({**function_filter, "_pichash": {"$ne": None}}, {"_pichash": 1, "_id": 0}))
+
+    def _uncountPicHashes(self, function_documents: Iterable[Dict[str, Any]]) -> None:
+        """Take the pichashes these function documents carry out of the counts."""
         if not self.isPicHashCountIndexComplete():
             return
         decrements: Dict[Any, int] = {}
-        for function_document in self._getDb().functions.find({"sample_id": sample_id, "_pichash": {"$ne": None}}, {"_pichash": 1, "_id": 0}):
-            encoded_pichash = function_document["_pichash"]
+        for function_document in function_documents:
+            encoded_pichash = function_document.get("_pichash")
+            if encoded_pichash is None:
+                continue
             decrements[encoded_pichash] = decrements.get(encoded_pichash, 0) + 1
         if not decrements:
             return
@@ -3652,7 +4109,11 @@ class MongoDbStorage(StorageInterface):
                 )
             )
         )
-        if not hashes:
+        return self._pullSampleFromPicBlockHashes(sample_id, hashes)
+
+    def _pullSampleFromPicBlockHashes(self, sample_id: int, hashes: List[str]) -> int:
+        """Drop a sample from the posting lists of the given block hashes, and the emptied lists."""
+        if not hashes or not self._isPicBlockHashIndexComplete():
             return 0
         collection = self._getDb()[self._PICBLOCKHASH_INDEX_COLLECTION]
         collection.update_many({"_id": {"$in": hashes}}, {"$pull": {"sample_ids": sample_id}})

@@ -40,6 +40,12 @@ class FakeCollection:
     def count_documents(self, query, limit=None):
         return len(self._matching(query))
 
+    def find_one_and_update(self, query, update, projection=None):
+        # deleteSample takes the sample's claim first, to stop a replacement under way (#270)
+        self.find_one_and_update_calls = getattr(self, "find_one_and_update_calls", []) + [(query, update)]
+        matching = self._matching(query)
+        return dict(matching[0]) if matching else None
+
     def update_one(self, query, update):
         # deleteSample claims the pichash-count removal on the sample document (#261); the claim
         # is all this fake needs to answer
