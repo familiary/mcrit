@@ -15,6 +15,21 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **`client submit --mode malpedia` skipped every dump (#280).** The filename pattern lacked the
+  underscore before `dump`, so only `_unpacked` files were collected, with no warning. It now takes
+  `_dump_0x...`, `_dump7_0x...` and `_dump10_0x...` names. Some dumps carry a label after the
+  address, such as `_dump7_0x00350000_loader` (9 of the 109 dumps among 281 samples of 29 families
+  downloaded from Malpedia for #283's evaluation), which `get_base_addr` did not read, so once
+  collected they would have been disassembled as files. In every submit mode, a Malpedia dump name
+  now gives its base address with a label after it; other filenames still need the address at their
+  end.
+- **`client submit --mode recursive` printed every file and submitted none (#281).** A leftover
+  `continue` after the progress line made the submission unreachable. Now that files are submitted,
+  a file directly in the given folder gets no family, where it would have been named after the
+  first folder of the working directory.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

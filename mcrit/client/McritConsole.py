@@ -35,9 +35,13 @@ def is_pe_or_elf(input_path):
 def get_base_addr(input_path):
     """
     If provided path ends with 0x[0-9a-fA-F]{8,16}, we assume that this is an IMAGEBASE address.
+    A Malpedia dump, <sha256>_dump7_0x00400000, may carry more after its address, such as a label
+    in <sha256>_dump7_0x00400000_loader (#280).
     """
     base_addr = None
     baddr_match = re.search(re.compile("0x(?P<base_addr>[0-9a-fA-F]{8,16})$"), input_path)
+    if not baddr_match:
+        baddr_match = re.search(re.compile(r"(?:^|[/\\])[0-9a-f]{64}_dump\d*_0x(?P<base_addr>[0-9a-fA-F]{8,16})(?![0-9a-fA-F])"), input_path)
     if baddr_match:
         base_addr = int(baddr_match.group("base_addr"), 16)
     return base_addr
@@ -546,19 +550,20 @@ class McritConsole:
                     if sha256(readFileContent(filepath)) in mcrit_samples_by_sha256:
                         print(f"SKIPPING: {filepath} - already in MCRIT.")
                         continue
-                    family_name = getFamilyName(folder_relative_path)
+                    # a file in the root itself has no family folder, and getFamilyName("") would
+                    # answer the first folder of the working directory
+                    family_name = getFamilyName(folder_relative_path) if folder_relative_path else ""
                     version = getSampleVersion(folder_relative_path, family_name)
                     print("Processing file: ", filepath, " as ", family_name, "|", version)
-                    continue
                     if args.worker:
-                        args.family = getFamilyName(folder_relative_path)
-                        args.version = getSampleVersion(folder_relative_path, args.family)
+                        args.family = family_name
+                        args.version = version
                         submitViaSubprocess(args, filepath)
                     else:
                         smda_report = getSmdaReportFromFilepath(args, filepath)
                         if smda_report:
-                            smda_report.family = getFamilyName(folder_relative_path)
-                            smda_report.version = getSampleVersion(folder_relative_path, smda_report.family)
+                            smda_report.family = family_name
+                            smda_report.version = version
                             print(filepath)
                             print(smda_report)
                             self.client.addReport(smda_report)
@@ -634,5 +639,6 @@ class McritConsole:
         return malpedia_samples_by_filename
 
     def _isMalpediaFilename(self, filename):
-        malpedia_file_pattern = re.compile("^[0-9a-f]{64}(_unpacked|dump7?_0x[0-9a-fA-F]{8,16})")
+        # <sha256>_unpacked, or a dump: _dump_0x..., _dump7_0x..., _dump10_0x..., maybe labelled (#280)
+        malpedia_file_pattern = re.compile(r"^[0-9a-f]{64}_(unpacked|dump\d*_0x[0-9a-fA-F]{8,16}(?![0-9a-fA-F]))")
         return re.search(malpedia_file_pattern, filename)
