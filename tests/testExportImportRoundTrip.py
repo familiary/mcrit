@@ -117,6 +117,44 @@ class ExportImportRoundTripMixin(unittest.TestCase):
         self.assertEqual(sample_entry.statistics["num_functions"], target.getStatus(with_pichash=False)["status"]["num_functions"])
         return source, target
 
+    def _importWrongLengthMinHashes(self, mcrit_config):
+        """An export is data from elsewhere: a minhash of another length than this instance's
+        signatures is dropped at import. Kept, it was banded beside the code it was copied from
+        and failed every matching job that drew it as a candidate, or did not fit the band
+        projection at all. The function itself is imported, and a repair hashes it again."""
+        index, sample_entry = self._index_with_report(mcrit_config)
+        export_data = json.loads(json.dumps(index.getExportData(compress_data=False)))
+        # a renamed copy of the indexed sample, so that it lands next to the code it copies
+        copy_sha256 = "ab" * 32
+        sample_dict = export_data["sample_entries"].pop(sample_entry.sha256)
+        sample_dict["sha256"] = copy_sha256
+        export_data["sample_entries"][copy_sha256] = sample_dict
+        functions = export_data["function_entries"].pop(sample_entry.sha256)
+        export_data["function_entries"][copy_sha256] = functions
+        hashed = sorted((function_id for function_id, function in functions.items() if function["minhash"]), key=int)
+        self.assertGreater(len(hashed), 2)
+        # the first keeps its signature, the second is cut short, the others carry a byte too many
+        functions[hashed[1]]["minhash"] = functions[hashed[1]]["minhash"][:16]
+        for function_id in hashed[2:]:
+            functions[function_id]["minhash"] += "00"
+        report = index.addImportData(export_data)
+        self.assertEqual(1, report["num_samples_imported"])
+        self.assertEqual(len(functions), report["num_functions_imported"])
+        storage = index.getStorage()
+        imported = storage.getSampleBySha256(copy_sha256)
+        assert imported is not None
+        minhash_config = mcrit_config.MINHASH_CONFIG
+        signature_bytes = minhash_config.MINHASH_SIGNATURE_LENGTH * (1 if minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4)
+        imported_functions = storage.getFunctionsBySampleId(imported.sample_id)
+        self.assertEqual([signature_bytes], [len(entry.minhash) for entry in imported_functions if entry.minhash])
+        kept = next(entry for entry in imported_functions if entry.minhash)
+        self.assertIn(kept.function_id, storage.getCandidatesForMinHash(kept.getMinHash(minhash_bits=minhash_config.MINHASH_SIGNATURE_BITS)))
+        # imported samples record no minhash version, so a repair hashes the dropped ones again
+        repair = index.getResultForJob(index.repairMinHashes(force_recalculation=True))
+        self.assertEqual(len(hashed), repair["num_functions_rehashed"])
+        source_minhashes = sorted(entry.minhash for entry in storage.getFunctionsBySampleId(sample_entry.sample_id) if entry.minhash)
+        self.assertEqual(source_minhashes, sorted(entry.minhash for entry in storage.getFunctionsBySampleId(imported.sample_id) if entry.minhash))
+
 
 class MemoryExportImportRoundTrip(ExportImportRoundTripMixin):
     def test_plain_export(self):
@@ -124,6 +162,9 @@ class MemoryExportImportRoundTrip(ExportImportRoundTripMixin):
 
     def test_compressed_export(self):
         self._roundTrip(config, config, compress_data=True)
+
+    def test_wrong_length_minhashes_are_dropped(self):
+        self._importWrongLengthMinHashes(config)
 
 
 @pytest.mark.mongo
@@ -152,6 +193,9 @@ class MongoExportImportRoundTrip(ExportImportRoundTripMixin):
     def test_mongo_export_into_mongo(self):
         source, target = self._roundTrip(mongo_config(self.SOURCE_DB), mongo_config(self.TARGET_DB), compress_data=True)
         self.assertEqual(source.getStorage()._getDb().xcfg.count_documents({}), target.getStorage()._getDb().xcfg.count_documents({}))
+
+    def test_wrong_length_minhashes_are_dropped(self):
+        self._importWrongLengthMinHashes(mongo_config(self.TARGET_DB))
 
     def test_disassembly_dropped_at_the_source_stays_dropped(self):
         """what mcritweb#67 saw: not the export dropping the xcfg, but STORAGE_DROP_DISASSEMBLY
