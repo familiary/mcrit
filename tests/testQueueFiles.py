@@ -413,6 +413,25 @@ class MongoQueueFilesTest(QueueFileFixtures, unittest.TestCase):
             self.assertEqual(1, self.queue.delete_orphaned_files()["file_params"])
         self.assertEqual([None], seen)
 
+    def test_a_file_is_claimed_by_id_until_it_is_retired(self):
+        # how a rerun takes over the file of the job it repeats (familiary/mcritweb#55)
+        file_id = self._param(sha256="cd" * 32)
+        self.assertEqual("cd" * 32, self.queue.claim_file(file_id))
+        self.assertEqual(1, self.database["fs.files"].find_one({"_id": ObjectId(file_id)})["metadata"]["tmp_lock"])
+        self.queue.release_file(file_id)
+        fs = self.queue._getFs()
+        delete = fs.delete
+        seen = []
+
+        def delete_checking_claims(retired_id):
+            seen.append(self.queue.claim_file(str(retired_id)))
+            delete(retired_id)
+
+        with patch.object(fs, "delete", side_effect=delete_checking_claims):
+            self.assertEqual(1, self.queue.delete_orphaned_files()["file_params"])
+        self.assertEqual([None], seen)
+        self.assertIsNone(self.queue.claim_file(file_id))
+
 
 class LocalQueueFilesTest(QueueFileFixtures, unittest.TestCase):
     def setUp(self):
@@ -461,6 +480,16 @@ class LocalQueueFilesTest(QueueFileFixtures, unittest.TestCase):
         job_id = self._job(self._param(), with_result=False)
         self.assertEqual(1, self.queue.delete_job(job_id))
         self.assertEqual({}, dict(self.queue._files))
+
+    def test_a_file_is_claimed_by_id_while_it_is_stored(self):
+        file_id = self._param(sha256="cd" * 32)
+        job_id = self._job(file_id, with_result=False)
+        self.assertEqual("cd" * 32, self.queue.claim_file(file_id))
+        self.assertEqual(1, self.queue._files_meta[file_id]["tmp_lock"])
+        self.queue.release_file(file_id)
+        self.queue.delete_job(job_id)
+        self.assertIsNone(self.queue.claim_file(file_id))
+        self.assertNotIn(file_id, self.queue._files_meta)
 
 
 class DeleteOrphanedQueueFilesJobTest(unittest.TestCase):

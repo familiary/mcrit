@@ -6,7 +6,8 @@ import falcon
 
 from mcrit.index.MinHashIndex import MinHashIndex
 from mcrit.queue.LocalQueue import Job
-from mcrit.server.utils import db_log_msg, jsonify, timing
+from mcrit.queue.QueueRemoteCalls import JobNotFoundError, JobNotRerunnableError
+from mcrit.server.utils import db_log_msg, get_username, jsonify, timing
 
 # TODO these should also return status and data in their json response
 
@@ -175,6 +176,30 @@ class JobResource:
         # resp.status = falcon.HTTP_404
         resp.data = jsonify({"status": "successful", "data": {"num_deleted": result}})
         db_log_msg(self.index, req, "JobResource.on_delete - success.")
+
+    @timing
+    def on_post_rerun(self, req, resp, job_id=None):
+        """Queue a finished, failed or terminated analysis again with what it was given (familiary/mcritweb#55). Answers the new job's id."""
+        job_id = _normalizeObjectId(job_id)
+        if job_id is None:
+            resp.status = falcon.HTTP_400
+            resp.data = jsonify({"status": "failed", "data": {"message": "Valid JobIDs are hexstrings with 24 characters."}})
+            db_log_msg(self.index, req, "JobResource.on_post_rerun - failed - invalid job_id.")
+            return
+        try:
+            new_job_id = self.index.rerunJob(job_id, username=get_username(req))
+        except JobNotFoundError as error:
+            resp.status = falcon.HTTP_404
+            resp.data = jsonify({"status": "failed", "data": {"message": str(error)}})
+            db_log_msg(self.index, req, "JobResource.on_post_rerun - failed - unknown job_id.")
+            return
+        except JobNotRerunnableError as error:
+            resp.status = falcon.HTTP_409
+            resp.data = jsonify({"status": "failed", "data": {"message": str(error)}})
+            db_log_msg(self.index, req, f"JobResource.on_post_rerun - failed - {error}")
+            return
+        resp.data = jsonify({"status": "successful", "data": new_job_id})
+        db_log_msg(self.index, req, f"JobResource.on_post_rerun - success - job_id {job_id} rerun as {new_job_id}.")
 
     @staticmethod
     def _wants_compact(req):

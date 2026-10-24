@@ -157,6 +157,14 @@ class UncacheableResult(dict):
     """
 
 
+class JobNotFoundError(LookupError):
+    """No job has the id that was asked for."""
+
+
+class JobNotRerunnableError(ValueError):
+    """A job that cannot be queued again from what it stored; the message says why."""
+
+
 # Wrapper that creates a remote call proxy for a given method
 def RemotifyFunctionWrapper(function):
     def submitPayloadQueue(self, payload, await_jobs, username):
@@ -287,6 +295,34 @@ def upload_file_params(self, file_params, hashes):
 def add_job_id_to_files(self, job_id, grid_params):
     for key, val in grid_params.items():
         self.queue.add_job_id_to_file(job_id, val)
+
+
+def resubmit_payload(self, payload, results_version=None, params=None, await_jobs=None, username=None):
+    """Queue a new job from a stored job's payload, as remote_call_function does with force_recalculation.
+
+    The new job gets the stored method and file parameters, and the stored parameters unless <params>
+    replaces them (keyed as rearrange_params leaves them). Its descriptor is computed anew, so it carries
+    the <results_version> given rather than the one the stored job was made with. The files are not
+    uploaded again: each is claimed by its id, as upload_file_params claims one by its hash, and then
+    linked to the new job, so deleting either job keeps the files the other one needs. A file that is
+    gone, or retired on its way out, raises JobNotRerunnableError, and nothing is queued.
+    """
+    if params is None:
+        params = json.loads(payload["params"])
+    grid_params = json.loads(payload["file_params"])
+    hashes = {}
+    for key, file_id in grid_params.items():
+        file_hash = self.queue.claim_file(file_id)
+        if file_hash is None:
+            for claimed_key in hashes:
+                self.queue.release_file(grid_params[claimed_key])
+            raise JobNotRerunnableError("A file the job was given is no longer stored.")
+        hashes[key] = file_hash
+    descriptor = get_descriptor(payload["method"], params, hashes, results_version=results_version)
+    new_payload = _createJobPayload(payload["method"], params, grid_params, descriptor)
+    job_id = str(self.queue.put(new_payload, await_jobs=await_jobs or [], username=username))
+    add_job_id_to_files(self, job_id, grid_params)
+    return job_id
 
 
 # Function to encode call
