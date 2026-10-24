@@ -109,9 +109,6 @@ class IngestWriteOrderMixin(unittest.TestCase):
     def test_a_failed_import_leaves_a_sample_another_writer_stored_meanwhile_alone(self):
         export_data = self._export_of("example_report.smda", "example_report_2.smda")
         first_sha256, second_sha256 = list(export_data["sample_entries"])
-        broken = copy.deepcopy(export_data)
-        function_entries = broken["function_entries"][second_sha256]
-        function_entries[next(iter(function_entries))] = {}
         target = self._index()
         storage = target.getStorage()
         import_sample_entry = storage.importSampleEntry
@@ -124,9 +121,12 @@ class IngestWriteOrderMixin(unittest.TestCase):
                 theirs.append(storage.addSmdaReport(load_report("example_report.smda")))
             return import_sample_entry(sample_entry)
 
+        # an export that does not read is refused before any sample is stored, so the import fails
+        # after its samples are written instead: at the function insert, as one MongoDB refuses
         with mock.patch.object(storage, "importSampleEntry", side_effect=stored_meanwhile):
-            with self.assertRaises(Exception):
-                target.addImportData(broken)
+            with mock.patch.object(storage, "importFunctionEntries", side_effect=RuntimeError("refused")):
+                with self.assertRaises(RuntimeError):
+                    target.addImportData(export_data)
         assert theirs[0] is not None
         self.assertEqual(export_data["sample_entries"][first_sha256]["sample_id"], theirs[0].sample_id)
         still_there = storage.getSampleBySha256(first_sha256)
@@ -275,6 +275,34 @@ class IngestWriteOrderMongoTest(IngestWriteOrderMixin):
         self.assertEqual(0, database.families.count_documents({"num_samples": {"$ne": 0}}))
         report = target.addImportData(export_data)
         self.assertEqual(2, report["num_samples_imported"])
+
+    def test_an_import_failing_at_a_later_sample_takes_back_what_the_earlier_ones_indexed(self):
+        # an import writes sample by sample, so the first sample's functions are stored, counted and
+        # given a range by the time the second sample's insert is refused
+        export_data = self._export_of("example_report.smda", "example_report_2.smda")
+        target = self._index()
+        storage = target.getStorage()
+        original = storage._dbInsertMany
+        function_inserts = []
+
+        def refusing_the_second(collection, data):
+            if collection == "functions" and data:
+                function_inserts.append(len(data))
+                if len(function_inserts) == 2:
+                    raise ValueError("Database insert failed.")
+            return original(collection, data)
+
+        with mock.patch.object(storage, "_dbInsertMany", refusing_the_second):
+            with self.assertRaises(ValueError):
+                target.addImportData(export_data)
+        self.assertEqual(2, len(function_inserts))
+        database = storage._getDb()
+        for collection in ("samples", "functions", "xcfg", storage._FUNCTION_RANGE_COLLECTION, storage._PICHASH_COUNT_COLLECTION, storage._PICBLOCKHASH_INDEX_COLLECTION):
+            self.assertEqual(0, database[collection].count_documents({}), collection)
+        self.assertEqual(0, database.families.count_documents({"num_samples": {"$ne": 0}}))
+        report = target.addImportData(export_data)
+        self.assertEqual(2, report["num_samples_imported"])
+        self.assertEqual(sum(entry["statistics"]["num_functions"] for entry in export_data["sample_entries"].values()), database.functions.count_documents({}))
 
 
 if __name__ == "__main__":

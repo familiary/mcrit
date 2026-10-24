@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
 import smda.common.SmdaFunction as smda_function_module
 from smda.common.BinaryInfo import BinaryInfo
@@ -45,7 +45,8 @@ def smdaFunctionFromXcfg(xcfg: Optional[Dict], binary_info: Optional[BinaryInfo]
     a missing blob to ``{}``. smda cannot rebuild a function from ``{}`` - it raises "serialized
     function is incomplete" - so the callers skip such a function instead of failing the whole
     batch it came in. An xcfg that is present but lacks a field smda requires still raises, and
-    names the fields, because that is not a state MCRIT writes.
+    names the fields, because that is not a state MCRIT writes - but an import stores whatever the
+    export holds, so the jobs that rehash the corpus log and skip a function that raises here.
     """
     if not xcfg:
         return None
@@ -53,6 +54,35 @@ def smdaFunctionFromXcfg(xcfg: Optional[Dict], binary_info: Optional[BinaryInfo]
     if missing:
         raise ValueError(f"stored disassembly of the function at offset {xcfg.get('offset')} lacks {', '.join(missing)}, which SmdaFunction.fromDict requires")
     return SmdaFunction.fromDict(xcfg, binary_info=binary_info)
+
+
+def picBlockHashEntries(blockhasher, smda_function: SmdaFunction, lower_addr: int, upper_addr: int) -> List[Dict]:
+    """The picblockhashes of a function's blocks as storage keeps them: each block's offset tuple with its hash."""
+    entries = []
+    for hash_entry in blockhasher.getBlockhashesForFunction(smda_function, lower_addr, upper_addr, hash_size=8):
+        for block_entry in hash_entry["offset_tuples"]:
+            block_entry["hash"] = hash_entry["hash"]
+            entries.append(block_entry)
+    return entries
+
+
+# The labels of a function that differ from its current name, which a plain search term matches
+# besides the name (#301). MongoDB keeps them in this derived, indexed field of the function
+# document, absent when there are none; it is storage-only and never part of a FunctionEntry.
+OTHER_LABELS_FIELD = "_other_labels"
+
+
+def otherLabels(function_name: Optional[str], function_labels: Iterable[Any]) -> List[str]:
+    """The distinct label strings that differ from the function name, in the order first given.
+
+    MongoDbStorage computes the same set on the server (_OTHER_LABELS_STAGE) for the writes that
+    change a function's labels or its name, as $setDifference does: compared exactly, case and all.
+    """
+    others: List[str] = []
+    for label in function_labels:
+        if isinstance(label, str) and label != function_name and label not in others:
+            others.append(label)
+    return others
 
 
 # Dataclass, post init
@@ -65,8 +95,8 @@ class FunctionEntry:
     function_id: int
     family_id: int
     sample_id: int
-    minhash: bytes  # TODO rename -> minhash_bytes? minhash_hex?
-    minhash_shingle_composition: Optional[Dict] = None  # FIXME MongoDbStorage fails without this, ... why?
+    minhash: bytes
+    minhash_shingle_composition: Optional[Dict]
     # inherited from sample
     architecture: str
     # smda information
@@ -80,6 +110,8 @@ class FunctionEntry:
     binweight: float
     offset: int
     xcfg: Optional[Dict]
+    # free labels an analyst attached, normalised by mcrit.libs.tags (#53)
+    tags: List[str]
 
     def __init__(
         self,
@@ -103,10 +135,15 @@ class FunctionEntry:
             self.pichash = smda_function.pic_hash or 0
             self.picblockhashes = []
         self.function_labels = []
+        self.tags = []
         self.matches = {}
         empty_minhash = MinHash()
         self.minhash = minhash.getMinHash() if minhash else empty_minhash.getMinHash()
-        self.shingler_composition = minhash.getComposition() if minhash else empty_minhash.getComposition()
+        self.minhash_shingle_composition = minhash.getComposition() if minhash else empty_minhash.getComposition()
+
+    def getOtherLabels(self) -> List[str]:
+        """The labels that differ from the current name (see otherLabels)."""
+        return otherLabels(getattr(self, "function_name", None), (label.function_label for label in self.function_labels))
 
     def getMinHash(self, minhash_bits=32):
         return MinHash(function_id=self.function_id, minhash_bytes=self.minhash, minhash_bits=minhash_bits)
@@ -139,6 +176,10 @@ class FunctionEntry:
             "sample_id": self.sample_id,
             "xcfg": self.xcfg,
         }
+        # most functions carry no tags, and a whole-corpus export or report holds millions of them,
+        # so the key is left out while empty; fromDict reads it missing as no tags (#53)
+        if self.tags:
+            function_entry["tags"] = list(self.tags)
         return function_entry
 
     @classmethod
@@ -162,6 +203,8 @@ class FunctionEntry:
         function_entry.binweight = entry_dict["binweight"]
         function_entry.offset = decode_two_complement(entry_dict["offset"])
         function_entry.xcfg = entry_dict["xcfg"] if "xcfg" in entry_dict else None
+        # functions stored before #53 carry no tags, and MongoDbStorage leaves the field out while empty
+        function_entry.tags = list(entry_dict.get("tags") or [])
         return function_entry
 
     def __str__(self):

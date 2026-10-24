@@ -3,6 +3,8 @@
 import hashlib
 import logging
 import os
+import signal
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from itertools import zip_longest
@@ -34,6 +36,7 @@ from mcrit.queue.QueueRemoteCalls import NoProgressReporter, QueueRemoteCallee, 
 from mcrit.storage.FunctionEntry import smdaFunctionFromXcfg
 from mcrit.storage.SampleEntry import SampleEntry
 from mcrit.storage.StorageFactory import StorageFactory
+from mcrit.storage.UniqueBlocksResult import UniqueBlocksProgressReporter, blockHashAsInt, blockScore, isGenericBlock, selectBlockCover
 
 if TYPE_CHECKING:
     from mcrit.storage.StorageInterface import StorageInterface
@@ -46,7 +49,7 @@ LOGGER = logging.getLogger(__name__)
 # answered from a job computed by the same results version (#241). Bump it in any change that
 # alters what such a report holds for the same corpus and parameters - jobs made before are
 # then recomputed on their next request instead of being handed out again.
-RESULTS_VERSION = 2
+RESULTS_VERSION = 3
 
 
 class Worker(QueueRemoteCallee):
@@ -82,9 +85,18 @@ class Worker(QueueRemoteCallee):
         return self
 
     def __exit__(self, *args):
-        # TODO unregister our worker_id from all in-progress jobs found in the queue
         self.queue.unregisterWorker()
         self.queue.release_all_jobs()
+
+    def run(self):
+        # jobs run in this process while the heartbeat reports it alive, so nothing else would reclaim
+        # one that does not end; a SpawningWorker bounds its job processes instead
+        # a QueueConfig from before this setting (docker-mcrit ships its own) has none
+        self._job_timeout = getattr(self._queue_config, "QUEUE_WORKER_JOB_TIMEOUT", 3600)
+        if self._job_timeout > 0 and (not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread()):
+            LOGGER.warning("QUEUE_WORKER_JOB_TIMEOUT needs SIGALRM in the main thread; this worker runs jobs without a time limit.")
+            self._job_timeout = 0
+        super().run()
 
     #### STORAGE IO ####
     def getStorage(self):
@@ -138,12 +150,12 @@ class Worker(QueueRemoteCallee):
     def deleteSample(self, sample_id, progress_reporter=NoProgressReporter()):
         return self._storage.deleteSample(sample_id)
 
-    def _addReport(self, smda_report, calculate_hashes=True, calculate_matches=False) -> Optional["SampleEntry"]:
+    def _addReport(self, smda_report, calculate_hashes=True, calculate_matches=False, sha256_verified=False) -> Optional["SampleEntry"]:
         sample_entry = self._storage.getSampleBySha256(smda_report.sha256)
         if sample_entry:
             LOGGER.info("Sample is already present in database: %s", sample_entry)
             return sample_entry
-        sample_entry = self._storage.addSmdaReport(smda_report)
+        sample_entry = self._storage.addSmdaReport(smda_report, sha256_verified=sha256_verified)
         if not sample_entry:
             return None
         LOGGER.info("Added %s", sample_entry)
@@ -158,36 +170,197 @@ class Worker(QueueRemoteCallee):
     def addBinarySample(self, binary, filename, family, version, is_dump, base_address, bitness, progress_reporter=NoProgressReporter()):
         binary_sha256 = hashlib.sha256(binary).hexdigest()
         sample_entry = self._storage.getSampleBySha256(binary_sha256)
+        job_id = self._jobIdOf(progress_reporter)
+        if sample_entry and sample_entry.sha256_verified is not True:
+            # indexed from a report that only states this hash: replaced by the bytes' disassembly (#270)
+            return self._replaceReportedSample(sample_entry, binary, binary_sha256, filename, family, version, is_dump, base_address, bitness, job_id=job_id)
         if sample_entry:
-            LOGGER.info("Sample is already known with ID: %d", sample_entry.sample_id)
-            result = {"sample_info": sample_entry.toDict()}
-            if self._storage_config.STORAGE_KEEP_SUBMITTED_BINARIES and not self._storage.hasSampleBinary(sample_entry.sample_id):
-                # a retried job (the sample was committed, storing the binary was not) or a
-                # sample submitted before binaries were kept: complete it here
-                result["binary_stored"] = self._storage.storeSampleBinary(sample_entry.sample_id, binary)
-            return result
-        config = SmdaConfig()
-        SMDA_REPORT = None
-        DISASSEMBLER = Disassembler(config)
+            return self._knownSampleResult(sample_entry, binary)
+        return self._indexNewBinary(binary, binary_sha256, filename, family, version, is_dump, base_address, bitness, job_id=job_id)
+
+    @staticmethod
+    def _jobIdOf(progress_reporter) -> Optional[str]:
+        """The queue job a call runs as, which a remote call's progress reporter is made for."""
+        job = getattr(progress_reporter, "_job", None)
+        return str(job.job_id) if job is not None else None
+
+    def _knownSampleResult(self, sample_entry: "SampleEntry", binary: bytes) -> Dict[str, Any]:
+        LOGGER.info("Sample is already known with ID: %d", sample_entry.sample_id)
+        result: Dict[str, Any] = {"sample_info": sample_entry.toDict()}
+        if self._storage_config.STORAGE_KEEP_SUBMITTED_BINARIES and not self._storage.hasSampleBinary(sample_entry.sample_id):
+            # a retried job (the sample was committed, storing the binary was not) or a
+            # sample submitted before binaries were kept: complete it here
+            result["binary_stored"] = self._storage.storeSampleBinary(sample_entry.sample_id, binary)
+        return result
+
+    @staticmethod
+    def _disassemble(binary, filename, family, version, is_dump, base_address, bitness) -> SmdaReport:
         LOGGER.info("Disassembling...")
+        disassembler = Disassembler(SmdaConfig())
         if is_dump:
-            SMDA_REPORT = DISASSEMBLER.disassembleBuffer(binary, base_addr=base_address, bitness=bitness)
+            smda_report = disassembler.disassembleBuffer(binary, base_addr=base_address, bitness=bitness)
         else:
-            SMDA_REPORT = DISASSEMBLER.disassembleUnmappedBuffer(binary)
+            smda_report = disassembler.disassembleUnmappedBuffer(binary)
         if filename is not None:
-            SMDA_REPORT.filename = filename
+            smda_report.filename = filename
         if family is not None:
-            SMDA_REPORT.family = family
+            smda_report.family = family
         if version is not None:
-            SMDA_REPORT.version = version
-        sample_entry = self._addReport(SMDA_REPORT)
+            smda_report.version = version
+        return smda_report
+
+    def _indexNewBinary(self, binary, binary_sha256, filename, family, version, is_dump, base_address, bitness, job_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        smda_report = self._disassemble(binary, filename, family, version, is_dump, base_address, bitness)
+        # smda hashes the buffer it was given; the sample is only as verified as that hash is the upload's
+        sample_entry = self._addReport(smda_report, sha256_verified=smda_report.sha256 == binary_sha256)
         LOGGER.info("Disassembled and indexed sample: %s", sample_entry)
         if sample_entry is None:
             return None
-        result = {"sample_info": sample_entry.toDict()}
+        if sample_entry.sha256_verified is not True and smda_report.sha256 == binary_sha256:
+            # a report submitted under this hash won the race with this job: replace it as well
+            return self._replaceReportedSample(
+                sample_entry, binary, binary_sha256, filename, family, version, is_dump, base_address, bitness, smda_report=smda_report, job_id=job_id
+            )
+        result: Dict[str, Any] = {"sample_info": sample_entry.toDict()}
         if self._storage_config.STORAGE_KEEP_SUBMITTED_BINARIES:
             # the raw submission, for whatever wants the bytes later (#95)
             result["binary_stored"] = self._storage.storeSampleBinary(sample_entry.sample_id, binary)
+        return result
+
+    @staticmethod
+    def compareWithStoredFunctions(stored_pichashes: Dict[int, int], stored_base_addr: int, smda_report: SmdaReport) -> Dict[str, Any]:
+        """How far a binary's disassembly agrees with a stored sample's functions (#270): those at
+        the same offset from the base address with the same PicHash, as a share of the larger of
+        the two function sets. For information only, the upload replaces the sample either way.
+        One pass over the binary's functions against the stored ones by offset."""
+        stored_by_offset = {offset - stored_base_addr: pichash for offset, pichash in stored_pichashes.items()}
+        binary_base_addr = smda_report.base_addr or 0
+        num_matched = 0
+        num_binary_functions = 0
+        for smda_function in smda_report.getFunctions():
+            num_binary_functions += 1
+            if smda_function.pic_hash and stored_by_offset.get((smda_function.offset or 0) - binary_base_addr) == smda_function.pic_hash:
+                num_matched += 1
+        num_larger = max(num_binary_functions, len(stored_by_offset))
+        return {
+            "agreement": num_matched / num_larger if num_larger else 1.0,
+            "matched_functions": num_matched,
+            "binary_functions": num_binary_functions,
+            "stored_functions": len(stored_by_offset),
+        }
+
+    def _claimReportedSample(self, sample_id: int, token: str, job_id: Optional[str]) -> str:
+        """Claim a sample for replacing its analysis, taking over the claim of a job that ended."""
+        stale_after = getattr(self._queue_config, "QUEUE_VERIFICATION_CLAIM_TIMEOUT", 60 * 60)
+        claim = self._storage.claimSampleVerification(sample_id, token, job_id, stale_after)
+        if claim != "busy":
+            return claim
+        held = self._storage.getSampleVerificationClaim(sample_id)
+        if held is None:
+            # released in between
+            return self._storage.claimSampleVerification(sample_id, token, job_id, stale_after)
+        if self._isClaimingJobOver(held.get("job_id"), job_id):
+            return self._storage.claimSampleVerification(sample_id, token, job_id, stale_after, dead_token=held["token"])
+        return "busy"
+
+    def _isClaimingJobOver(self, claiming_job_id: Optional[str], own_job_id: Optional[str]) -> bool:
+        """Whether the queue job that holds a claim no longer runs: finished, failed, or released
+        for another attempt. Without a job id to look up, only the claim's timeout tells."""
+        if claiming_job_id is None:
+            return False
+        if claiming_job_id == own_job_id:
+            # an earlier attempt of this very job
+            return True
+        try:
+            job = self.queue.get_job(claiming_job_id)
+        except Exception:
+            LOGGER.warning("Could not look up job %s holding a sample claim.", claiming_job_id, exc_info=True)
+            return False
+        return job is None or bool(job.is_finished) or bool(job.is_failed) or not job.locked_by
+
+    def _replaceReportedSample(
+        self,
+        sample_entry: "SampleEntry",
+        binary,
+        binary_sha256,
+        filename,
+        family,
+        version,
+        is_dump,
+        base_address,
+        bitness,
+        smda_report: Optional[SmdaReport] = None,
+        job_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Replace the analysis of a sample indexed from a submitted report by its binary's (#270).
+
+        A report only states the hash of the bytes it was made from. Once the bytes are uploaded,
+        their disassembly takes the place of the reported analysis under the same sample_id, so
+        that sha256_verified vouches for the analysis being MCRIT's own of those bytes. The labels
+        of functions found at the same offset from the base address are carried over. The family,
+        version and filename the upload names win, otherwise the sample keeps its own, as it holds
+        them when the swap ends, and so it does its is_library and component. How far the report
+        agreed with the disassembly is part of the result, for information.
+        """
+        sample_id = sample_entry.sample_id
+        token = f"{self._worker_id}:{uuid.uuid4()}"
+        claim = self._claimReportedSample(sample_id, token, job_id)
+        if claim == "missing":
+            # deleted since it was looked up: the upload is a new sample after all
+            return self._indexNewBinary(binary, binary_sha256, filename, family, version, is_dump, base_address, bitness, job_id=job_id)
+        if claim == "verified":
+            current = self._storage.getSampleById(sample_id)
+            if current is None:
+                return self._indexNewBinary(binary, binary_sha256, filename, family, version, is_dump, base_address, bitness, job_id=job_id)
+            return self._knownSampleResult(current, binary)
+        if claim == "busy":
+            LOGGER.info("Sample %d is being replaced by another job.", sample_id)
+            return {"sample_info": sample_entry.toDict(), "verification": {"status": "in_progress"}}
+        verification: Dict[str, Any] = {}
+        try:
+            if claim == "resume":
+                # a job that died swapping had the bytes disassembled already: finish its swap
+                # with what this upload says about the sample
+                verification["resumed"] = True
+            else:
+                if smda_report is None:
+                    smda_report = self._disassemble(binary, filename, family, version, is_dump, base_address, bitness)
+                if smda_report.sha256 != binary_sha256:
+                    self._storage.releaseSampleVerification(sample_id, token)
+                    return {"sample_info": sample_entry.toDict(), "verification": {"status": "unverified", "reason": "the disassembly hashes other bytes than the upload"}}
+                if not self._storage.renewSampleVerification(sample_id, token):
+                    return self._unreplacedResult(sample_id, verification)
+                current = self._storage.getSampleById(sample_id)
+                stored_base_addr = current.base_addr if current is not None else 0
+                verification.update(self.compareWithStoredFunctions(self._storage.getFunctionPicHashesBySampleId(sample_id), stored_base_addr, smda_report))
+                if not self._storage.stageSampleAnalysis(sample_id, smda_report, token) or not self._storage.renewSampleVerification(sample_id, token):
+                    return self._unreplacedResult(sample_id, verification)
+            verification.update(self._storage.swapSampleAnalysis(sample_id, token, filename=filename, family=family, version=version))
+        except Exception:
+            self._storage.releaseSampleVerification(sample_id, token)
+            raise
+        if verification["status"] != "replaced":
+            return self._unreplacedResult(sample_id, verification)
+        LOGGER.info("Sample %d replaced by the disassembly of its binary: %s", sample_id, verification)
+        self.updateMinHashesForSample(sample_id)
+        return self._verificationResult(sample_id, binary, verification)
+
+    def _unreplacedResult(self, sample_id: int, verification: Dict[str, Any]) -> Dict[str, Any]:
+        """The result of a replacement that stopped, its claim gone to deleteSample or another job."""
+        sample_entry = self._storage.getSampleById(sample_id)
+        if "status" not in verification or verification["status"] == "replaced":
+            verification["status"] = "claim_lost" if sample_entry is not None else "sample_deleted"
+        LOGGER.info("Sample %d was not replaced: %s", sample_id, verification["status"])
+        return {"sample_info": sample_entry.toDict() if sample_entry is not None else None, "verification": {**verification, "sample_id": sample_id}}
+
+    def _verificationResult(self, sample_id: int, binary: bytes, verification: Dict[str, Any]) -> Dict[str, Any]:
+        sample_entry = self._storage.getSampleById(sample_id)
+        if sample_entry is None:
+            # deleted right after its swap
+            return self._unreplacedResult(sample_id, {**verification, "status": "sample_deleted"})
+        result: Dict[str, Any] = {"sample_info": sample_entry.toDict(), "verification": verification}
+        if self._storage_config.STORAGE_KEEP_SUBMITTED_BINARIES:
+            result["binary_stored"] = self._storage.storeSampleBinary(sample_id, binary)
         return result
 
     QUERY_JOB_METHODS = ("getMatchesForUnmappedBinary", "getMatchesForMappedBinary", "getMatchesForSmdaReport")
@@ -325,8 +498,18 @@ class Worker(QueueRemoteCallee):
         # functions whose disassembly is gone keep their minhashes: this used to drop every minhash
         # first and lose theirs for good, and then stamp their samples as current anyway
         kept_sample_ids = self._storage.deleteRehashableMinHashes(progress_reporter=progress_reporter)
-        num_updated = self.updateMinHashes(None, progress_reporter=progress_reporter)
-        self._storage.setMinHashVersionForSamples(SmdaConfig().VERSION, except_sample_ids=kept_sample_ids)
+        failed_function_ids = []
+        num_updated = self._updateMinHashes(None, progress_reporter, failed_function_ids)
+        # a sample with a function that could not be hashed is not recorded as current either, so
+        # that a repair tries it again
+        unhashable_sample_ids = set()
+        for function_id in failed_function_ids:
+            function_entry = self._storage.getFunctionById(function_id)
+            if function_entry is not None:
+                unhashable_sample_ids.add(function_entry.sample_id)
+        if unhashable_sample_ids:
+            LOGGER.warning("Recalculating MinHashes: %d samples have functions that could not be hashed and are not recorded as current.", len(unhashable_sample_ids))
+        self._storage.setMinHashVersionForSamples(SmdaConfig().VERSION, except_sample_ids=kept_sample_ids | unhashable_sample_ids)
         return num_updated
 
     @staticmethod
@@ -376,11 +559,38 @@ class Worker(QueueRemoteCallee):
                 continue
             # a sample without functions large enough to hash is repaired too: it simply holds no
             # minhashes afterwards, and is recorded as current like any other (#238)
-            minhashes = self.calculateMinHashes(hashable) if hashable else []
+            failed_function_ids = []
+            minhashes = self.calculateMinHashes(hashable, failed_function_ids=failed_function_ids) if hashable else []
+            if failed_function_ids:
+                # dropping the sample's minhashes would drop those of the functions that could not be
+                # hashed again, and recording it as current would stop anything from trying them
+                LOGGER.warning("Repairing MinHashes: %d functions of sample %d cannot be hashed, keeping its minhashes and leaving it stale.", len(failed_function_ids), sample_id)
+                report["num_samples_skipped"] += 1
+                progress_reporter.step()
+                continue
             # a function of the sample whose disassembly is gone keeps its minhash, as in
             # recalculateMinHashes: dropping the sample's minhashes would take it along for good
+            # One of another length than the configured signature (an earlier import stored such
+            # unchecked) does not fit the band projection and would stop the repair at this sample on
+            # every run; it can match nothing and has no disassembly to be recomputed from, so it goes
             minhash_bits = self.config.MINHASH_CONFIG.MINHASH_SIGNATURE_BITS
-            kept = [entry.getMinHash(minhash_bits=minhash_bits) for entry in function_entries if not entry.xcfg and entry.minhash]
+            signature_bytes = self.config.MINHASH_CONFIG.MINHASH_SIGNATURE_LENGTH * (1 if minhash_bits <= 8 else 4)
+            kept_entries = [entry for entry in function_entries if not entry.xcfg and entry.minhash]
+            kept = []
+            for entry in kept_entries:
+                if len(entry.minhash) == signature_bytes:
+                    # rebuilt from its bytes, it would write an empty composition over the function's:
+                    # it takes the one read with the entry, as deleteMinHashesForSample clears it
+                    minhash = entry.getMinHash(minhash_bits=minhash_bits)
+                    minhash.shingler_composition = entry.minhash_shingle_composition or {}
+                    kept.append(minhash)
+            if len(kept) != len(kept_entries):
+                LOGGER.warning(
+                    "Repairing MinHashes: dropping %d minhashes of sample %d that are not %d bytes long and have no disassembly.",
+                    len(kept_entries) - len(kept),
+                    sample_id,
+                    signature_bytes,
+                )
             report["num_functions_dropped"] += self._storage.deleteMinHashesForSample(sample_id)
             if minhashes or kept:
                 self._storage.addMinHashes(minhashes + kept)
@@ -394,8 +604,19 @@ class Worker(QueueRemoteCallee):
 
     # Reports PROGRESS
     @Remote(progress=True)
-    def updateMinHashes(self, function_ids, progress_reporter=NoProgressReporter()):
-        """Find unhashed functions in storage and calculate their MinHashes, optionally filter by function_ids or get function_entries passed directly"""
+    def updateMinHashes(self, function_ids, finish_samples=False, progress_reporter=NoProgressReporter()):
+        """Find unhashed functions in storage and calculate their MinHashes, optionally filter by function_ids or get function_entries passed directly
+
+        With finish_samples, every sample still waiting for its minhashes is then finished the way
+        updateMinHashesForSample finishes its sample, once nothing in it is left to hash. GET
+        /complete_minhashes asks for it, as that is how samples submitted with deferred hashing get
+        hashed. recalculateMinHashes and updateMinHashesForSample record versions themselves and
+        leave it off.
+        """
+        return self._updateMinHashes(function_ids, progress_reporter, finish_samples=finish_samples)
+
+    def _updateMinHashes(self, function_ids, progress_reporter, failed_function_ids=None, finish_samples=False):
+        # failed_function_ids, when given, collects the functions that could not be hashed
         # Counts every MinHash written, across every batch. It has to be initialised before the
         # loops: when there is nothing left to hash the loop body never runs, and returning
         # len(minhashes) then raised UnboundLocalError - so finishing with no work to do failed
@@ -416,7 +637,7 @@ class Worker(QueueRemoteCallee):
             for sliced_ids in zip_longest(*[iter(unhashed_function_ids)] * self.config.MINHASH_CONFIG.MINHASH_GENERATION_WORKPACK_SIZE):
                 sliced_ids = [fid for fid in sliced_ids if fid is not None]
                 unhashed_functions = self._storage.getUnhashedFunctions([fid for fid in sliced_ids if isinstance(fid, int)])
-                minhashes = self.calculateMinHashes(unhashed_functions, progress_reporter=progress_reporter)
+                minhashes = self.calculateMinHashes(unhashed_functions, progress_reporter=progress_reporter, failed_function_ids=failed_function_ids)
                 if minhashes:
                     self._storage.addMinHashes(minhashes)
                     num_updated += len(minhashes)
@@ -432,14 +653,40 @@ class Worker(QueueRemoteCallee):
                 sliced_ids = [fid for fid in sliced_ids if fid is not None]
                 unhashed_functions = self._storage.getUnhashedFunctions([fid for fid in sliced_ids if isinstance(fid, int)])
                 LOGGER.info("Updating MinHashes: %d function entries have no MinHash yet.", len(unhashed_functions))
-                minhashes = self.calculateMinHashes(unhashed_functions, progress_reporter=progress_reporter)
+                minhashes = self.calculateMinHashes(unhashed_functions, progress_reporter=progress_reporter, failed_function_ids=failed_function_ids)
                 if minhashes:
                     self._storage.addMinHashes(minhashes)
                     num_updated += len(minhashes)
                     LOGGER.info("Updated minhashes for %d function entries.", len(minhashes))
                 progress_reporter.step()
-        # TODO if we do deferred calculation for a batch of minhashes, we might have to clear them here or address this where else updateMinHashes is used
+        if finish_samples:
+            self._finishPendingSamples()
         return num_updated
+
+    def _finishPendingSamples(self) -> None:
+        """Record the minhash version of every sample still pending since it was stored and now
+        hashed completely and, with STORAGE_DROP_DISASSEMBLY, drop its disassembly - what
+        updateMinHashesForSample does for a sample hashed on submission.
+
+        This goes by what storage holds rather than by what this run hashed, so a retried, repeated
+        or overlapping run finishes the same samples, and so does one for a sample with nothing
+        large enough to hash. A sample repairMinHashes or recalculateMinHashes rehashed stays
+        pending until then, as neither drops disassembly. Only samples stored by an smda at or above
+        the escaper compatibility threshold and by the running shingler revision count: minhashes
+        written across an incompatible upgrade, like those of an import or of a sample stored before
+        the marker existed, are left to repairMinHashes.
+        """
+        pending_sample_ids = self._storage.getSamplesWithPendingMinHashes(self.getMinHashCompatibilityThreshold())
+        # as in repairMinHashes, a function without disassembly cannot be hashed and does not hold
+        # its sample back; every other function large enough to hash has to have its minhash
+        unhashed_sample_ids = self._storage.getSamplesWithUnhashedFunctions(pending_sample_ids)
+        finished_sample_ids = [sample_id for sample_id in pending_sample_ids if sample_id not in unhashed_sample_ids]
+        LOGGER.info("Updating MinHashes: %d of %d pending samples hashed completely, recording them as current.", len(finished_sample_ids), len(pending_sample_ids))
+        if finished_sample_ids:
+            self._storage.setMinHashVersionForSamples(SmdaConfig().VERSION, finished_sample_ids, finish_pending=True)
+            if self.config.STORAGE_CONFIG.STORAGE_DROP_DISASSEMBLY:
+                for sample_id in finished_sample_ids:
+                    self._storage.deleteXcfgForSampleId(sample_id)
 
     # Reports PROGRESS
     @Remote(progress=True)
@@ -452,7 +699,7 @@ class Worker(QueueRemoteCallee):
             LOGGER.info("Sample %d did not have any functions, proceeding.", sample_id)
             update_result = 0
         # which escaper produced them, so a later smda can tell whether they are stale (#142)
-        self._storage.setMinHashVersionForSamples(SmdaConfig().VERSION, [sample_id])
+        self._storage.setMinHashVersionForSamples(SmdaConfig().VERSION, [sample_id], finish_pending=True)
         if not function_entries:
             return 0
         if self.config.STORAGE_CONFIG.STORAGE_DROP_DISASSEMBLY:
@@ -460,15 +707,44 @@ class Worker(QueueRemoteCallee):
         return update_result
 
     # Reports PROGRESS
-    @Remote(progress=True, results_version=RESULTS_VERSION)
-    def getUniqueBlocks(self, sample_ids, family_id=None, covers_required=10, min_instructions=0, progress_reporter=NoProgressReporter()):
+    @Remote(progress=True, kwjson_locations=["exclude_picblockhashes"], results_version=RESULTS_VERSION, time_limited=True)
+    def getUniqueBlocks(
+        self,
+        sample_ids,
+        family_id=None,
+        covers_required=10,
+        min_instructions=0,
+        gentle_length_score=False,
+        max_blocks_per_function=0,
+        demote_generic_blocks=False,
+        exclude_picblockhashes=None,
+        progress_reporter=NoProgressReporter(),
+    ):
         """Collect the blocks unique to <sample_ids> and greedily pick a multi-set cover of them.
 
         The cover is a k-of-n construction: <covers_required> is that k, i.e. how many selected
         blocks every sample must be reached by. Lower values yield a smaller rule on weaker
         evidence. <min_instructions> drops shorter blocks before the selection runs, so the cover is
         chosen from blocks a caller would keep rather than from ones it discards afterwards - a
-        two-instruction block is not worth a YARA string. Both are clamped to sane values.
+        two-instruction block is not worth a YARA string. Both are clamped to sane values. Among
+        blocks that cover as many samples with the same score, the cover takes the one whose YARA
+        string has the most fixed hex digits, then the lowest picblockhash (coverPreference, #283),
+        so the same input always gives the same rule.
+
+        Four options try the other directions of #283. They are off by default and leave the cover
+        unchanged unless given; the statistics echo them either way:
+        - <gentle_length_score> rescores the blocks with lengthScore's gentle decline, which only
+          changes those longer than 11 instructions: a 12-instruction block no longer loses half
+          its length score.
+        - <max_blocks_per_function> caps how many selected blocks one function of one sample
+          contributes, see selectBlockCover.
+        - <demote_generic_blocks> ranks function exits and mostly-wildcard blocks (isGenericBlock)
+          behind every other block that reaches as many samples.
+        - <exclude_picblockhashes> is a negative set: blocks with these hashes are dropped before
+          the cover, e.g. those of siblings that are not in the index. The list is stored with the
+          job rather than in its arguments, as it can run to many thousands of hashes. Called
+          through MinHashIndex, even an explicit None or [] is stored and makes a job of its own,
+          so leave it out when there is nothing to exclude.
 
         NOTE: result["yara_rule"] is the cover's selection as a list of picblockhash strings, not
         YARA source - the byte patterns live per block in unique_blocks[hash]["escaped_sequence"].
@@ -476,17 +752,20 @@ class Worker(QueueRemoteCallee):
         statistics reports how far the cover got: "num_samples_covered" counts the samples reached
         by at least covers_required selected blocks, and "yara_covers" is the number of selected
         blocks covering the least covered sample, i.e. the k the cover actually achieved. It also
-        echoes the two parameters, so a result says what shaped it, and "blocks_considered" records
-        how many blocks survived min_instructions while the counts above describe everything found.
+        echoes the parameters, so a result says what shaped it, and "blocks_considered" records
+        how many blocks survived min_instructions and the negative set, which "blocks_excluded"
+        counts, while the counts above describe everything found. "generic_blocks" counts the
+        considered blocks isGenericBlock flags, only when demote_generic_blocks asks for it.
         "blocks_without_instructions" counts the blocks found whose function was stored without its
         disassembly: they are left out of unique_blocks and of the cover, having no instructions to
         show and no bytes to match on.
         """
-        # TODO we could propagate this progress reporter into the storage function for more fine grained progress tracking
-        progress_reporter.set_total(1)
+        progress = UniqueBlocksProgressReporter.wrap(progress_reporter)
         covers_required = max(1, int(covers_required))
         min_instructions = max(0, int(min_instructions))
-        blocks_result_dict = self._storage.getUniqueBlocks(sample_ids, progress_reporter=progress_reporter)
+        max_blocks_per_function = max(0, int(max_blocks_per_function or 0))
+        excluded = {blockHashAsInt(block_hash) for block_hash in exclude_picblockhashes or []}
+        blocks_result_dict = self._storage.getUniqueBlocks(sample_ids, progress_reporter=progress)
         blocks_result_dict["statistics"]["has_yara_rule"] = False
         blocks_result_dict["statistics"]["yara_covers"] = 0
         blocks_result_dict["statistics"]["has_complete_yara_rule"] = False
@@ -498,45 +777,22 @@ class Worker(QueueRemoteCallee):
         blocks_result_dict["statistics"]["blocks_without_instructions"] = len(found_blocks) - len(unique_blocks)
         if min_instructions:
             unique_blocks = {block_hash: entry for block_hash, entry in unique_blocks.items() if entry["length"] >= min_instructions}
+        num_before_exclusion = len(unique_blocks)
+        if excluded:
+            unique_blocks = {block_hash: entry for block_hash, entry in unique_blocks.items() if blockHashAsInt(block_hash) not in excluded}
+        if gentle_length_score:
+            for entry in unique_blocks.values():
+                # the storage's score with the gentle length share, which differs past 11 instructions
+                entry["score"] = blockScore(len(entry["samples"]), len(sample_ids), entry["length"], gentle=True)
         blocks_result_dict["unique_blocks"] = unique_blocks
         blocks_result_dict["statistics"]["covers_required"] = covers_required
         blocks_result_dict["statistics"]["min_instructions"] = min_instructions
+        blocks_result_dict["statistics"]["gentle_length_score"] = bool(gentle_length_score)
+        blocks_result_dict["statistics"]["max_blocks_per_function"] = max_blocks_per_function
+        blocks_result_dict["statistics"]["demote_generic_blocks"] = bool(demote_generic_blocks)
+        blocks_result_dict["statistics"]["blocks_excluded"] = num_before_exclusion - len(unique_blocks)
         blocks_result_dict["statistics"]["blocks_considered"] = len(unique_blocks)
-        # greedily produce a multi set cover of picblockhashes for sample_ids, i.e. a YARA rule :)
-        yara_rule = []
-        sample_coverage = {sample_id: 0 for sample_id in sample_ids}
-        samples_covered = set()
-        while True:
-            # calculate block_scores as how much benefit they bring, i.e. how many uncovered samples they can cover at once
-            block_candidates = []
-            for block_hash, entry in unique_blocks.items():
-                sample_ids_coverable = set(entry["samples"]).difference(samples_covered)
-                if sample_ids_coverable and block_hash not in yara_rule:
-                    candidate = {"block_hash": block_hash, "coverable": sample_ids_coverable, "value": len(sample_ids_coverable), "score": entry["score"]}
-                    block_candidates.append(candidate)
-            # check if we are done yet, successful or not
-            if len(samples_covered) == len(sample_ids):
-                # an empty request covers its zero samples vacuously - do not report a rule for it
-                blocks_result_dict["statistics"]["has_yara_rule"] = bool(yara_rule)
-                blocks_result_dict["statistics"]["has_complete_yara_rule"] = bool(yara_rule)
-                break
-            if len(block_candidates) == 0:
-                if len(yara_rule) > 0:
-                    blocks_result_dict["statistics"]["has_yara_rule"] = True
-                break
-            # if not, choose the best block
-            block_candidates.sort(key=lambda i: (i["value"], i["score"]))
-            selected_block: Dict[str, Any] = block_candidates.pop()
-            yara_rule.append(selected_block["block_hash"])
-            # and update counters
-            for sample_id in selected_block["coverable"]:
-                sample_coverage[sample_id] += 1
-            samples_covered = set([sample_id for sample_id, count in sample_coverage.items() if count >= covers_required])
-        blocks_result_dict["statistics"]["num_samples_covered"] = len(samples_covered)
-        # how many selected blocks reach the least covered sample - reported as 0 before (#144)
-        blocks_result_dict["statistics"]["yara_covers"] = min(sample_coverage.values()) if sample_coverage else 0
-        blocks_result_dict["yara_rule"] = yara_rule
-        # enrich with escaped sequences
+        # enrich with escaped sequences, before the cover: it breaks score ties by their fixed hex digits (#283)
         sample_addr_borders = {}
         sample_escaper = {}
         for sample_id in sample_ids:
@@ -544,6 +800,7 @@ class Worker(QueueRemoteCallee):
             assert sample_entry is not None
             sample_addr_borders[sample_id] = {"lower": sample_entry.base_addr, "upper": sample_entry.base_addr + sample_entry.binary_size}
             sample_escaper[sample_id] = SmdaFunction.getInstructionEscaper(sample_entry.architecture)
+        progress.start_phase("escape", len(unique_blocks))
         for block_hash, entry in unique_blocks.items():
             sample_id = entry["sample_id"]
             escaped_sequences = []
@@ -558,8 +815,27 @@ class Worker(QueueRemoteCallee):
                     )
                 )
             unique_blocks[block_hash]["escaped_sequence"] = " ".join(escaped_sequences)
+            progress.step()
+        # greedily produce a multi set cover of picblockhashes for sample_ids, i.e. a YARA rule :)
+        demoted = {block_hash for block_hash, entry in unique_blocks.items() if isGenericBlock(entry)} if demote_generic_blocks else frozenset()
+        if demote_generic_blocks:
+            blocks_result_dict["statistics"]["generic_blocks"] = len(demoted)
+        # the cover is short next to escaping the blocks, so its phase takes no steps and finish() fills it
+        progress.start_phase("cover", 1)
+        yara_rule, sample_coverage = selectBlockCover(unique_blocks, sample_ids, covers_required, max_blocks_per_function=max_blocks_per_function, demoted=demoted)
+        samples_covered = {sample_id for sample_id, count in sample_coverage.items() if count >= covers_required}
+        # an empty request covers its zero samples vacuously - do not report a rule for it
+        if len(samples_covered) == len(sample_ids):
+            blocks_result_dict["statistics"]["has_yara_rule"] = bool(yara_rule)
+            blocks_result_dict["statistics"]["has_complete_yara_rule"] = bool(yara_rule)
+        elif yara_rule:
+            blocks_result_dict["statistics"]["has_yara_rule"] = True
+        blocks_result_dict["statistics"]["num_samples_covered"] = len(samples_covered)
+        # how many selected blocks reach the least covered sample - reported as 0 before (#144)
+        blocks_result_dict["statistics"]["yara_covers"] = min(sample_coverage.values()) if sample_coverage else 0
+        blocks_result_dict["yara_rule"] = yara_rule
         blocks_result_dict["unique_blocks"] = unique_blocks
-        progress_reporter.step()
+        progress.finish()
         return blocks_result_dict
 
     @staticmethod
@@ -576,7 +852,7 @@ class Worker(QueueRemoteCallee):
         return match_report
 
     # Reports PROGRESS
-    @Remote(progress=True, json_locations=[0], results_version=RESULTS_VERSION)
+    @Remote(progress=True, json_locations=[0], results_version=RESULTS_VERSION, time_limited=True)
     def getMatchesForSmdaReport(
         self,
         report_json,
@@ -603,7 +879,7 @@ class Worker(QueueRemoteCallee):
         return self._asJobResult(matcher, match_report)
 
     # Reports PROGRESS
-    @Remote(progress=True, file_locations=[0], results_version=RESULTS_VERSION)
+    @Remote(progress=True, file_locations=[0], results_version=RESULTS_VERSION, time_limited=True)
     def getMatchesForMappedBinary(
         self,
         binary,
@@ -634,7 +910,7 @@ class Worker(QueueRemoteCallee):
         return self._asJobResult(matcher, match_report)
 
     # Reports PROGRESS
-    @Remote(progress=True, file_locations=[0], results_version=RESULTS_VERSION)
+    @Remote(progress=True, file_locations=[0], results_version=RESULTS_VERSION, time_limited=True)
     def getMatchesForUnmappedBinary(
         self,
         binary,
@@ -664,7 +940,7 @@ class Worker(QueueRemoteCallee):
         return self._asJobResult(matcher, match_report)
 
     # Reports PROGRESS
-    @Remote(progress=True, results_version=RESULTS_VERSION)
+    @Remote(progress=True, results_version=RESULTS_VERSION, time_limited=True)
     def getMatchesForSample(
         self,
         sample_id,
@@ -690,7 +966,7 @@ class Worker(QueueRemoteCallee):
         return self._asJobResult(matcher, match_report)
 
     # Reports PROGRESS
-    @Remote(progress=True, results_version=RESULTS_VERSION)
+    @Remote(progress=True, results_version=RESULTS_VERSION, time_limited=True)
     def getMatchesForSampleVs(
         self,
         sample_id,
@@ -710,10 +986,10 @@ class Worker(QueueRemoteCallee):
             band_df_cutoff=band_df_cutoff,
         )
         match_report = matcher.getMatchesForSample(sample_id, other_sample_id)
-        return match_report
+        return self._asJobResult(matcher, match_report)
 
     # Reports PROGRESS
-    @Remote(progress=True, results_version=RESULTS_VERSION)
+    @Remote(progress=True, results_version=RESULTS_VERSION, time_limited=True)
     def getMatchesForSampleVsGroup(
         self,
         sample_id,
@@ -733,9 +1009,9 @@ class Worker(QueueRemoteCallee):
             band_df_cutoff=band_df_cutoff,
         )
         match_report = matcher.getMatchesForSample(sample_id, other_sample_ids)
-        return match_report
+        return self._asJobResult(matcher, match_report)
 
-    @Remote(results_version=RESULTS_VERSION)
+    @Remote(results_version=RESULTS_VERSION, time_limited=True)
     def combineMatchesToCross(self, sample_to_job_id):
         child_results = []
         for job_id in sample_to_job_id.values():
@@ -759,7 +1035,9 @@ class Worker(QueueRemoteCallee):
     #### used by Worker(updateMinHashes) and MatcherQuery #####
 
     # Reports PROGRESS
-    def calculateMinHashes(self, function_entries, progress_reporter=NoProgressReporter()):
+    def calculateMinHashes(self, function_entries, progress_reporter=NoProgressReporter(), failed_function_ids=None):
+        """MinHashes of the given functions; failed_function_ids, when given, is extended by those that
+        have disassembly and are large enough to hash but could not be."""
         minhashes = []
         smda_functions = []
         LOGGER.info("Calculating MinHashes: hashing for %d function entries requested.", len(function_entries))
@@ -767,7 +1045,15 @@ class Worker(QueueRemoteCallee):
         for func in function_entries:
             binary_info = BinaryInfo(b"")
             binary_info.architecture = func.architecture
-            smda_function = smdaFunctionFromXcfg(func.xcfg, binary_info)
+            try:
+                smda_function = smdaFunctionFromXcfg(func.xcfg, binary_info)
+            except Exception as error:
+                # an imported function holds whatever disassembly the export stated: one smda cannot
+                # rebuild would fail the batch, and so every job over the corpus, on every run
+                LOGGER.warning("Calculating MinHashes: function %d cannot be rebuilt from its stored disassembly and is skipped: %s", func.function_id, error)
+                if failed_function_ids is not None:
+                    failed_function_ids.append(func.function_id)
+                continue
             if smda_function is None:
                 without_disassembly += 1
                 continue
@@ -800,10 +1086,18 @@ class Worker(QueueRemoteCallee):
                     progress_reporter.set_total(len(smda_functions))
                     is_stepping = True
                 for smda_function in tqdm.tqdm(smda_functions, total=len(smda_functions)):
-                    minhashes.append(self.minhasher.calculateMinHashFromStorage(smda_function))
+                    minhash = self.minhasher.calculateMinHashFromStorage(smda_function)
+                    if minhash is not None:
+                        minhashes.append(minhash)
                     if is_stepping:
                         progress_reporter.step()
             LOGGER.info("Calculated minhashes for %d function entries!", len(minhashes))
+            if len(minhashes) < len(smda_functions):
+                # each one is logged with its function id by calculateMinHashFromStorage
+                LOGGER.warning("Calculating MinHashes: %d function entries could not be hashed and stay unhashed.", len(smda_functions) - len(minhashes))
+            if failed_function_ids is not None:
+                hashed_function_ids = {minhash.function_id for minhash in minhashes}
+                failed_function_ids.extend(function_id for function_id, _ in smda_functions if function_id not in hashed_function_ids)
         return minhashes
 
     ##### CONFIG CHANGES ####

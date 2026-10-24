@@ -1,6 +1,7 @@
 import hashlib
 import re
 import threading
+import unicodedata
 
 import falcon
 
@@ -22,6 +23,7 @@ class SampleResource:
 
     @timing
     def on_get(self, req, resp, sample_id=None):
+        """One sample by id. Unknown ids answer 404."""
         if not self.index.isSampleId(sample_id):
             resp.data = jsonify(
                 {
@@ -37,6 +39,7 @@ class SampleResource:
 
     @timing
     def on_get_by_sha256(self, req, resp, sample_sha256):
+        """One sample by its sha256. Malformed hashes answer 400, unknown ones 404."""
         sha256_pattern = "[a-fA-F0-9]{64}"
         match = re.match(sha256_pattern, sample_sha256)
         if not match:
@@ -66,6 +69,7 @@ class SampleResource:
 
     @timing
     def on_post_by_ids(self, req, resp):
+        """The samples with the comma-separated ids in the body, keyed by sample id; negative ids resolve against query samples, and ids that are not found are left out."""
         if not req.content_length:
             resp.data = jsonify(
                 {
@@ -91,19 +95,26 @@ class SampleResource:
 
     @timing
     def on_delete(self, req, resp, sample_id=None):
+        """Delete a sample and its functions, minhashes and band entries; a family left without samples is removed as well. An unknown sample id answers 404."""
+        if not self.index.isSampleId(sample_id):
+            resp.data = jsonify({"status": "failed", "data": {"message": "We don't have a sample with that id."}})
+            resp.status = falcon.HTTP_404
+            db_log_msg(self.index, req, f"SampleResource.on_delete - failed - unknown sample_id: {sample_id}.")
+            return
         successful = self.index.deleteSample(sample_id, force_recalculation=True, username=get_username(req))
         if successful:
             resp.data = jsonify({"status": "successful", "data": successful})
             resp.status = falcon.HTTP_202
             db_log_msg(self.index, req, "SampleResource.on_delete - success.")
         else:
-            resp.data = jsonify({"status": "failed", "data": {"message": "Failed to delete sample."}})
-            # TODO whats the correct code?
-            resp.status = falcon.HTTP_400
+            # not reached through the queue, which raises when it cannot queue a job
+            resp.data = jsonify({"status": "failed", "data": {"message": "Failed to queue the sample deletion."}})
+            resp.status = falcon.HTTP_503
             db_log_msg(self.index, req, f"SampleResource.on_delete - failed - sample_id: {sample_id} not deleted.")
 
     @timing
     def on_put(self, req, resp, sample_id=None):
+        """Modify a sample; JSON body with ``family_name``, ``version``, ``component`` (1-64 printable chars) and/or ``is_library``. Answers 202 on success, 400 for a malformed body."""
         resp.status = falcon.HTTP_400
         if not req.content_length or not isinstance(req.media, dict):
             resp.data = jsonify({"status": "failed", "data": {"message": "PUT request without body can't be processed."}})
@@ -143,7 +154,9 @@ class SampleResource:
 
     @timing
     def on_post_collection(self, req, resp):
-        # TODO 2019-05-07 verify integrity of SMDA report
+        """Submit a disassembled SMDA report (JSON body) as a new sample. Answers the sample entry and, when hashing was scheduled, the ``job_id`` of the minhash job; an already known sha256 answers the existing entry with ``existed``."""
+        # the report's shape is checked where it is read (addReportJson); that its sha256 belongs to
+        # its disassembly cannot be checked without the binary (#270)
         if not req.content_length:
             resp.data = jsonify(
                 {
@@ -155,7 +168,14 @@ class SampleResource:
             db_log_msg(self.index, req, "SampleResource.on_post_collection - failed - JSON not processible.")
             return
         username = req.get_header("username", default="anonymous")
-        summary = self.index.addReportJson(req.media, username=username)
+        try:
+            summary = self.index.addReportJson(req.media, username=username)
+        except ValueError as error:
+            # a report smda refuses as malformed, or one stating a sha256 that is not 64 hex digits
+            resp.data = jsonify({"status": "failed", "data": {"message": f"SMDA report rejected: {error}"}})
+            resp.status = falcon.HTTP_400
+            db_log_msg(self.index, req, "SampleResource.on_post_collection - failed - report rejected.")
+            return
         if summary is not None:
             resp.data = jsonify({"status": "successful", "data": summary})
             db_log_msg(self.index, req, "SampleResource.on_post_collection - success.")
@@ -165,6 +185,7 @@ class SampleResource:
 
     @timing
     def on_post_submit_binary(self, req, resp):
+        """Submit a raw binary (request body) for disassembly and insertion. Query parameters: ``filename``, ``family``, ``version``, ``is_dump``, ``base_addr`` (hex) and ``bitness`` (32/64) for memory dumps. Answers the job id of the disassembly job."""
         if not req.content_length:
             resp.data = jsonify(
                 {
@@ -175,34 +196,68 @@ class SampleResource:
             resp.status = falcon.HTTP_400
             db_log_msg(self.index, req, "SampleResource.on_post_submit_binary - failed - no POST body.")
             return
-        # TODO parse respective query fields -> escape / sanitize input
         filename = req.params["filename"] if "filename" in req.params else None
         family = req.params["family"] if "family" in req.params else None
         version = req.params["version"] if "version" in req.params else None
-        is_dump = True if ("is_dump" in req.params and req.params["is_dump"] in ["True", "true", "1", 1]) else False
+        # names are stored and shown as given, so only what no name holds is refused: control
+        # characters and line breaks, a filename longer than file systems allow, and a family or
+        # version longer than updating a sample allows. Format characters stay (a joiner is part of
+        # a word, and a sample's filename may well carry a right-to-left override)
+        for field, value, max_length in (("filename", filename, 255), ("family", family, 64), ("version", version, 64)):
+            if value is not None and (not isinstance(value, str) or len(value) > max_length or any(unicodedata.category(char) in ("Cc", "Cs", "Zl", "Zp") for char in value)):
+                resp.data = jsonify({"status": "failed", "data": {"message": f"{field} may be at most {max_length} characters, without control characters or line breaks."}})
+                resp.status = falcon.HTTP_400
+                db_log_msg(self.index, req, f"SampleResource.on_post_submit_binary - failed - invalid {field}.")
+                return
+        # a blank value (falcon keeps "?is_dump=" as an empty string) is as good as absent
+        is_dump = False
+        if req.params.get("is_dump"):
+            if req.params["is_dump"] not in ["True", "true", "1", "False", "false", "0"]:
+                resp.data = jsonify({"status": "failed", "data": {"message": "is_dump must be one of true, false, 1 or 0."}})
+                resp.status = falcon.HTTP_400
+                db_log_msg(self.index, req, "SampleResource.on_post_submit_binary - failed - invalid is_dump.")
+                return
+            is_dump = req.params["is_dump"] in ["True", "true", "1"]
         base_address = 0
-        if "base_addr" in req.params:
+        if req.params.get("base_addr"):
             try:
                 base_address = int(req.params["base_addr"], 16)
+                if not 0 <= base_address < 2**64:
+                    raise ValueError
             except ValueError:
-                pass
-        bitness = int(req.params["bitness"]) if ("bitness" in req.params and req.params["bitness"] in ["32", "64"]) else 32
+                resp.data = jsonify({"status": "failed", "data": {"message": "base_addr must be a hexadecimal address below 2**64."}})
+                resp.status = falcon.HTTP_400
+                db_log_msg(self.index, req, "SampleResource.on_post_submit_binary - failed - invalid base_addr.")
+                return
+        bitness = 32
+        if req.params.get("bitness"):
+            if req.params["bitness"] not in ["32", "64"]:
+                resp.data = jsonify({"status": "failed", "data": {"message": "bitness must be 32 or 64."}})
+                resp.status = falcon.HTTP_400
+                db_log_msg(self.index, req, "SampleResource.on_post_submit_binary - failed - invalid bitness.")
+                return
+            bitness = int(req.params["bitness"])
         # binary itself
         binary = req.stream.read()
         binary_sha256 = hashlib.sha256(binary).hexdigest()
         sample_entry = self.index.getSampleBySha256(binary_sha256)
-        if sample_entry is None:
+        # a sample indexed from a report that merely states this sha256 is checked against the
+        # binary by the job, and replaced by its analysis where they disagree (#270)
+        if sample_entry is None or sample_entry.sha256_verified is not True:
             job_id = self.index.addBinarySample(binary, filename, family, version, is_dump, base_address, bitness, force_recalculation=True, username=get_username(req))
             resp.data = jsonify({"status": "successful", "data": job_id})
             resp.status = falcon.HTTP_202
             db_log_msg(self.index, req, f"SampleResource.on_post_submit_binary - success - with job_id: {job_id}.")
         else:
-            resp.data = jsonify({"status": "failed", "data": {"message": f"Conflict: Binary already exists as sample with ID: {sample_entry.sample_id}."}})
+            message = f"Conflict: Binary already exists as sample with ID: {sample_entry.sample_id}."
+            # the sample and its state as fields too, so a client need not parse the message
+            resp.data = jsonify({"status": "failed", "data": {"message": message, "sample_id": sample_entry.sample_id, "sha256_verified": sample_entry.sha256_verified}})
             resp.status = falcon.HTTP_409
             db_log_msg(self.index, req, "SampleResource.on_post_submit_binary - failed - sample exists already.")
 
     @timing
     def on_get_collection(self, req, resp):
+        """All samples keyed by id; optional ``start`` (first sample id) and ``limit``."""
         # parse optional request parameters
         start_index = 0
         if "start" in req.params:
@@ -225,6 +280,7 @@ class SampleResource:
 
     @timing
     def on_get_function(self, req, resp, sample_id=None, function_id=None):
+        """One function of a sample by ids. Unknown ids answer 404."""
         if not self.index.isSampleId(sample_id):
             resp.data = jsonify({"status": "failed", "data": {"message": "We don't have a sample with that id."}})
             resp.status = falcon.HTTP_404
@@ -247,11 +303,7 @@ class SampleResource:
 
     @timing
     def on_get_smda_report(self, req, resp, sample_id=None):
-        """The SMDA report the sample was submitted as, rebuilt from storage (#94).
-
-        data: {"smda_report": {...}, "complete": bool, "incomplete_reasons": [...],
-        "num_functions_without_disassembly": int} - see RebuiltSmdaReport for the reasons.
-        Answers 503 with a Retry-After while the server process is rebuilding another report."""
+        """The SMDA report the sample was submitted as, rebuilt from storage (#94). Answers ``smda_report`` with ``complete``, ``incomplete_reasons`` and ``num_functions_without_disassembly`` (see RebuiltSmdaReport for the reasons). Unknown ids answer 404; while the server process is rebuilding another report it answers 503 with a Retry-After."""
         if not self.index.isSampleId(sample_id):
             resp.data = jsonify({"status": "failed", "data": {"message": "We don't have a sample with that id."}})
             resp.status = falcon.HTTP_404
@@ -305,6 +357,7 @@ class SampleResource:
 
     @timing
     def on_get_functions(self, req, resp, sample_id=None):
+        """All functions of a sample keyed by function id. Unknown sample ids answer 404."""
         if not self.index.isSampleId(sample_id):
             resp.data = jsonify(
                 {

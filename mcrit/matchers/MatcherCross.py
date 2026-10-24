@@ -14,18 +14,24 @@ class MatcherCross:
         input:
             - Z is a hierarchical tree (dendrogram)
             - N is the number of points given to the clustering process
-            - cur_index is the position in the tree for the recursive traversal
+            - cur_index is the position in the tree to start the traversal at
         output:
             - order implied by the hierarchical tree Z
 
         seriation computes the order implied by a hierarchical tree (dendrogram)
         """
-        if cur_index < N:
-            return [cur_index]
-        else:
-            left = int(Z[cur_index - N, 0])
-            right = int(Z[cur_index - N, 1])
-            return self._seriation(Z, N, left) + self._seriation(Z, N, right)
+        # walk the tree with an explicit stack, left subtree first: the tree can be as deep as it has leaves
+        # (samples sharing no code form a chain), which a recursion breaks at Python's recursion limit
+        order = []
+        stack = [cur_index]
+        while stack:
+            index = stack.pop()
+            if index < N:
+                order.append(index)
+            else:
+                stack.append(int(Z[index - N, 1]))
+                stack.append(int(Z[index - N, 0]))
+        return order
 
     def _compute_serial_matrix(self, dist_mat, method="ward"):
         """

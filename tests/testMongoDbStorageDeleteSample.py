@@ -40,6 +40,12 @@ class FakeCollection:
     def count_documents(self, query, limit=None):
         return len(self._matching(query))
 
+    def find_one_and_update(self, query, update, projection=None):
+        # deleteSample takes the sample's claim first, to stop a replacement under way (#270)
+        self.find_one_and_update_calls = getattr(self, "find_one_and_update_calls", []) + [(query, update)]
+        matching = self._matching(query)
+        return dict(matching[0]) if matching else None
+
     def update_one(self, query, update):
         # deleteSample claims the pichash-count removal on the sample document (#261); the claim
         # is all this fake needs to answer
@@ -171,6 +177,32 @@ class MongoDbStorageDeleteSampleTest(TestCase):
         self.assertEqual([{"family_id": 1}], families.delete_one_calls)
         self.assertEqual(1, len(band_updates))
         self.assertEqual("pull", band_updates[0][1])
+
+    def testPullingBandEntriesSkipsMinHashesThatCannotHaveBeenBanded(self):
+        """Imports stored minhashes unchecked. One shorter than the signature (10 x 32 bits here) or
+        not a whole number of entries was never banded, and reading or banding it raised on every
+        attempt to delete or repair its sample."""
+        band_updates = []
+        setattr(self.storage, "_updateBands", MethodType(lambda _self, band_hashes, method="push": band_updates.append((band_hashes, method)), self.storage))
+        function_minhashes = [
+            {"function_id": 10, "minhash": bytes(range(40)).hex()},
+            {"function_id": 11, "minhash": bytes(range(8)).hex()},
+            {"function_id": 12, "minhash": bytes(range(4)).hex()},
+            {"function_id": 13, "minhash": bytes(range(44)).hex()},
+            {"function_id": 14, "minhash": bytes(range(41)).hex()},
+            {"function_id": 15, "minhash": bytes(range(39)).hex()},
+            {"function_id": 16, "minhash": ""},
+        ]
+
+        # every function that held a minhash counts, as it is dropped all the same
+        self.assertEqual(6, self.storage._pullBandEntries(function_minhashes))
+
+        self.assertEqual(1, len(band_updates))
+        band_hashes, method = band_updates[0]
+        self.assertEqual("pull", method)
+        # a longer one was banded under its first entries and is taken out as before
+        pulled = {function_id for band in band_hashes.values() for function_ids in band.values() for function_id in function_ids}
+        self.assertEqual({10, 13}, pulled)
 
     def testMinHashRoundTripsFromBytes(self):
         signature = [0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39]

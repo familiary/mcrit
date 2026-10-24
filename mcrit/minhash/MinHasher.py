@@ -70,19 +70,27 @@ class MinHasher:
         raise NotImplementedError("Unknown MinHasher strategy.")
 
     def calculateMinHashFromStorage(self, function_tuple):
+        """The MinHash of a function rebuilt from storage, None when the shinglers fail on it: an imported
+        function holds whatever disassembly the export stated, and one such function must not fail the batch."""
         function_id, smda_function = function_tuple
-        minhash = self._calculateMinHash(smda_function)
+        try:
+            minhash = self._calculateMinHash(smda_function)
+        except Exception as error:
+            LOGGER.warning("Function %d cannot be minhashed from its stored disassembly and is skipped: %s", function_id, error)
+            return None
         minhash.function_id = function_id
         return minhash
 
     def calculateMinHashesFromStorage(self, function_tuples):
-        minhashes = []
-        for function_tuple in function_tuples:
-            function_id, smda_function = function_tuple
-            minhash = self._calculateMinHash(smda_function)
-            minhash.function_id = function_id
-            minhashes.append(minhash)
-        return minhashes
+        """The MinHashes of those (function_id, smda_function) tuples that can be hashed.
+
+        A function the shinglers fail on is logged and left out (it stays unhashed), like one without
+        disassembly: its disassembly can come from a submitted report or an import, and raising failed
+        every other function of the batch with it, on every retry - for recalculateMinHashes after
+        dropping all.
+        """
+        minhashes = [self.calculateMinHashFromStorage(function_tuple) for function_tuple in function_tuples]
+        return [minhash for minhash in minhashes if minhash is not None]
 
     def calculateAggregatedScoresFromPackedTuples(
         self,

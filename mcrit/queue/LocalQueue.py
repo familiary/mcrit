@@ -105,8 +105,12 @@ class Job:
         if self.method in self.method_types["family_id"]:
             return int(self.arguments[0])
         if self.method == "getUniqueBlocks":
-            if len(self.arguments) > 1:
-                return int(self.arguments[1])
+            # by name: arguments lists the named ones after the positional ones, so the second
+            # entry is whichever option came first, e.g. covers_required or the negative set (#283)
+            payload = self._data.get("payload") or {}
+            params = json.loads(payload["params"]) if "params" in payload else {}
+            family_id = params.get("family_id", params.get("1"))
+            return int(family_id) if family_id is not None else None
 
     @property
     def has_family_id(self):
@@ -372,12 +376,17 @@ class Job:
 
 
 class LocalQueue:
+    # most jobs one clean() deletes, as MongoQueue
+    CLEAN_MAX_JOBS = 1000
+
     def __init__(self):
         self._setup_empty_queue()
         self._worker: Any = None
         self._job_counter = 0
         self.clean_interval: float = 10**9
-        self.cache_time: float = 10**9
+        # as MongoQueue: set by QueueFactory; 0 deletes nothing
+        self.retention_seconds: float = 0
+        self.transient_methods: frozenset = frozenset()
         self.max_attempts = 1
 
     def _setup_empty_queue(self):
@@ -392,6 +401,11 @@ class LocalQueue:
 
     def unregisterWorker(self):
         # left empty, as we only have one worker in local mode
+        pass
+
+    def release_all_jobs(self, consumer_id=None):
+        # left empty: jobs run synchronously in the calling process and next() hands out nothing,
+        # so no job is ever held by a consumer that exits; Job.__exit__ releases on error itself
         pass
 
     def getQueueStatistics(self):
@@ -637,11 +651,21 @@ class LocalQueue:
         return deleted_count
 
     def clean(self):
-        time_threshold = datetime.now() - timedelta(seconds=self.cache_time)
+        # as MongoQueue.clean: transient methods only, oldest first, at most CLEAN_MAX_JOBS
         delete_list = []
-        for d in self._jobs.values():
-            if (d["finished_at"] is not None) and d["finished_at"] < time_threshold:
-                delete_list.append(d["_id"])
+        if self.retention_seconds > 0:
+            try:
+                time_threshold = datetime.now() - timedelta(seconds=self.retention_seconds)
+            except OverflowError:
+                # a retention beyond what a datetime can reach is "never expire"
+                time_threshold = datetime.min
+            expired = [
+                d
+                for d in self._jobs.values()
+                if d["payload"]["method"] in self.transient_methods and d["finished_at"] is not None and d["finished_at"] < time_threshold and not d.get("terminated")
+            ]
+            expired.sort(key=lambda d: d["finished_at"])
+            delete_list = [d["_id"] for d in expired[: self.CLEAN_MAX_JOBS]]
 
         self.delete_history.append(delete_list)
         LOGGER.debug("Perfomed clean, delete_history now has %d entries.", len(self.delete_history))

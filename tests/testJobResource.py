@@ -63,7 +63,12 @@ class ResultRoutesServeTheStoredBytes(unittest.TestCase):
             assert resp.data is not None
             self.assertEqual({"samples": [[4, 5]]}, json.loads(resp.data)["data"]["matches"])
             index.getResultBytesForJob.assert_not_called()
-            index.getResultBytes.assert_not_called()
+            if route is JobResource.on_get_results:
+                # the stored bytes are what tells an unknown result from a stored null
+                index.getResultBytes.assert_called_once_with(RESULT_ID)
+                index.getResult.assert_not_called()
+            else:
+                index.getResultBytes.assert_not_called()
 
     def test_compact_leaves_a_non_matching_job_alone(self):
         index, resource = self._resource(job_data={"payload": {"method": "getUniqueBlocks", "params": "[[1]]"}, "_id": JOB_ID})
@@ -79,6 +84,18 @@ class ResultRoutesServeTheStoredBytes(unittest.TestCase):
             resource.on_get_job_result(self._request(query), resp, JOB_ID)
             assert resp.data is not None
             self.assertEqual({"status": "successful", "data": None}, json.loads(resp.data))
+
+    def test_a_stored_json_null_result_is_present_in_both_modes(self):
+        for query in ("", "compact=true"):
+            with self.subTest(query=query):
+                index, resource = self._resource(stored=b"null")
+                resp = falcon.Response()
+                resource.on_get_results(self._request(query), resp, RESULT_ID)
+                self.assertEqual(falcon.HTTP_200, resp.status)
+                assert resp.data is not None
+                self.assertEqual({"status": "successful", "data": None}, json.loads(resp.data))
+                index.getResultBytes.assert_called_once_with(RESULT_ID)
+                index.getResult.assert_not_called()
 
     def test_an_invalid_id_is_rejected_before_any_lookup(self):
         index, resource = self._resource()
@@ -152,7 +169,7 @@ class JobIdsInMemoryMode(unittest.TestCase):
         self.assertEqual(falcon.HTTP_200, result_job.status)
         self.assertEqual(job_id, result_job.json["data"]["_id"])
 
-    def test_unknown_ids_answer_null_and_leave_the_queue_intact(self):
+    def test_unknown_ids_answer_404_and_leave_the_queue_intact(self):
         """A lookup must not create entries: LocalQueue keeps its files in defaultdicts, and a None
         entry left behind by a lookup made the next clean() - and with it the next job - fail."""
         self.index.recomputeFamilyStats()  # a real job and result for clean() to walk past
@@ -163,11 +180,14 @@ class JobIdsInMemoryMode(unittest.TestCase):
             (f"/results/{unknown}", ""),
             (f"/results/{unknown}/job", ""),
             (f"/results/{unknown}", "compact=true"),
+            (f"/jobs/{unknown}/result", "compact=true"),
         ):
             with self.subTest(path=path, query=query):
                 response = self.client.simulate_get(path, query_string=query)
-                self.assertEqual(falcon.HTTP_200, response.status)
-                self.assertIsNone(response.json["data"])
+                self.assertEqual(falcon.HTTP_404, response.status)
+                self.assertEqual("failed", response.json["status"])
+                expected = "We don't have a job with that id." if path.startswith("/jobs/") else "We don't have a result with that id."
+                self.assertEqual({"message": expected}, response.json["data"])
         queue = self.index.queue
         self.assertNotIn(None, list(queue._files.values()) + list(queue._files_meta.values()))
         queue.clean()
@@ -205,6 +225,73 @@ class JobIdsInMemoryMode(unittest.TestCase):
         self.assertEqual(falcon.HTTP_200, response.status)
         self.assertEqual(1, response.json["data"]["num_deleted"])
         self.assertIsNone(self.index.getJobData(job_id))
+        for missing_id in (job_id, "0" * 24):
+            with self.subTest(missing_id=missing_id):
+                missing = self.client.simulate_delete(f"/jobs/{missing_id}")
+                self.assertEqual(falcon.HTTP_404, missing.status)
+                self.assertEqual({"status": "failed", "data": {"message": "We don't have a job with that id."}}, missing.json)
+
+
+class PendingAndOrphanedResults(unittest.TestCase):
+    @staticmethod
+    def _request(query_string=""):
+        return falcon.Request(falcon.testing.create_environ(path="/jobs", query_string=query_string))
+
+    def test_an_existing_job_without_a_result_answers_null_in_both_modes(self):
+        for query in ("", "compact=true"):
+            with self.subTest(query=query):
+                index = MagicMock()
+                index.getJobData.return_value = {"_id": JOB_ID, "result": None}
+                index.getResultBytesForJob.return_value = None
+                index.getResultForJob.return_value = None
+                resp = falcon.Response()
+                JobResource(index).on_get_job_result(self._request(query), resp, JOB_ID)
+                self.assertEqual(falcon.HTTP_200, resp.status)
+                assert resp.data is not None
+                self.assertEqual({"status": "successful", "data": None}, json.loads(resp.data))
+
+    def test_a_result_remains_readable_if_its_job_is_gone(self):
+        index = MagicMock()
+        index.getResultBytes.return_value = STORED
+        index.getResult.return_value = json.loads(STORED)
+        index.getJobIdForResult.return_value = JOB_ID
+        index.getJobData.return_value = None
+        for query in ("", "compact=true"):
+            with self.subTest(query=query):
+                resp = falcon.Response()
+                JobResource(index).on_get_results(self._request(query), resp, RESULT_ID)
+                self.assertEqual(falcon.HTTP_200, resp.status)
+                assert resp.data is not None
+                self.assertEqual(RESULT, json.loads(resp.data)["data"])
+        resp = falcon.Response()
+        JobResource(index).on_get_result_job(self._request(), resp, RESULT_ID)
+        self.assertEqual(falcon.HTTP_404, resp.status)
+        assert resp.data is not None
+        self.assertEqual({"status": "failed", "data": {"message": "We don't have the job for that result id."}}, json.loads(resp.data))
+
+    def test_a_result_without_a_job_is_served_in_full(self):
+        index = MagicMock()
+        index.getResultBytes.return_value = STORED
+        index.getJobIdForResult.return_value = None
+        for query in ("", "compact=true"):
+            with self.subTest(query=query):
+                resp = falcon.Response()
+                JobResource(index).on_get_results(self._request(query), resp, RESULT_ID)
+                self.assertEqual(falcon.HTTP_200, resp.status)
+                assert resp.data is not None
+                self.assertEqual(RESULT, json.loads(resp.data)["data"])
+        index.getJobData.assert_not_called()
+
+    def test_an_unknown_result_has_no_job_either(self):
+        index = MagicMock()
+        index.getResultBytes.return_value = None
+        index.getJobIdForResult.return_value = None
+        resp = falcon.Response()
+        JobResource(index).on_get_result_job(self._request(), resp, RESULT_ID)
+        self.assertEqual(falcon.HTTP_404, resp.status)
+        assert resp.data is not None
+        self.assertEqual({"status": "failed", "data": {"message": "We don't have a result with that id."}}, json.loads(resp.data))
+        index.getJobData.assert_not_called()
 
 
 class InvalidIdsAreRejected(unittest.TestCase):

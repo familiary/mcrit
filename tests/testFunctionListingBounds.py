@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import unittest
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import falcon
@@ -136,7 +137,7 @@ class FunctionIdsThroughClientTestSuite(unittest.TestCase):
         raw_client = McritClient(mcrit_server="http://mcrit.invalid", raw_responses=True)
         raw_client._session = client._session
         ids = list(range(2 * FunctionResource.MAX_FUNCTION_IDS))
-        response = raw_client.getFunctionsByIds(ids)
+        response = cast(Any, raw_client.getFunctionsByIds(ids))
         self.assertEqual([len(ids)], posts)
         self.assertEqual(400, response.status_code)
 

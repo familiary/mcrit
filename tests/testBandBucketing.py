@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 import pytest
+from pymongo.errors import BulkWriteError
 from smda.common.SmdaReport import SmdaReport
 
 from mcrit.config.McritConfig import McritConfig
@@ -17,6 +18,7 @@ from mcrit.config.StorageConfig import StorageConfig
 from mcrit.index.MinHashIndex import MinHashIndex
 from mcrit.matchers.MatcherSample import MatcherSample
 from mcrit.queue.QueueFactory import QueueFactory
+from mcrit.storage.MongoDbStorage import MongoDbStorage
 from mcrit.storage.StorageFactory import StorageFactory
 
 from .context import getTestMongoServerAndPort
@@ -400,6 +402,52 @@ class BandBucketingTest(unittest.TestCase):
         """Only bucket 0 carries df, so a cutoff a spilled hash could fit under would return bucket 0 alone."""
         with self.assertRaises(ValueError):
             self._rawStorage(2, "cutoff", df_cutoff=5)._getDb()
+
+    def testAFullPostingListRefusesItsPostingsAlone(self):
+        """Unbucketed, a hash whose document is at the 16 MiB cap refuses every further posting.
+
+        Copies of one function share all their band hashes, so submitting it over and over fills
+        them. The refusal used to fail the whole write at that band, leaving every band after it
+        without any posting of the sample, which the job's retry then stamped as indexed.
+        """
+        storage = self._rawStorage(0, "full")
+        db = storage._getDb()
+        full_hash, other_hash, later_hash = 616161, 626262, 636363
+        # a document a few hundred bytes short of the cap stands in for ~1.35M postings
+        db["band_0"].insert_one({"band_hash": full_hash, "function_ids": [1], "df": 1, "padding": "x" * (16 * 1024 * 1024 - 512)})
+        storage._updateBands({0: {full_hash: list(range(100, 400)), other_hash: [2, 3]}, 1: {later_hash: [4]}})
+        full = db["band_0"].find_one({"band_hash": full_hash}, {"function_ids": 1, "df": 1})
+        assert full is not None
+        self.assertEqual(([1], 1), (full["function_ids"], full["df"]))
+        # the rest of the band's batch and the bands after it are written
+        other = db["band_0"].find_one({"band_hash": other_hash})
+        assert other is not None
+        self.assertEqual(([2, 3], 2), (other["function_ids"], other["df"]))
+        later = db["band_1"].find_one({"band_hash": later_hash})
+        assert later is not None
+        self.assertEqual([4], later["function_ids"])
+        # and the refusal is on record
+        error = db.error.find_one({}, sort=[("ts", -1)])
+        assert error is not None
+        self.assertIn("16 MiB document cap", error["error_msg"])
+        self.assertEqual([full_hash], error["error_details"]["band_hashes"])
+
+
+class FullBandDocumentErrorTest(unittest.TestCase):
+    """Only a refusal for the document cap is absorbed; any other write error still fails the write."""
+
+    def testWhichBulkErrorsCountAsAFullDocument(self):
+        def refused(*codes, write_concern=False):
+            details = {"writeErrors": [{"index": index, "code": code, "op": {"q": {"band_hash": index}}} for index, code in enumerate(codes)], "writeConcernErrors": []}
+            if write_concern:
+                details["writeConcernErrors"] = [{"code": 64}]
+            return BulkWriteError(details)
+
+        self.assertTrue(MongoDbStorage._isFullBandDocumentError(refused(17419)))
+        self.assertTrue(MongoDbStorage._isFullBandDocumentError(refused(17419, 10334)))
+        self.assertFalse(MongoDbStorage._isFullBandDocumentError(refused(17419, 11000)))
+        self.assertFalse(MongoDbStorage._isFullBandDocumentError(refused(17419, write_concern=True)))
+        self.assertFalse(MongoDbStorage._isFullBandDocumentError(refused()))
 
 
 if __name__ == "__main__":

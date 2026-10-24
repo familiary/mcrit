@@ -1,3 +1,6 @@
+from mcrit.queue.retention import TRANSIENT_JOB_METHODS
+
+
 class QueueFactory:
     QUEUE_METHOD_FAKE = "fake"
     QUEUE_METHOD_MONGODB = "mongodb"
@@ -25,4 +28,6 @@ class QueueFactory:
                 max_attempts=queue_config.QUEUE_MAX_ATTEMPTS,
             )
         queue.clean_interval = queue_config.QUEUE_CLEAN_INTERVAL
+        queue.retention_seconds = getattr(queue_config, "QUEUE_TRANSIENT_JOB_RETENTION_SECONDS", 0)
+        queue.transient_methods = TRANSIENT_JOB_METHODS
         return queue
