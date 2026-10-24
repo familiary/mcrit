@@ -1,6 +1,6 @@
 import falcon
 
-from mcrit.index.MinHashIndex import MinHashIndex
+from mcrit.index.MinHashIndex import MAX_CROSS_COMPARE_SAMPLES, MinHashIndex
 from mcrit.server.utils import db_log_msg, get_username, jsonify, readMatchingParams, timing
 
 
@@ -43,6 +43,11 @@ class MatchResource:
             db_log_msg(self.index, req, "MatchResource.on_get_sample_cross - failed - no sample_ids.")
             return
         sample_ids_list = [int(id) for id in sample_ids.split(",")]
+        if len(set(sample_ids_list)) > MAX_CROSS_COMPARE_SAMPLES:
+            resp.status = falcon.HTTP_400
+            resp.data = jsonify({"status": "failed", "data": {"message": f"A cross compare takes at most {MAX_CROSS_COMPARE_SAMPLES} samples."}})
+            db_log_msg(self.index, req, "MatchResource.on_get_sample_cross - failed - too many sample_ids.")
+            return
         cross_matches = self.index.getMatchesCross(sample_ids_list, username=get_username(req), **parameters)
         resp.data = jsonify({"status": "successful", "data": cross_matches})
         db_log_msg(self.index, req, "MatchResource.on_get_sample_cross - success.")

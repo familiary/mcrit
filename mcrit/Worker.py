@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
 import hashlib
+import heapq
 import logging
 import os
+import signal
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from itertools import zip_longest
@@ -85,6 +88,16 @@ class Worker(QueueRemoteCallee):
         # TODO unregister our worker_id from all in-progress jobs found in the queue
         self.queue.unregisterWorker()
         self.queue.release_all_jobs()
+
+    def run(self):
+        # jobs run in this process while the heartbeat reports it alive, so nothing else would reclaim
+        # one that does not end; a SpawningWorker bounds its job processes instead
+        # a QueueConfig from before this setting (docker-mcrit ships its own) has none
+        self._job_timeout = getattr(self._queue_config, "QUEUE_WORKER_JOB_TIMEOUT", 3600)
+        if self._job_timeout > 0 and (not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread()):
+            LOGGER.warning("QUEUE_WORKER_JOB_TIMEOUT needs SIGALRM in the main thread; this worker runs jobs without a time limit.")
+            self._job_timeout = 0
+        super().run()
 
     #### STORAGE IO ####
     def getStorage(self):
@@ -460,7 +473,7 @@ class Worker(QueueRemoteCallee):
         return update_result
 
     # Reports PROGRESS
-    @Remote(progress=True, results_version=RESULTS_VERSION)
+    @Remote(progress=True, results_version=RESULTS_VERSION, time_limited=True)
     def getUniqueBlocks(self, sample_ids, family_id=None, covers_required=10, min_instructions=0, progress_reporter=NoProgressReporter()):
         """Collect the blocks unique to <sample_ids> and greedily pick a multi-set cover of them.
 
@@ -503,35 +516,45 @@ class Worker(QueueRemoteCallee):
         blocks_result_dict["statistics"]["min_instructions"] = min_instructions
         blocks_result_dict["statistics"]["blocks_considered"] = len(unique_blocks)
         # greedily produce a multi set cover of picblockhashes for sample_ids, i.e. a YARA rule :)
+        # Every round selects the block that reaches the most samples not covered yet, then the one with
+        # the higher score, then the later one. A block's reach only shrinks as samples become covered, so
+        # the blocks wait in a heap keyed on the reach they had when last looked at, and the top one is
+        # selected once its reach is confirmed. Rescanning and resorting every block in every round instead
+        # took cubic time in the number of blocks whenever covers_required was more than they could reach.
         yara_rule = []
         sample_coverage = {sample_id: 0 for sample_id in sample_ids}
         samples_covered = set()
+        block_candidates = [(-len(set(entry["samples"])), -entry["score"], -position, block_hash) for position, (block_hash, entry) in enumerate(unique_blocks.items())]
+        heapq.heapify(block_candidates)
         while True:
-            # calculate block_scores as how much benefit they bring, i.e. how many uncovered samples they can cover at once
-            block_candidates = []
-            for block_hash, entry in unique_blocks.items():
-                sample_ids_coverable = set(entry["samples"]).difference(samples_covered)
-                if sample_ids_coverable and block_hash not in yara_rule:
-                    candidate = {"block_hash": block_hash, "coverable": sample_ids_coverable, "value": len(sample_ids_coverable), "score": entry["score"]}
-                    block_candidates.append(candidate)
             # check if we are done yet, successful or not
             if len(samples_covered) == len(sample_ids):
                 # an empty request covers its zero samples vacuously - do not report a rule for it
                 blocks_result_dict["statistics"]["has_yara_rule"] = bool(yara_rule)
                 blocks_result_dict["statistics"]["has_complete_yara_rule"] = bool(yara_rule)
                 break
-            if len(block_candidates) == 0:
+            # if not, choose the best block among those still reaching an uncovered sample
+            selected_block = None
+            sample_ids_coverable = set()
+            while block_candidates:
+                negative_value, negative_score, negative_position, block_hash = heapq.heappop(block_candidates)
+                sample_ids_coverable = set(unique_blocks[block_hash]["samples"]).difference(samples_covered)
+                if not sample_ids_coverable:
+                    continue
+                if len(sample_ids_coverable) == -negative_value:
+                    selected_block = block_hash
+                    break
+                heapq.heappush(block_candidates, (-len(sample_ids_coverable), negative_score, negative_position, block_hash))
+            if selected_block is None:
                 if len(yara_rule) > 0:
                     blocks_result_dict["statistics"]["has_yara_rule"] = True
                 break
-            # if not, choose the best block
-            block_candidates.sort(key=lambda i: (i["value"], i["score"]))
-            selected_block: Dict[str, Any] = block_candidates.pop()
-            yara_rule.append(selected_block["block_hash"])
+            yara_rule.append(selected_block)
             # and update counters
-            for sample_id in selected_block["coverable"]:
+            for sample_id in sample_ids_coverable:
                 sample_coverage[sample_id] += 1
-            samples_covered = set([sample_id for sample_id, count in sample_coverage.items() if count >= covers_required])
+                if sample_coverage[sample_id] >= covers_required:
+                    samples_covered.add(sample_id)
         blocks_result_dict["statistics"]["num_samples_covered"] = len(samples_covered)
         # how many selected blocks reach the least covered sample - reported as 0 before (#144)
         blocks_result_dict["statistics"]["yara_covers"] = min(sample_coverage.values()) if sample_coverage else 0
@@ -576,7 +599,7 @@ class Worker(QueueRemoteCallee):
         return match_report
 
     # Reports PROGRESS
-    @Remote(progress=True, json_locations=[0], results_version=RESULTS_VERSION)
+    @Remote(progress=True, json_locations=[0], results_version=RESULTS_VERSION, time_limited=True)
     def getMatchesForSmdaReport(
         self,
         report_json,
@@ -603,7 +626,7 @@ class Worker(QueueRemoteCallee):
         return self._asJobResult(matcher, match_report)
 
     # Reports PROGRESS
-    @Remote(progress=True, file_locations=[0], results_version=RESULTS_VERSION)
+    @Remote(progress=True, file_locations=[0], results_version=RESULTS_VERSION, time_limited=True)
     def getMatchesForMappedBinary(
         self,
         binary,
@@ -634,7 +657,7 @@ class Worker(QueueRemoteCallee):
         return self._asJobResult(matcher, match_report)
 
     # Reports PROGRESS
-    @Remote(progress=True, file_locations=[0], results_version=RESULTS_VERSION)
+    @Remote(progress=True, file_locations=[0], results_version=RESULTS_VERSION, time_limited=True)
     def getMatchesForUnmappedBinary(
         self,
         binary,
@@ -664,7 +687,7 @@ class Worker(QueueRemoteCallee):
         return self._asJobResult(matcher, match_report)
 
     # Reports PROGRESS
-    @Remote(progress=True, results_version=RESULTS_VERSION)
+    @Remote(progress=True, results_version=RESULTS_VERSION, time_limited=True)
     def getMatchesForSample(
         self,
         sample_id,
@@ -690,7 +713,7 @@ class Worker(QueueRemoteCallee):
         return self._asJobResult(matcher, match_report)
 
     # Reports PROGRESS
-    @Remote(progress=True, results_version=RESULTS_VERSION)
+    @Remote(progress=True, results_version=RESULTS_VERSION, time_limited=True)
     def getMatchesForSampleVs(
         self,
         sample_id,
@@ -713,7 +736,7 @@ class Worker(QueueRemoteCallee):
         return match_report
 
     # Reports PROGRESS
-    @Remote(progress=True, results_version=RESULTS_VERSION)
+    @Remote(progress=True, results_version=RESULTS_VERSION, time_limited=True)
     def getMatchesForSampleVsGroup(
         self,
         sample_id,
@@ -735,7 +758,7 @@ class Worker(QueueRemoteCallee):
         match_report = matcher.getMatchesForSample(sample_id, other_sample_ids)
         return match_report
 
-    @Remote(results_version=RESULTS_VERSION)
+    @Remote(results_version=RESULTS_VERSION, time_limited=True)
     def combineMatchesToCross(self, sample_to_job_id):
         child_results = []
         for job_id in sample_to_job_id.values():
