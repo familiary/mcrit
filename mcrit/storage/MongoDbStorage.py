@@ -2042,13 +2042,20 @@ class MongoDbStorage(StorageInterface):
     def isFamilyId(self, family_id: int) -> bool:
         return bool(self._getDb().families.find_one({"family_id": family_id}))
 
-    def addMinHash(self, minhash: "MinHash") -> bool:
+    @staticmethod
+    def _minHashUpdate(minhash: "MinHash", keep_composition: bool) -> Dict[str, Any]:
+        """the fields addMinHash(es) sets on the function's document"""
+        update: Dict[str, Any] = {"minhash": minhash.getMinHash().hex()}
+        if not keep_composition:
+            update["minhash_shingle_composition"] = minhash.getComposition()
+        return {"$set": update}
+
+    def addMinHash(self, minhash: "MinHash", keep_composition: bool = False) -> bool:
         if minhash.function_id is None:
             return False
         is_query_function = minhash.function_id < 0
         collection = self._getDb().query_functions if is_query_function else self._getDb().functions
-        set_command = {"$set": {"minhash": minhash.getMinHash().hex(), "minhash_shingle_composition": minhash.getComposition()}}
-        if collection.find_one_and_update({"function_id": minhash.function_id}, set_command) is None:
+        if collection.find_one_and_update({"function_id": minhash.function_id}, self._minHashUpdate(minhash, keep_composition)) is None:
             LOGGER.warning("addMinHash() - no function with id %d, skipping its minhash.", minhash.function_id)
             return False
         # query functions are not indexed into bands, they are only ever used as query input
@@ -2056,7 +2063,7 @@ class MongoDbStorage(StorageInterface):
             self._addMinHashToBands(minhash)
         return True
 
-    def addMinHashes(self, minhashes: List["MinHash"]) -> None:
+    def addMinHashes(self, minhashes: List["MinHash"], keep_composition: bool = False) -> None:
         if not minhashes:
             return
         for is_query_function in (False, True):
@@ -2080,7 +2087,7 @@ class MongoDbStorage(StorageInterface):
             # held about 0.6 kB each at once
             for offset in range(0, len(stored_minhashes), self._MINHASH_UPDATE_BATCH):
                 function_updates = [
-                    UpdateOne({"function_id": minhash.function_id}, {"$set": {"minhash": minhash.getMinHash().hex(), "minhash_shingle_composition": minhash.getComposition()}})
+                    UpdateOne({"function_id": minhash.function_id}, self._minHashUpdate(minhash, keep_composition))
                     for minhash in stored_minhashes[offset : offset + self._MINHASH_UPDATE_BATCH]
                 ]
                 collection.bulk_write(function_updates, ordered=False)

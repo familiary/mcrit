@@ -594,7 +594,9 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 for function_id, minhash in zip(function_ids, minhash_bytes)
             ]
             del minhashes_to_import
-            storage.addMinHashes(minhashes)
+            # rebuilt from their bytes, these carry no shingle composition: the one each function was
+            # stored with above stays, where writing theirs would empty it
+            storage.addMinHashes(minhashes, keep_composition=True)
             LOGGER.info(f"{len(minhashes)} Minhashes added")
         except Exception:
             LOGGER.error("Import failed, removing the %d samples and %d families it had added.", len(imported_sample_entries), len(created_family_ids))

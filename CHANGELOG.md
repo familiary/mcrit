@@ -118,6 +118,17 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   `rebuildPicHashCountIndex` runs, and a database left without functions clears them at its next
   start instead of trusting them again.
 
+- **Imports, repairs and memory recalculations keep each function's shingle composition (#310).**
+  With `MINHASH_TRACK_SHINGLES` on, a function could lose its `minhash_shingle_composition` wherever
+  its MinHash was rebuilt from the stored bytes and added again: the rebuilt MinHash carries no
+  composition and wrote an empty one over the function's. This hit every function `POST /import`
+  stored, on both storages; the functions without disassembly that `/repair_minhashes` keeps, on
+  both storages; and those that `/recalculate_minhashes` keeps on memory storage. `addMinHash` and
+  `addMinHashes` take `keep_composition`, which the import and the memory recalculation set, to
+  write only the minhash. A repair gives each kept MinHash the composition read with its function,
+  since `deleteMinHashesForSample` has cleared the stored one by then. Every other caller writes the
+  MinHash's composition, as before.
+
 ### Security
 
 - `POST /import` no longer attaches functions to a sample it did not create. An export entry whose
