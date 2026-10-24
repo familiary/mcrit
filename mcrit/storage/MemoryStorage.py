@@ -403,6 +403,21 @@ class MemoryStorage(StorageInterface):
         self._releaseSampleBinary(sha256, sample_id)
         return True
 
+    def deleteOrphanedSampleBinaries(self, dry_run: bool = False) -> Dict[str, Any]:
+        # as MongoDbStorage does; a binary is held in one piece here, so there are no chunks to look for
+        report: Dict[str, Any] = {"dry_run": dry_run, "binaries": 0, "stale_sample_ids": 0, "chunk_files": 0}
+        for sha256, (_, sample_ids) in list(self._sample_binaries.items()):
+            stale = {sample_id for sample_id in sample_ids if not self.isSampleId(sample_id)}
+            if stale == sample_ids:
+                report["binaries"] += 1
+                if not dry_run:
+                    del self._sample_binaries[sha256]
+                continue
+            report["stale_sample_ids"] += len(stale)
+            if not dry_run:
+                sample_ids.difference_update(stale)
+        return report
+
     def recomputeFamilyStats(self, progress_reporter=None) -> Dict[str, Any]:
         report: Dict[str, Any] = {"num_families": 0, "num_families_corrected": 0, "num_families_created": 0, "corrections": {}}
         for sample_entry in self._samples.values():

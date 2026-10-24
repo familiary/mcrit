@@ -2,10 +2,12 @@ import hashlib
 import json
 import logging
 import os
+from datetime import UTC, datetime, timedelta
 from unittest import TestCase, main
 from unittest.mock import patch
 
 import pytest
+from bson import ObjectId
 from bson import encode as bson_encode
 from smda.common.SmdaReport import SmdaReport
 
@@ -561,6 +563,39 @@ class MemoryStorageTest(TestCase):
         self.storage.storeSampleBinary(sample_entry.sample_id, b"third")
         self.storage.deleteSample(sample_entry.sample_id)
         self.assertIsNone(self.storage.getSampleBinary(sample_entry.sample_id))
+
+    def _deleteSampleButNotItsBinary(self, sample_id):
+        """A deletion that dies between the sample and its binary, as a crash or a lost connection leaves it."""
+        with patch.object(self.storage, "deleteSampleBinary", side_effect=RuntimeError("died")):
+            with self.assertRaises(RuntimeError):
+                self.storage.deleteSample(sample_id)
+        self.assertFalse(self.storage.isSampleId(sample_id))
+
+    def testBinariesOfSamplesThatAreGoneAreCountedThenDeleted(self):
+        """#80: a deletion interrupted between a sample and its binary left the binary for good, and
+        on a binary shared with another sample, the id left on it kept it past that one's deletion."""
+        self.storage.clearStorage()
+        sample_a, sample_b = self._addTwoSamples()
+        payload = b"MZ" + bytes(range(256)) * 2000
+        self.storage.storeSampleBinary(sample_a, payload)
+        self.storage.storeSampleBinary(sample_b, payload)
+        self._deleteSampleButNotItsBinary(sample_a)
+        stale_id = {"binaries": 0, "stale_sample_ids": 1, "chunk_files": 0}
+        self.assertEqual({"dry_run": True, **stale_id}, self.storage.deleteOrphanedSampleBinaries(dry_run=True))
+        self.assertEqual({"dry_run": False, **stale_id}, self.storage.deleteOrphanedSampleBinaries())
+        self.assertEqual(payload, self.storage.getSampleBinary(sample_b))
+        # with the gone sample taken off, the binary goes with the last one that exists
+        self.storage.deleteSample(sample_b)
+        self.assertEqual(0, self._numStoredBinaries())
+        sample_c, _ = self._addTwoSamples()
+        self.storage.storeSampleBinary(sample_c, payload)
+        self._deleteSampleButNotItsBinary(sample_c)
+        orphan = {"binaries": 1, "stale_sample_ids": 0, "chunk_files": 0}
+        self.assertEqual({"dry_run": True, **orphan}, self.storage.deleteOrphanedSampleBinaries(dry_run=True))
+        self.assertEqual(1, self._numStoredBinaries())
+        self.assertEqual({"dry_run": False, **orphan}, self.storage.deleteOrphanedSampleBinaries())
+        self.assertEqual(0, self._numStoredBinaries())
+        self.assertEqual({"dry_run": False, "binaries": 0, "stale_sample_ids": 0, "chunk_files": 0}, self.storage.deleteOrphanedSampleBinaries())
 
     def testSampleHandling(self):
         self.storage.clearStorage()
@@ -1382,6 +1417,119 @@ class MongoDbStorageTest(MemoryStorageTest):
         with patch.object(self.storage, "isSampleId", side_effect=[True, False, False]):
             self.assertFalse(self.storage.storeSampleBinary(sample_a, b"MZ late"))
         self.assertEqual(0, self._numStoredBinaries())
+
+    def testTheLeftoversOfAnInterruptedReleaseOrPutAreDeleted(self):
+        """#80: a release that died after taking its sample off, or after retiring the file, and a
+        put() that died before writing the file document; chunks young enough to be a put() still
+        running stay, and so does a file storeSampleBinary did not write."""
+        self.storage.clearStorage()
+        db = self.storage._getDb()
+        sample_a, _ = self._addTwoSamples()
+        self.storage.storeSampleBinary(sample_a, b"MZ kept")
+        bucket = self.storage._getBinaries()
+        bucket.put(b"MZ emptied", metadata={"sha256": hashlib.sha256(b"MZ emptied").hexdigest(), "sample_ids": [], "size": 10})
+        bucket.put(b"MZ retired", metadata={"sha256": None, "sample_ids": [], "size": 10})
+        foreign = bucket.put(b"MZ foreign", metadata={"source": "elsewhere"})
+        old_chunks, fresh_chunks = ObjectId.from_datetime(datetime.now(UTC) - timedelta(days=2)), ObjectId()
+        db["sample_binaries.chunks"].insert_many(
+            [{"files_id": old_chunks, "n": 0, "data": b"x"}, {"files_id": old_chunks, "n": 1, "data": b"x"}, {"files_id": fresh_chunks, "n": 0, "data": b"x"}]
+        )
+        leftovers = {"binaries": 2, "stale_sample_ids": 0, "chunk_files": 1}
+        self.assertEqual({"dry_run": True, **leftovers}, self.storage.deleteOrphanedSampleBinaries(dry_run=True))
+        self.assertEqual((4, 7), (db["sample_binaries.files"].count_documents({}), db["sample_binaries.chunks"].count_documents({})))
+        self.assertEqual({"dry_run": False, **leftovers}, self.storage.deleteOrphanedSampleBinaries())
+        self.assertEqual(b"MZ kept", self.storage.getSampleBinary(sample_a))
+        self.assertIsNotNone(db["sample_binaries.files"].find_one({"_id": foreign}))
+        self.assertEqual(2, db["sample_binaries.files"].count_documents({}))
+        self.assertEqual(0, db["sample_binaries.chunks"].count_documents({"files_id": old_chunks}))
+        self.assertEqual(1, db["sample_binaries.chunks"].count_documents({"files_id": fresh_chunks}))
+
+    def testASampleSubmittedDuringTheSweepKeepsItsBinary(self):
+        """The samples a file names are looked up after the files are read, never taken from before:
+        a sample is written before its binary, so one named by a file read is found."""
+        self.storage.clearStorage()
+        with open(self.example_file_path) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        payload = b"MZ" + bytes(range(256)) * 2000
+        real_files = self.storage._getBinaryFiles()
+        storage = self.storage
+        submitted = []
+
+        class ScanAfterSubmission:
+            def __getattr__(inner, name):
+                return getattr(real_files, name)
+
+            def find(inner, *args, **kwargs):
+                if not submitted:
+                    # what Worker.addBinarySample does for a new sample: the sample first, then its binary
+                    sample_entry = storage.addSmdaReport(report)
+                    assert sample_entry is not None
+                    submitted.append(sample_entry.sample_id)
+                    storage.storeSampleBinary(sample_entry.sample_id, payload)
+                return real_files.find(*args, **kwargs)
+
+        with patch.object(self.storage, "_getBinaryFiles", return_value=ScanAfterSubmission()):
+            self.assertEqual(0, self.storage.deleteOrphanedSampleBinaries()["binaries"])
+        self.assertEqual(payload, self.storage.getSampleBinary(submitted[0]))
+
+    def testASubmissionOfTheSameBytesDuringTheSweepKeepsTheBinary(self):
+        """Between reading a binary whose samples are gone and deleting it, a submission of the same
+        bytes can link its sample to it: the binary is retired only while no sample is on it, and
+        one retired already is no longer linked to, so the submission stores a fresh copy."""
+        payload = b"MZ" + bytes(range(256)) * 2000
+        for race in ("before the retirement", "between retirement and deletion"):
+            with self.subTest(race=race):
+                self.storage.clearStorage()
+                sample_a, sample_b = self._addTwoSamples()
+                self.storage.storeSampleBinary(sample_a, payload)
+                self._deleteSampleButNotItsBinary(sample_a)
+                retire, real_bucket = self.storage._retireAndDeleteOrphanedBinary, self.storage._getBinaries()
+                storage = self.storage
+
+                def submit_then_retire(file_id, stale_sample_ids):
+                    storage.storeSampleBinary(sample_b, payload)
+                    return retire(file_id, stale_sample_ids)
+
+                class BucketWithASubmissionBeforeDelete:
+                    def __getattr__(inner, name):
+                        return getattr(real_bucket, name)
+
+                    def delete(inner, file_id):
+                        with patch.object(storage, "_getBinaries", return_value=real_bucket):
+                            storage.storeSampleBinary(sample_b, payload)
+                        real_bucket.delete(file_id)
+
+                if race == "before the retirement":
+                    racing = patch.object(self.storage, "_retireAndDeleteOrphanedBinary", side_effect=submit_then_retire)
+                    expected = {"binaries": 0, "stale_sample_ids": 1}
+                else:
+                    racing = patch.object(self.storage, "_getBinaries", return_value=BucketWithASubmissionBeforeDelete())
+                    expected = {"binaries": 1, "stale_sample_ids": 0}
+                with racing:
+                    report = self.storage.deleteOrphanedSampleBinaries()
+                self.assertEqual(expected, {key: report[key] for key in expected})
+                self.assertEqual(payload, self.storage.getSampleBinary(sample_b))
+                self.assertEqual([sample_b], self.storage._getBinaryFiles().find_one({})["metadata"]["sample_ids"])
+                self.assertEqual(1, self._numStoredBinaries())
+
+    def testChunksWhoseBinaryAppearsMeanwhileAreKept(self):
+        # an old ObjectId, so that only the check right before deleting can keep these chunks
+        self.storage.clearStorage()
+        db = self.storage._getDb()
+        sample_a, _ = self._addTwoSamples()
+        self.storage.storeSampleBinary(sample_a, b"MZ")
+        files_id = ObjectId.from_datetime(datetime.now(UTC) - timedelta(days=2))
+        db["sample_binaries.chunks"].insert_one({"files_id": files_id, "n": 0, "data": b"x"})
+        batch = self.storage._deleteOrphanedBinaryBatch
+
+        def document_arrives(*args):
+            db["sample_binaries.files"].insert_one({"_id": files_id, "length": 1, "chunkSize": 261120, "metadata": {"source": "elsewhere"}})
+            return batch(*args)
+
+        with patch.object(self.storage, "_deleteOrphanedBinaryBatch", side_effect=document_arrives):
+            self.assertEqual(0, self.storage.deleteOrphanedSampleBinaries()["chunk_files"])
+        self.assertEqual(1, db["sample_binaries.chunks"].count_documents({"files_id": files_id}))
 
     def _numBandEntries(self):
         db = self.storage._getDb()

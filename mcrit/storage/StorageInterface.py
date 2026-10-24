@@ -627,6 +627,15 @@ class StorageInterface:
         left on it; True when the sample had one (#95)."""
         raise NotImplementedError
 
+    def deleteOrphanedSampleBinaries(self, dry_run: bool = False) -> Dict[str, Any]:
+        """Delete the kept binaries no existing sample refers to any more, and take the ids of
+        samples that are gone off the binaries other samples still use (#80).
+
+        Answers {"dry_run", "binaries", "stale_sample_ids", "chunk_files"}: the binaries deleted,
+        the ids taken off binaries that stay, and the chunk groups deleted for lack of a file. With
+        dry_run nothing is changed, and the answer is what would have been."""
+        raise NotImplementedError
+
     def recomputeFamilyStats(self, progress_reporter=None) -> Dict[str, Any]:
         """Set every family's sample/function counters from the samples and functions that exist,
         and report how many families were corrected (#151)."""

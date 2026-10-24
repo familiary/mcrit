@@ -122,6 +122,14 @@ class StatusResource:
     @timing
     def on_post_delete_orphaned_queue_files(self, req, resp):
         """Schedule a job that deletes the GridFS files and chunks no job refers to any more; with ``dry_run=true`` it only counts them. Answers the job id."""
+        self._schedule_orphan_sweep(req, resp, self.index.deleteOrphanedQueueFiles, "on_post_delete_orphaned_queue_files")
+
+    @timing
+    def on_post_delete_orphaned_sample_binaries(self, req, resp):
+        """Schedule a job that deletes the kept binaries (``sample_binaries``) no existing sample refers to any more; with ``dry_run=true`` it only counts them. Answers the job id."""
+        self._schedule_orphan_sweep(req, resp, self.index.deleteOrphanedSampleBinaries, "on_post_delete_orphaned_sample_binaries")
+
+    def _schedule_orphan_sweep(self, req, resp, sweep_method, endpoint):
         # required, and strictly true or false: a missing, repeated or misspelt value is refused
         # rather than taken as a real, destructive run
         dry_run = req.params.get("dry_run")
@@ -129,11 +137,11 @@ class StatusResource:
         if dry_run not in ("true", "false"):
             resp.status = falcon.HTTP_400
             resp.data = jsonify({"status": "failed", "data": {"message": "dry_run=true or dry_run=false has to be given in the query string."}})
-            db_log_msg(self.index, req, "StatusResource.on_post_delete_orphaned_queue_files - failed - invalid dry_run.")
+            db_log_msg(self.index, req, f"StatusResource.{endpoint} - failed - invalid dry_run.")
             return
-        job_id = self.index.deleteOrphanedQueueFiles(dry_run == "true", force_recalculation=True)
+        job_id = sweep_method(dry_run == "true", force_recalculation=True)
         resp.data = jsonify({"status": "successful", "data": job_id})
-        db_log_msg(self.index, req, "StatusResource.on_post_delete_orphaned_queue_files - success.")
+        db_log_msg(self.index, req, f"StatusResource.{endpoint} - success.")
 
     def on_get_band_df_cutoff_coverage(self, req, resp):
         """Schedule a job that measures what STORAGE_BAND_DF_CUTOFF skips - band hashes and postings over the cutoff, per band and in total (#201). ``band_df_cutoff`` evaluates another cutoff than the configured one. Answers the job id."""

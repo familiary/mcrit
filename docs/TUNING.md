@@ -434,6 +434,15 @@ reports submitted as SMDA JSON (`POST /samples`) never have any. Turn it on when
 the original file back from MCRIT (re-disassembly with a newer smda, hand-off to other
 tooling); leave it off when the binaries are kept elsewhere.
 
+A process dying part way through - between deleting a sample and releasing its binary, or while
+storing one - leaves a file no sample refers to, or a deleted sample's id on a file another
+sample still uses, which then outlives that one too. `POST /delete_orphaned_sample_binaries`
+(`McritClient.deleteOrphanedSampleBinaries`) schedules a job that deletes such files, takes the
+stale ids off, and deletes chunks without a file document once they are an hour old;
+`dry_run=true` or `dry_run=false` is required in the query string, and with `true` it only
+counts them. It looks at `sample_binaries` alone; the job queue's GridFS has its own sweep,
+`POST /delete_orphaned_queue_files`.
+
 Keeping and serving are separate switches because they are separate decisions. The stored
 binaries are the submitted samples - on most instances, live malware - and serving them makes
 the REST API a download point for it, for anyone who can reach it. Turn serving on only when
