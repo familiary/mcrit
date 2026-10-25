@@ -12,6 +12,7 @@ from mcrit.client.McritClient import McritClient, McritNotFound, McritServerErro
 from mcrit.config.StorageConfig import StorageConfig
 from mcrit.index.MinHashIndex import MinHashIndex
 from mcrit.server.SampleResource import SampleResource
+from mcrit.server.StatusResource import StatusResource
 from mcrit.Worker import Worker
 
 from .context import config
@@ -175,6 +176,55 @@ class WorkerKeepsBinariesTest(unittest.TestCase):
             result = worker.addBinarySample(b"MZ", "a.exe", "fam", "1", False, None, None)
             storage.storeSampleBinary.assert_not_called()
             self.assertNotIn("binary_stored", result)
+
+
+class DeleteOrphanedSampleBinariesTest(unittest.TestCase):
+    """#80: the sweep of kept binaries is reached the way the queue's is, as a job behind a POST"""
+
+    def test_the_job_runs_on_the_worker_and_answers_the_report(self):
+        index = MinHashIndex(config)
+        storage = cast(Any, index._storage)
+        # a binary whose only sample is gone, as an interrupted deletion leaves it
+        storage._sample_binaries["ab" * 32] = (b"MZ", {4242})
+        dry_job = index.deleteOrphanedSampleBinaries(True, force_recalculation=True)
+        self.assertEqual({"dry_run": True, "binaries": 1, "stale_sample_ids": 0, "chunk_files": 0}, index.getResultForJob(dry_job))
+        self.assertIn("ab" * 32, storage._sample_binaries)
+        real_job = index.deleteOrphanedSampleBinaries(False, force_recalculation=True)
+        self.assertEqual({"dry_run": False, "binaries": 1, "stale_sample_ids": 0, "chunk_files": 0}, index.getResultForJob(real_job))
+        self.assertEqual({}, storage._sample_binaries)
+
+    def test_the_route_schedules_the_job_with_dry_run_as_asked(self):
+        for query, dry_run in (("dry_run=true", True), ("dry_run=false", False), ("dry_run=TRUE", True)):
+            with self.subTest(query=query):
+                index = MagicMock()
+                index.deleteOrphanedSampleBinaries.return_value = "0123456789abcdef01234567"
+                app = falcon.App()
+                app.add_route("/delete_orphaned_sample_binaries", StatusResource(index), suffix="delete_orphaned_sample_binaries")
+                response = falcon.testing.TestClient(app).simulate_post("/delete_orphaned_sample_binaries", query_string=query)
+                self.assertEqual(falcon.HTTP_200, response.status)
+                self.assertEqual("0123456789abcdef01234567", response.json["data"])
+                index.deleteOrphanedSampleBinaries.assert_called_once_with(dry_run, force_recalculation=True)
+                index.deleteOrphanedQueueFiles.assert_not_called()
+
+    def test_anything_but_true_or_false_in_the_query_string_is_refused(self):
+        # missing (including sent in the body, which is not read), repeated, or not a boolean
+        for query, body in (("", None), ("", "dry_run=true"), ("dry_run=true&dry_run=true", None), ("dry_run=1", None), ("dry_run=yes", None)):
+            with self.subTest(query=query, body=body):
+                index = MagicMock()
+                app = falcon.App()
+                app.add_route("/delete_orphaned_sample_binaries", StatusResource(index), suffix="delete_orphaned_sample_binaries")
+                headers = {"Content-Type": "application/x-www-form-urlencoded"} if body else None
+                response = falcon.testing.TestClient(app).simulate_post("/delete_orphaned_sample_binaries", query_string=query, body=body, headers=headers)
+                self.assertEqual(falcon.HTTP_400, response.status)
+                index.deleteOrphanedSampleBinaries.assert_not_called()
+
+    def test_the_client_posts_to_the_route(self):
+        with patch("mcrit.client.McritClient.requests.Session.post") as post:
+            post.return_value.status_code = 200
+            post.return_value.json.return_value = {"status": "successful", "data": "0123456789abcdef01234567"}
+            self.assertEqual("0123456789abcdef01234567", McritClient("http://mcrit.test").deleteOrphanedSampleBinaries(dry_run=True))
+        self.assertEqual("http://mcrit.test/delete_orphaned_sample_binaries", post.call_args.args[0])
+        self.assertEqual({"dry_run": "true"}, post.call_args.kwargs["params"])
 
 
 if __name__ == "__main__":

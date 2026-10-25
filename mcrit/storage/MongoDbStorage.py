@@ -11,7 +11,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
-from itertools import zip_longest
+from itertools import batched, zip_longest
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
@@ -1400,6 +1400,91 @@ class MongoDbStorage(StorageInterface):
             self._releaseBinaryFile(stored["_id"], sample_id)
             had_binary = True
         return had_binary
+
+    # a chunk group without its file document can be a binary put() is still writing: GridFS stores
+    # the chunks first, so only ids older than this are taken as leftovers, as the queue's sweep does
+    _ORPHANED_BINARY_CHUNKS_MIN_AGE = datetime.timedelta(hours=1)
+
+    def deleteOrphanedSampleBinaries(self, dry_run: bool = False) -> Dict[str, Any]:
+        """Collect what a process dying in deleteSample or storeSampleBinary left in the bucket (#80):
+        binaries whose samples are all gone, binaries a release emptied but did not delete, and the
+        chunks of a put() that never wrote its file document.
+
+        Files are read in batches, and only then are the samples they name looked up: a sample is
+        written before storeSampleBinary links it to a file, so every sample a file names when it is
+        read is found, and a sample submitted during the sweep keeps its binary. Sample ids are not
+        reused, so an id found missing stays missing and can be taken off. A binary is deleted the way
+        _releaseBinaryFile deletes one, retired by the update that checks no sample is on it, so a
+        submission of the same bytes racing the sweep either keeps it or stores a fresh copy.
+
+        A binary is counted when this sweep's retirement matched it. GridFS's delete() does not say
+        whether the file was still there, so a binary that a release or a second sweep running at
+        the same time deleted as well can be counted by a sweep that did not delete it, or twice."""
+        # taken before anything is read: a chunk group older than this was complete before the sweep began
+        chunk_cutoff = datetime.datetime.now(datetime.UTC) - self._ORPHANED_BINARY_CHUNKS_MIN_AGE
+        report: Dict[str, Any] = {"dry_run": dry_run, "binaries": 0, "stale_sample_ids": 0, "chunk_files": 0}
+        # batch_size: a getMore after each batch is handled, so no cursor sits idle while large binaries are deleted
+        for batch in batched(self._getBinaryFiles().find({}, {"metadata.sample_ids": 1}).batch_size(1000), 1000):
+            self._deleteOrphanedBinaryBatch(batch, dry_run, report)
+        binary_chunks = self._getDb()[f"{self._BINARIES_BUCKET}.chunks"]
+        # a streamed $group rather than distinct(), whose answer is one document
+        groups = (group["_id"] for group in binary_chunks.aggregate([{"$group": {"_id": "$files_id"}}], allowDiskUse=True, batchSize=1000))
+        old_groups = (files_id for files_id in groups if isinstance(files_id, ObjectId) and files_id.generation_time < chunk_cutoff)
+        for chunk_batch in batched(old_groups, 1000):
+            # checked against the files right before deleting, not against what the scan above saw
+            with_document = {document["_id"] for document in self._getBinaryFiles().find({"_id": {"$in": list(chunk_batch)}}, {"_id": 1})}
+            orphaned = [files_id for files_id in chunk_batch if files_id not in with_document]
+            report["chunk_files"] += len(orphaned)
+            if orphaned and not dry_run:
+                binary_chunks.delete_many({"files_id": {"$in": orphaned}})
+        return report
+
+    def _deleteOrphanedBinaryBatch(self, documents: Iterable[Dict[str, Any]], dry_run: bool, report: Dict[str, Any]) -> None:
+        # a file without a list of samples is not one storeSampleBinary wrote, and not this sweep's to judge
+        files = [(document["_id"], document["metadata"]["sample_ids"]) for document in documents if isinstance((document.get("metadata") or {}).get("sample_ids"), list)]
+        existing = self._existingSampleIds(sample_id for _, sample_ids in files for sample_id in sample_ids)
+        for file_id, sample_ids in files:
+            # an id that is not a number names no sample to look up, and is kept as if it did
+            stale = [sample_id for sample_id in sample_ids if self._canLookUpSampleId(sample_id) and sample_id not in existing]
+            if len(stale) < len(sample_ids):
+                # still the binary of a sample: only the samples that are gone come off it, so that
+                # it goes with the last one that exists rather than staying on their account - or
+                # goes here, when that one was deleted after the file was read: its release saw the
+                # gone ids still on the file and kept it
+                if stale and not dry_run and self._retireAndDeleteOrphanedBinary(file_id, stale):
+                    report["binaries"] += 1
+                else:
+                    report["stale_sample_ids"] += len(stale)
+            elif dry_run or self._retireAndDeleteOrphanedBinary(file_id, stale):
+                report["binaries"] += 1
+            else:
+                # a submission of the same bytes linked its sample to the file in between: it stays
+                report["stale_sample_ids"] += len(stale)
+
+    def _existingSampleIds(self, sample_ids: Iterable[Any]) -> Set[Any]:
+        """Which of the ids belong to a sample - a query sample for a negative one, as in isSampleId.
+
+        Every number is looked up, whatever its type: $in matches 5 to a sample_id stored as 5.0,
+        and 5 == 5.0 in the set answered, so either finds the other."""
+        db = self._getDb()
+        ids = {sample_id for sample_id in sample_ids if self._canLookUpSampleId(sample_id)}
+        existing: Set[Any] = set()
+        for collection, selected in ((db.samples, [i for i in ids if i >= 0]), (db.query_samples, [i for i in ids if i < 0])):
+            if selected:
+                existing.update(document["sample_id"] for document in collection.find({"sample_id": {"$in": selected}}, {"sample_id": 1, "_id": 0}))
+        return existing
+
+    def _retireAndDeleteOrphanedBinary(self, file_id, stale_sample_ids: List[Any]) -> bool:
+        """Take the samples that are gone off a binary, and delete it if that leaves none on it,
+        unless a sample has been linked to it since it was read. True when it was deleted."""
+        if stale_sample_ids:
+            self._getBinaryFiles().update_one({"_id": file_id}, {"$pullAll": {"metadata.sample_ids": stale_sample_ids}})
+        # retired as in _releaseBinaryFile, and also when a release cleared the hash already and died
+        # before deleting: no submission can link to such a file any more
+        if self._getBinaryFiles().find_one_and_update({"_id": file_id, "metadata.sample_ids": []}, {"$set": {"metadata.sha256": None}}) is None:
+            return False
+        self._getBinaries().delete(file_id)
+        return True
 
     def recomputeFamilyStats(self, progress_reporter=None) -> Dict[str, Any]:
         """Set every family's counters from the samples and functions that exist (#151).
