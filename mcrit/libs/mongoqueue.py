@@ -761,6 +761,19 @@ class MongoQueue:
         file_id = ObjectId(file_id)
         self._getFsFiles().find_one_and_update({"_id": file_id}, {"$inc": {"metadata.tmp_lock": -1}, "$addToSet": {"metadata.jobs": job_id}})
 
+    def claim_file(self, file_id):
+        """Claim a file parameter by its id, as get_file_by_hash_inc_lock does by hash, and answer its sha256.
+
+        None for a file that is gone or retired: _retireAndDeleteFile clears the hash in the update
+        that re-checks the file is unused, so a file is either claimed here or retired, never both.
+        """
+        file = self._getFsFiles().find_one_and_update({"_id": ObjectId(file_id), "metadata.sha256": {"$ne": None}}, {"$inc": {"metadata.tmp_lock": 1}})
+        return file and file["metadata"]["sha256"] or None
+
+    def release_file(self, file_id):
+        """Give up a claim no job was linked by. Nothing is deleted here: a file no job holds any more is left to delete_orphaned_files."""
+        self._getFsFiles().update_one({"_id": ObjectId(file_id)}, {"$inc": {"metadata.tmp_lock": -1}})
+
     def clean(self):
         # TODO consider a good way to implement this
         # we probably do not want to drop matches and their results automatically, which would be the case right now

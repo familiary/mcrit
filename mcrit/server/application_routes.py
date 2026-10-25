@@ -210,6 +210,8 @@ def get_app():
     _app.add_route("/jobs/count", job_resource, suffix="count")
     _app.add_route("/jobs/{job_id}", job_resource)
     _app.add_route("/jobs/{job_id}/result", job_resource, suffix="job_result")
+    # post only: queue a finished, failed or terminated analysis job again with the arguments and files it stored
+    _app.add_route("/jobs/{job_id}/rerun", job_resource, suffix="rerun")
     _app.add_route("/results/{result_id}", job_resource, suffix="results")
     _app.add_route("/results/{result_id}/job", job_resource, suffix="result_job")
 

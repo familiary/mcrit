@@ -543,6 +543,17 @@ class LocalQueue:
         self._files_meta[file_id]["jobs"].append(job_id)
         self._dec_lock(file_id)
 
+    def claim_file(self, file_id):
+        # as MongoQueue.claim_file: the file's sha256 with its lock raised, or None for a file that is gone
+        meta = self._files_meta.get(file_id)
+        if file_id not in self._files or not meta or meta.get("sha256") is None:
+            return None
+        self._inc_lock(file_id)
+        return meta["sha256"]
+
+    def release_file(self, file_id):
+        self._dec_lock(file_id)
+
     def _dicts_to_grid(self, dicts, **kwargs):
         return self._file_to_grid(json.dumps(dicts).encode("ascii"), **kwargs)
 

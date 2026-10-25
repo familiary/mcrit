@@ -15,6 +15,28 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- **`POST /jobs/{job_id}/rerun` and `McritClient.requestJobRerun(job_id)` queue a finished, failed
+  or terminated analysis again** from the payload its job stored, and answer the new job's id
+  ([familiary/mcritweb#55]). The new job has the old one's method and arguments, and its input
+  files: the binary or report of a query is not uploaded again but claimed in GridFS and linked to
+  the new job as well, so deleting either job keeps it for the other. Its descriptor is computed with
+  the results version the method declares now, it is never answered from the cache, and it is
+  recorded for the `username` that asked for the rerun. A client could not do this for every job: it
+  has no request for a query from a stored reference, none for `getMatchesForSampleVsGroup`, and its
+  unique-blocks requests take no `force_recalculation`, so a repeat got the cached job back. A cross
+  compare reruns each of the jobs it combined, those it was served from the cache included, so one
+  over n samples queues n + 1 jobs. Only the analyses can be rerun - the matches, queries, cross
+  compares and unique blocks, named in `MinHashIndex.RERUNNABLE_METHODS`, so a method added later is
+  not until it is listed there. A job of any other method, one still queued or running (for a cross
+  compare: any job it combined), and one whose input file is gone answer 409, and nothing is queued;
+  an unknown id answers 404. NOTE that the arguments are repeated as stored, matching knobs included
+  as they were resolved at submission ([#217]): a configuration changed since does not apply, and a
+  job that ran with `shortlist_unavailable` runs with it again. A query's rerun stores its query
+  sample anew, under a new id, and a binary query is disassembled again by the worker's smda.
+  In raw mode `requestJobRerun` answers the `requests.Response`, like `deleteJob`.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct
@@ -1506,6 +1528,7 @@ date, the version, and what changed.
 [mcritweb#47]: https://github.com/fkie-cad/mcritweb/issues/47
 [mcritweb#59]: https://github.com/fkie-cad/mcritweb/issues/59
 [mcritweb#76]: https://github.com/fkie-cad/mcritweb/issues/76
+[familiary/mcritweb#55]: https://github.com/familiary/mcritweb/issues/55
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210

@@ -22,7 +22,7 @@ from mcrit.minhash.EscaperFingerprint import FINGERPRINT_UNAVAILABLE, getEscaper
 from mcrit.minhash.MinHash import MinHash
 from mcrit.minhash.MinHasher import MinHasher
 from mcrit.queue.QueueFactory import QueueFactory
-from mcrit.queue.QueueRemoteCalls import QueueRemoteCaller
+from mcrit.queue.QueueRemoteCalls import JobNotFoundError, JobNotRerunnableError, QueueRemoteCaller, resubmit_payload
 from mcrit.storage.FamilyEntry import FamilyEntry
 from mcrit.storage.FunctionEntry import FunctionEntry
 from mcrit.storage.MatchedFunctionEntry import MatchedFunctionEntry
@@ -649,6 +649,75 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             "match_entry": MatchedFunctionEntry(function_id_a, function_entry_a.binweight, function_entry_a.offset, match_tuple).toDict(),
         }
         return result
+
+    #### JOB RERUNS ####
+    # The analyses whose jobs can be queued again from the payload they stored (familiary/mcritweb#55). A
+    # client cannot rebuild every such request itself: a query's binary or report is only referenced by
+    # its job. An allow-list, so that changes to the collection and maintenance are never repeated from
+    # an old payload, and a method added later is not rerun until someone decides that it may be.
+    RERUNNABLE_METHODS = frozenset(
+        {
+            "getMatchesForSample",
+            "getMatchesForSampleVs",
+            "getMatchesForSampleVsGroup",
+            "getMatchesForSmdaReport",
+            "getMatchesForMappedBinary",
+            "getMatchesForUnmappedBinary",
+            "getUniqueBlocks",
+            "combineMatchesToCross",
+        }
+    )
+    # a job that is queued or running has its result still coming, a rerun would only compute it twice
+    RERUNNABLE_STATES = ("finished", "failed", "terminated")
+
+    def rerunJob(self, job_id, username=None) -> str:
+        """Queue the finished, failed or terminated analysis <job_id> again, and answer the new job's id.
+
+        The new job has the old one's method, arguments and input files, a descriptor computed with the
+        results version the method declares now, and <username> as who asked for it. It is never answered
+        from the cache. A cross compare reruns each of the jobs it combined the same way, and its new
+        combining job waits for those. Every job involved is checked before any is queued: raises
+        JobNotFoundError for an unknown id, JobNotRerunnableError for a job that is queued or running, is
+        no analysis, or whose input is no longer stored. A cross compare that fails to queue one of its
+        jobs deletes those it queued before, and raises what failed.
+        """
+        job = self.queue.get_job(job_id)
+        if job is None:
+            raise JobNotFoundError(f"There is no job with id {job_id}.")
+        self._checkRerunnable(job)
+        if job.method != "combineMatchesToCross":
+            return self._rerun(job, username)
+        params = json.loads(job.payload["params"])
+        children = {}
+        for sample_id, child_job_id in params["0"].items():
+            child = self.queue.get_job(child_job_id)
+            if child is None:
+                raise JobNotRerunnableError(f"Job {child_job_id}, one of the jobs this cross compare combined, no longer exists.")
+            self._checkRerunnable(child)
+            # keyed by int again, as getMatchesCross submits it, so the descriptor reads like a new cross compare's
+            children[int(sample_id)] = child
+        params["0"] = {}
+        try:
+            for sample_id, child in children.items():
+                params["0"][sample_id] = self._rerun(child, username)
+            return self._rerun(job, username, params=params, await_jobs=list(params["0"].values()))
+        except Exception:
+            # no combining job waits for the jobs queued so far, they would only be computed for nobody;
+            # deleting them releases their files too, a job that failed to queue gave up its claims itself
+            for child_job_id in params["0"].values():
+                self.queue.delete_job(child_job_id)
+            raise
+
+    def _checkRerunnable(self, job):
+        if job.method not in self.RERUNNABLE_METHODS:
+            raise JobNotRerunnableError(f"Job {job.job_id} is a {job.method} job, which is not an analysis that can be rerun.")
+        state = self.queue._identifyJobState(job._data)
+        if state not in self.RERUNNABLE_STATES:
+            raise JobNotRerunnableError(f"Job {job.job_id} is {state.replace('_', ' ')}, only a finished, failed or terminated job can be rerun.")
+
+    def _rerun(self, job, username, params=None, await_jobs=None) -> str:
+        results_version = getattr(Worker, job.method).results_version
+        return resubmit_payload(self, job.payload, results_version=results_version, params=params, await_jobs=await_jobs, username=username)
 
     #### SIMPLE LOOKUPS ####
     def getFamily(self, family_id):
