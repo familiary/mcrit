@@ -45,7 +45,8 @@ def smdaFunctionFromXcfg(xcfg: Optional[Dict], binary_info: Optional[BinaryInfo]
     a missing blob to ``{}``. smda cannot rebuild a function from ``{}`` - it raises "serialized
     function is incomplete" - so the callers skip such a function instead of failing the whole
     batch it came in. An xcfg that is present but lacks a field smda requires still raises, and
-    names the fields, because that is not a state MCRIT writes.
+    names the fields, because that is not a state MCRIT writes - but an import stores whatever the
+    export holds, so the jobs that rehash the corpus log and skip a function that raises here.
     """
     if not xcfg:
         return None

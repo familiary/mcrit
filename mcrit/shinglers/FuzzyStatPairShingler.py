@@ -23,21 +23,38 @@ class FuzzyStatPairShingler(AbstractShingler):
         self._weight = weight
         self._log_buckets = LogBucket(self._config.SHINGLER_LOGBUCKETS, self._config.SHINGLER_LOGBUCKET_RANGE)
 
+    @staticmethod
+    def _getEntryBlock(function_object):
+        """The instructions of the block at the function's offset. A submitted report can place the
+        offset outside the function's blocks - smda's fromDict checks that both are addresses, not
+        that one is among the others - and such a function has no prologue to read a frame from."""
+        return function_object.blocks.get(function_object.offset, [])
+
+    @staticmethod
+    def _parseImmediate(immediate):
+        """An immediate as capstone writes it (0x-prefixed hex or plain decimal), else 0: int(x, 0)
+        refuses a decimal with a leading zero (#-010) or of more than 4300 digits, which only a
+        submitted report carries, and raising here failed every minhash batch holding the function."""
+        try:
+            return int(immediate, 0)
+        except ValueError:
+            return 0
+
     def _getAArch64StackSize(self, function_object):
         """The frame an AArch64 prologue sets up: what pre-indexed stores push onto sp
         (stp x29, x30, [sp, #-0x20]!) plus what sub sp, sp, #imm reserves, in its first ten
         instructions (#238)."""
         stack_size = 0
-        for ins in function_object.blocks[function_object.offset][:10]:
+        for ins in self._getEntryBlock(function_object)[:10]:
             operands = ins.operands or ""
             if ins.mnemonic in ("stp", "str") and operands.endswith("]!"):
                 pushed = AARCH64_PUSH.search(operands)
                 if pushed:
-                    stack_size += int(pushed.group(1), 0)
+                    stack_size += self._parseImmediate(pushed.group(1))
             elif ins.mnemonic == "sub":
                 reserved = AARCH64_RESERVE.match(operands)
                 if reserved:
-                    stack_size += int(reserved.group(1), 0) << (12 if reserved.group(2) else 0)
+                    stack_size += self._parseImmediate(reserved.group(1)) << (12 if reserved.group(2) else 0)
         return stack_size if 0 <= stack_size < self._config.SHINGLER_LOGBUCKETS else 0
 
     def _getStackSize(self, function_object):
@@ -49,7 +66,7 @@ class FuzzyStatPairShingler(AbstractShingler):
             return self._getAArch64StackSize(function_object)
         if function_object._escaper is not IntelInstructionEscaper:
             return stack_size
-        for ins in function_object.blocks[function_object.offset][:10]:
+        for ins in self._getEntryBlock(function_object)[:10]:
             if ins.mnemonic == "sub":
                 operands = [op.strip() for op in ins.operands.split(",")]
                 if len(operands) == 2 and operands[0] in ["esp", "rsp"]:

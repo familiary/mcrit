@@ -1,5 +1,6 @@
 #!/usr/bin/python
 
+import contextlib
 import logging
 import unittest
 
@@ -193,6 +194,28 @@ class ExplicitStrategyTestSuite(unittest.TestCase):
         forward = buildStorage(STORAGE_BAND_STRATEGY="explicit", STORAGE_BAND_PROJECTION=[[5, 17, 33, 60]])
         backward = buildStorage(STORAGE_BAND_STRATEGY="explicit", STORAGE_BAND_PROJECTION=[[60, 33, 17, 5]])
         self.assertNotEqual(forward.getBandHashesForMinHash(minhash), backward.getBandHashesForMinHash(minhash))
+
+
+class RandomStrategyTestSuite(unittest.TestCase):
+    """A process derives its projection once and bands every later minhash under it, so the
+    minhash it happens to band first - an imported one, say - must not decide it."""
+
+    def testProjectionDependsOnTheConfigurationAlone(self):
+        reference = buildStorage(STORAGE_BAND_STRATEGY="random").createBandhashProjection(emptyMinHash())
+        for length in (8, 63, 80):
+            self.assertEqual(reference, buildStorage(STORAGE_BAND_STRATEGY="random").createBandhashProjection(emptyMinHash(length)), length)
+
+    def testAWrongLengthFirstMinHashLeavesLaterBandHashesAlone(self):
+        """A short first minhash re-keyed every band hash the process computed afterwards, a long
+        one put positions past the signature into the projection, so that every later one raised."""
+        minhash = MinHash(minhash_signature=list(range(64)), minhash_bits=8)
+        expected = buildStorage().getBandHashesForMinHash(minhash)
+        for length in (8, 80):
+            storage = buildStorage()
+            # whether the odd one is banded at all is not the point here
+            with contextlib.suppress(IndexError):
+                storage.getBandHashesForMinHash(MinHash(minhash_signature=[1] * length, minhash_bits=8))
+            self.assertEqual(expected, storage.getBandHashesForMinHash(minhash), length)
 
 
 if __name__ == "__main__":

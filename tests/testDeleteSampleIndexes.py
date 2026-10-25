@@ -1,4 +1,4 @@
-"""deleteSample and clearStorage keep the pichash counts and the function ranges in step with what is stored (#261).
+"""deleteSample, discardImportedSample and clearStorage keep the pichash counts and the function ranges in step with what is stored (#261).
 
 addSmdaReport adds a sample's functions to both indexes; deleteSample used to leave them there, so
 a deleted sample stayed counted and a deleted and re-added one was counted twice. clearStorage left
@@ -10,6 +10,7 @@ import json
 import logging
 import os
 from unittest import TestCase, main
+from unittest.mock import patch
 
 import pytest
 from smda.common.SmdaReport import SmdaReport
@@ -190,6 +191,108 @@ class DeleteSampleIndexesTest(TestCase):
         # the original sample still holds every hash the twin held, each counted once
         self.assertEqual(self._storedCounts(), self._countsFromFunctions())
         self.assertTrue(all(df >= 1 for df in self._storedCounts().values()))
+
+    def testDiscardingAnImportedSampleTakesItOutOfBothIndexes(self):
+        # what an import that fails after its functions are written undoes: the twin holds the same
+        # pichashes as a sample that stays, so counts left in would be too high, not merely stale
+        twin = self.storage.addSmdaReport(loadReport(REPORTS[0], sha256="ef" * 32))
+        self.assertIn(twin.sample_id, {sample_id for sample_id, _, _ in self._storedRanges()})
+
+        self.storage.discardImportedSample(twin)
+
+        self.assertIsNone(self.storage.getSampleBySha256("ef" * 32))
+        self.assertEqual(self._storedCounts(), self._countsFromFunctions())
+        ranges = self._storedRanges()
+        self.assertNotIn(twin.sample_id, {sample_id for sample_id, _, _ in ranges})
+        self.assertEqual(ranges, self._rangesFromRebuild())
+
+    def _importTwinEntries(self, sha256):
+        """A sample entry imported under another sha256, and the functions of the first sample moved
+        onto it, ready for importFunctionEntries - as addImportData has them at that point."""
+        sample_entry = self.storage.getSampleById(self.sample_ids[0])
+        function_entries = self.storage.getFunctionsBySampleId(self.sample_ids[0])
+        sample_entry.sha256 = sha256
+        imported = self.storage.importSampleEntry(sample_entry)
+        for function_entry in function_entries:
+            function_entry.sample_id = imported.sample_id
+        return imported, function_entries
+
+    def _failImport(self, sha256, method, side_effect):
+        imported, function_entries = self._importTwinEntries(sha256)
+        with patch.object(self.storage, method, side_effect=side_effect):
+            with self.assertRaises(RuntimeError):
+                self.storage.importFunctionEntries(function_entries)
+        return imported
+
+    def testAnImportFailingAfterItsFunctionsLeavesBothIndexesAsTheyWere(self):
+        # importFunctionEntries failing after the insert, as addImportData sees it: the functions are
+        # stored, and discardImportedSample takes out the counts of what it finds, so those have to
+        # have been added already - else the sample that stays loses the counts of its hashes
+        counts_before, ranges_before = self._storedCounts(), self._storedRanges()
+
+        imported = self._failImport("ab" * 32, "_addToPicBlockHashIndex", RuntimeError("connection lost"))
+        self.storage.discardImportedSample(imported)
+
+        self.assertEqual(counts_before, self._storedCounts())
+        self.assertEqual(self._storedCounts(), self._countsFromFunctions())
+        self.assertEqual(ranges_before, self._storedRanges())
+        self.assertTrue(self.storage.isPicHashCountIndexComplete())
+
+    def testAnImportWhoseFamilyUpdateFailsLeavesTheCountsAsTheyWere(self):
+        # the first write after the insert: had it run before the counting, the functions would be
+        # stored uncounted, and the discard would take the twin's counts off the original's hashes
+        counts_before = self._storedCounts()
+
+        imported = self._failImport("ad" * 32, "_updateFamilyStats", RuntimeError("connection lost"))
+        self.storage.discardImportedSample(imported)
+
+        self.assertEqual(counts_before, self._storedCounts())
+        self.assertEqual(self._storedCounts(), self._countsFromFunctions())
+        self.assertTrue(self.storage.isPicHashCountIndexComplete())
+
+    def testAnInsertWhoseCleanupFailsLeavesTheCountsToTheRebuild(self):
+        # the insert fails part way, and so does removing what it wrote: those functions are stored
+        # but were never counted, so the discard must not take counts out for them
+        imported, function_entries = self._importTwinEntries("ae" * 32)
+        counts_before = self._storedCounts()
+        insert_many = self.storage._dbInsertMany
+
+        def insertsHalf(collection, documents):
+            insert_many(collection, documents[: len(documents) // 2])
+            raise RuntimeError("connection lost")
+
+        with (
+            patch.object(self.storage, "_dbInsertMany", side_effect=insertsHalf),
+            patch.object(self.storage, "_discardFunctions", side_effect=RuntimeError("connection lost")),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.storage.importFunctionEntries(function_entries)
+        self.assertFalse(self.storage.isPicHashCountIndexComplete())
+        self.storage.discardImportedSample(imported)
+
+        self.assertEqual(counts_before, self._storedCounts())
+        self.storage.rebuildPicHashCountIndex()
+        self.assertEqual(self._storedCounts(), self._countsFromFunctions())
+
+    def testAnImportWhoseCountsFailPartWayLeavesThemToTheRebuild(self):
+        # counts that fail part way are in in part: the index is marked incomplete, so that nothing
+        # trusts them, and a rebuild that runs before the discard counts the stored functions, which
+        # the discard then takes out like any others
+        add_counts = self.storage._addToPicHashCounts
+
+        def countsHalf(function_documents):
+            add_counts(function_documents[: len(function_documents) // 2])
+            raise RuntimeError("connection lost")
+
+        imported = self._failImport("ac" * 32, "_addToPicHashCounts", countsHalf)
+        self.assertFalse(self.storage.isPicHashCountIndexComplete())
+        self.assertNotEqual(self._storedCounts(), self._countsFromFunctions())
+        self.storage.rebuildPicHashCountIndex()
+        self.assertEqual(self._storedCounts(), self._countsFromFunctions())
+        self.storage.discardImportedSample(imported)
+
+        self.assertEqual(self._storedCounts(), self._countsFromFunctions())
+        self.assertTrue(self.storage.isPicHashCountIndexComplete())
 
 
 if __name__ == "__main__":

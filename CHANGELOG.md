@@ -15,6 +15,239 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **`POST /import` answers 400 for an export it refuses, and stores nothing of it (#266).** An
+  export of another shingler or MinHash configuration, or of a version that is too old, was answered
+  with 200 and `data: null`, which a client could not tell from success (`McritClient` with
+  `raise_client_errors=True` now raises `McritBadRequest` where it returned `None`). A missing or
+  non-text version was a 500, and any text sorting above `"0.0.0"` was accepted, `latest` and
+  `0.0.0rc1` included, because versions were compared as strings; they are now compared by PEP 440
+  ordering. All of these are answered with 400 ("Import rejected: ..."), as is an export whose
+  structure cannot be read: a section missing or no mapping; a sample, present here already or not,
+  whose architecture is neither text nor null; a field missing from the entry of a sample to be
+  stored, or its `is_library` not a boolean; a family id that is no number, or that names two
+  families; a family name other than text or null; family actors that are not a list; a function
+  whose pichash is neither a number nor null; content that does not inflate (corrupt, truncated,
+  encrypted) or parse; JSON nested too deeply; and what the storage cannot hold (#300, below). A
+  refused export stores nothing, its families included, which a malformed export used to leave
+  behind. A sample's stated number of functions is only reported back as skipped, and one that is
+  missing or no count is read as 0. `MinHashIndex.addImportData` raises `ImportRejected`, a
+  `ValueError`, where it returned `None`.
+
+- **`POST /import`: what an accepted export changes.** A sample whose family the export names null,
+  as older versions export a report without a family, used to land in a family named null and now
+  goes to the default family. An error while storing, a failed MongoDB insert say, is still a 500,
+  and removes everything the import had added (#299, below). The actors of families the import found
+  are merged last and only once everything else is stored, so a failure no longer changes them, and
+  an error merging them is logged rather than failing an import that is otherwise complete.
+
+- **A failed `POST /import` could leave the samples it removed in the function ranges and PicHash
+  counts.** On MongoDB, `discardImportedSample`, which rolls back an import that failed after
+  storing its functions, deleted the functions but neither their function ranges nor their PicHash
+  counts. Those were left behind when the failure came after they were written - the ranges are
+  the last index an import writes, and the counts came just before them - so a range could name a
+  sample that was gone and a hash stay counted too often until `rebuildPicHashCountIndex` ran. Both
+  are now taken out with the functions. The PicHashes of imported functions are counted right after
+  the insert, so that the rollback takes out only what was counted; where functions may be stored
+  without being counted (the counting failed, or removing what a failed insert wrote did), the
+  count index is marked for its rebuild and the rollback leaves the counts alone. Functions whose
+  PicHashes could not be counted are also removed before the import fails: no family has counted
+  them yet, and the rollback would have lowered their family by them. The rollback also lowers the
+  family function counters by the functions it finds stored; on either storage, a counter update
+  that failed left functions stored that their family had not counted, which the rollback then took
+  off it. On MongoDB the import now removes the functions with their PicHash counts before failing,
+  and then takes back the families it had counted; memory storage counts each function before
+  storing it. Every family then keeps its counters, unless removing the functions fails as well: the
+  families counted stay raised for the rollback to lower, while the family whose counter failed is
+  lowered by functions it never counted, until `POST /recompute_family_stats` runs.
+
+- **Memory storage: deleting a sample left its PicHashes behind.** `deleteSample` and
+  `discardImportedSample` emptied a PicHash's set of matches but kept the key, so `isPicHash` stayed
+  true and `num_pichashes` counted hashes no function carried. The key is now removed with its last
+  match. MongoDB storage is not affected.
+
+- **Memory storage: `/rebuild_index` held every MinHash of the corpus in one list.** The bands are
+  now rebuilt one work package at a time, with the same result, and the progress total is exactly
+  the number of work packages (it was one too many when the count divided evenly).
+
+- **`POST /import`: an import that fails while storing leaves nothing behind (#299, #304).** Its
+  MinHashes were added after the rollback, so a failure there left samples stored without band
+  entries, which a retry then skipped as present. They are part of it now, and the rollback also
+  takes out the band entries of the samples it removes, as well as a sample that failed after it was
+  stored but before the import learnt of it (a family counter overflowing on MongoDB, say). The
+  families the import created go too, but only while no sample is filed under them. Every writer now
+  ensures its family's document after filing a sample, and the rollback looks for samples again
+  after deleting the family, so a sample filed meanwhile keeps a family document; that family's
+  counters can then miss it until `/recompute_family_stats` runs. When the document of the family a
+  writer looked up is gone and another id holds its name by then, `addSmdaReport`, `modifySample`
+  and imports file the sample under that family instead. `num_families_imported` counts the families
+  the import created, where it counted every family with a higher id than any before it, another
+  writer's included. On MongoDB, `family_name` gets a unique index and a family is added by an
+  upsert, which the index makes atomic, so two writers adding one name no longer both create it. A
+  database that holds a name twice already cannot get the index: it logs an error at startup naming
+  the duplicates and merges nothing; two writers upserting the same new name at the same moment can
+  still both insert it there, until the duplicates are merged or renamed and the next start creates
+  the index. `/recompute_family_stats` no longer re-creates a missing family document under a name
+  another family carries: it files that id's samples and functions under the family of the name and
+  reports them as `num_families_merged`, not as created. The import still fails with the error that
+  failed it (500), and an error while rolling back is logged. `StorageInterface.ensureFamily(name)`
+  answers the family id and whether the call created it; its default looks the name up and calls
+  `addFamily`, which a backend shared by several writers has to override to decide atomically, as
+  both built-in ones do. Backends implement `discardImportedFamily` too.
+
+- **`POST /import` refuses with 400 what MongoDB cannot store, and caps decompression per import
+  (#300, #304).** An integer beyond signed 64 bit in a sample or function entry (`binary_size`,
+  `statistics`, `num_blocks`, ...), a mapping key holding a NUL, a pichash or picblockhash hash or
+  offset outside unsigned 64 bit, or `picblockhashes` other than a list of mappings holding a
+  numeric `hash` and `offset` passed validation and failed on MongoDB at insert, with a 500 after
+  part of the import was written, while memory storage stored them. Both now refuse them before
+  storing anything; checking costs about 1 s per 210,000 functions. A pichash of null, which failed
+  on MongoDB too, is imported as 0, as a function SMDA reports without one is stored. Compressed
+  content is capped across the whole import as well, at 20 times the size of the request body or 64
+  MiB if that is more: four 70 KB blobs, each under its own cap, inflated to 32 MiB. Exports of the
+  live corpus inflate to at most 11.6 times, so they stay below it. MongoDB storage updates the
+  picblockhash index in one pass over an import's functions instead of one per sample, with the same
+  updates in the same order: 7 s instead of 20 s of Python for 300 samples of 700 functions.
+  `MinHashIndex.addImportData` takes the size of the export as an optional `import_size`.
+
+- **`POST /import` holds one sample's functions at a time, not the export's (#304, #309).** It kept
+  every sample's parsed functions until the last was written, then built MinHash objects, band
+  postings and MongoDB updates for all of them at once: on a synthetic export of 300 samples x 700
+  functions (35 MB compressed, minhashes drawn from 20,000 distinct ones) the server peaked at 4.1
+  GB RSS. The validation pass still reads and checks the whole export before the first write, as
+  #266 and #300 require, but now lets go of each sample's entries once checked; the write pass reads
+  and checks each sample again and stores it with its functions before reading the next. Each pass
+  draws on an inflation budget of its own, of the same size, so content read twice is not counted
+  twice against the cap of #300. Only each banded function's id and minhash bytes are kept until the
+  minhashes are banded, in one call as before, so that a band hash shared across samples stays one
+  update. MongoDB storage now bands one band at a time from a matrix of band hashes, and looks up
+  the functions and writes its minhash and band updates 10,000 at a time, with the same documents as
+  result. base85 is decoded with numpy, 13 times faster than `base64.b85decode`. Same export,
+  measured before the checks of #300 were added: 4.1 GB to 0.54 GB peak and 143 s to 115 s; with
+  210,000 distinct minhashes 4.1 GB to 0.62 GB and 414 s to 361 s, nearly all of it band upserts;
+  the validation pass alone 1.7 GB and 13 s to 0.27 GB and 6 s. With them, on 100 samples x 700
+  functions and without the database's own time, what the import adds to the process falls from 820
+  MiB to 93 MiB. Banding is the one step that still grows with the export, by 1.1 to 1.4 kB per
+  function. An uncompressed export is parsed whole by `json.loads` before any of this: 406 MB of
+  JSON still peaks at 2.5 GB (4.6 GB before). As samples are now stored one by one, a later sample
+  that fails finds the earlier ones stored, counted and indexed; the rollback of #299 takes them
+  back too, except their pichash counts if counting failed: those stay untrusted until
+  `rebuildPicHashCountIndex` runs, and a database left without functions clears them at its next
+  start instead of trusting them again.
+
+### Security
+
+- A sample whose SMDA report had no timestamp (missing or empty) was stored, but reading it back
+  failed, so the sample listing, the sample itself, its family with samples, the export and every
+  matching job that reached it answered with an error, and the sample could not be deleted through
+  the API. A stored timestamp that cannot be read is now treated as no timestamp. Samples stored
+  earlier read back the same way, without a migration.
+
+- A sample whose SMDA report had no `statistics` was stored in full before submitting it failed with
+  a server error, and from then on every matching job that found a match in it failed with
+  `KeyError: 'num_functions'`. The family counters now count the functions that were stored instead
+  of the figure the report states, the matchers count a sample's functions when its statistics hold
+  none, and importing an export that holds such a sample works.
+
+- The function counter of a family could be set to any value by a report's
+  `statistics.num_functions`; a very large claim saturated it, after which every later report into
+  that family was stored without being counted or hashed. A family now counts the functions that
+  were actually stored, for submitted reports as well as for imports (the sample is counted when its
+  entry is imported and its functions as they are imported). A counter that is already off stays
+  so until `POST /recompute_family_stats` resets it from the stored functions.
+
+- A function in a submitted report whose offset is not one of its blocks, or an AArch64 prologue
+  with an operand such as `#-010`, made the fuzzy shingler raise, which failed every minhash batch
+  holding it (including `complete_minhashes`, `repair_minhashes` and `recalculate_minhashes`, the
+  last after it had already dropped all hashes). The shingler now treats such a function as having
+  no stack frame. A function the shinglers still fail on no longer fails its batch, see below.
+
+- The `sha256` of a submitted SMDA report is now checked to be 64 hex digits; anything else
+  (including a JSON object, which MongoDB read as a query operator and resolved to an existing
+  sample) is answered with 400 and nothing is stored. A report smda refuses as malformed is also
+  answered with 400 instead of a server error.
+
+- A function in a submitted report whose `pic_hash` is not an unsigned 64-bit integer is now
+  answered with 400 and nothing of the report is stored. Before, the in-memory storage stored -1,
+  2**64, 1.5, strings and booleans as they came, and a PicHash like `{"$ne": 0}` or `[1]` failed
+  with a 500 after the sample had already been partly stored.
+
+- Functions whose report carries no PicHash are stored with PicHash 0. The vs and vs-group matchers
+  and the MongoDB sample matching treated 0 as a hash like any other and reported every such
+  function as an exact match of every other one; the in-memory storage failed sample matching, and
+  moving such a sample or its family to another family, with `KeyError: 0`. On MongoDB, a query for
+  PicHash `0000000000000000` answered with every such function. A PicHash of 0 now never matches.
+  Cached matching results from before are recomputed on their next request.
+
+- `POST /import` no longer attaches functions to a sample it did not create. An export entry whose
+  own `sha256` differed from its key, or named a sample already present (including one added by a
+  second import running at the same time), was reported as imported and its functions were stored
+  under the sample id of the exporting instance, on whatever local sample held that id or on none.
+  `importSampleEntry` now returns None for a known sha256, as its interface documents, and the
+  import skips such a sample together with its functions and counts it as skipped. Functions
+  attached by earlier imports are not detached; a sample whose `statistics.num_functions` is lower
+  than its number of functions is worth checking.
+
+- `POST /import` drops imported minhashes whose length is not the configured signature length. Such
+  a minhash used to be stored and banded next to the code it was copied from, and every matching job
+  that drew it as a candidate then failed. The function is still imported, without a minhash, and a
+  minhash repair computes it again. Minhashes of a wrong length stored by earlier imports keep
+  failing matching jobs until `/repair_minhashes` rehashes their sample, if it has disassembly.
+
+- The band projection for the `random` band strategy is derived from the configured signature length
+  instead of from the first minhash a process happens to band. An imported minhash of another length
+  could previously change the band hashes of everything that process wrote afterwards, or make every
+  later banding fail. For correctly configured instances the projection is unchanged.
+
+- A single function that cannot be minhashed no longer fails every batch holding it, on every run.
+  That is one smda cannot rebuild from its stored disassembly (for example an imported `xcfg`
+  holding only an offset), which failed `/complete_minhashes`, `/repair_minhashes`,
+  `/recalculate_minhashes` and `/recalculate_pichashes`, or one the shinglers fail on, from a
+  submitted report or an import, which failed the three minhash jobs, the last of them,
+  `/recalculate_minhashes`, after it had already dropped all hashes. Such a function is skipped and
+  stays unhashed, with a warning naming it, like one without disassembly, and the rest of its batch
+  is hashed.
+  `/recalculate_pichashes` does not stamp its sample as rehashed. `/repair_minhashes` leaves a
+  sample with such a function alone, keeping its minhashes and its stale mark, and counts it as
+  skipped. `/recalculate_minhashes` does not record such a sample as current, so a later repair
+  tries it again.
+
+- Deleting a sample or family, and `/repair_minhashes`, no longer fail on a stored minhash shorter
+  than the configured signature (or not a whole number of entries), as an earlier import could have
+  stored. It never had band entries and is skipped with a warning; before, the sample could not be
+  deleted through the API and every repair run stopped at it.
+
+- `/rebuild_index` no longer stops half way after having emptied the band collections when it meets
+  a function without a minhash field or with a minhash of the wrong length. Those functions are left
+  out with a warning and the rest is indexed.
+
+- `POST /import` limits what it decompresses. Compressed sample content is accepted only as deflate
+  (or stored) data and only up to 20 times its encoded size, or 8 MiB if that is more; anything
+  else is answered with 400 instead of growing the server by gigabytes. Exports of the live corpus
+  inflate to 4 times their encoded size at the median and 11.6 at most. A body that is not JSON is
+  now answered with 400 instead of 500. An export that compresses better than that has to be
+  imported uncompressed. The whole export is read before any sample is stored, so a refused import
+  leaves no sample or function behind.
+
+- A family is attributed to at most 64 actors. `PUT /families/{id}` answers 400 for a longer list,
+  and an import or a family rename that merges into another family adds the first actors that fit
+  and logs a warning for the rest. Deduplication of actor names now takes linear time instead of
+  quadratic. Families already holding more actors keep them.
+
+### Changed
+
+- **`POST /samples/binary` refuses `is_dump`, `bitness` and `base_addr` values it used to misread.**
+  `is_dump=yes` was read as false, so a dump was disassembled as an unmapped file; `bitness=16`
+  became 32 and an unparsable `base_addr` became 0, each without a word. They are now answered with
+  400 and nothing is enqueued. `is_dump` takes `true`/`True`/`1` or `false`/`False`/`0`, `bitness`
+  32 or 64, `base_addr` a hexadecimal address from 0 to 2**64 - 1, and a blank value (`is_dump=`)
+  still means the parameter is absent. A `filename` longer than 255 characters, a `family` or
+  `version` longer than 64, or any of them with a control character (a newline, a tab, a NUL, an
+  escape sequence) or a line separator, is refused the same way; other characters, spaces and
+  non-ASCII included, are stored as given, as before. A client that sent such a value and got a
+  sample anyway now has to correct it.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

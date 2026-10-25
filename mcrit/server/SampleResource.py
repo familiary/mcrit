@@ -1,6 +1,7 @@
 import hashlib
 import re
 import threading
+import unicodedata
 
 import falcon
 
@@ -143,7 +144,8 @@ class SampleResource:
 
     @timing
     def on_post_collection(self, req, resp):
-        # TODO 2019-05-07 verify integrity of SMDA report
+        # the report's shape is checked where it is read (addReportJson); that its sha256 belongs to
+        # its disassembly cannot be checked without the binary (#270)
         if not req.content_length:
             resp.data = jsonify(
                 {
@@ -155,7 +157,14 @@ class SampleResource:
             db_log_msg(self.index, req, "SampleResource.on_post_collection - failed - JSON not processible.")
             return
         username = req.get_header("username", default="anonymous")
-        summary = self.index.addReportJson(req.media, username=username)
+        try:
+            summary = self.index.addReportJson(req.media, username=username)
+        except ValueError as error:
+            # a report smda refuses as malformed, or one stating a sha256 that is not 64 hex digits
+            resp.data = jsonify({"status": "failed", "data": {"message": f"SMDA report rejected: {error}"}})
+            resp.status = falcon.HTTP_400
+            db_log_msg(self.index, req, "SampleResource.on_post_collection - failed - report rejected.")
+            return
         if summary is not None:
             resp.data = jsonify({"status": "successful", "data": summary})
             db_log_msg(self.index, req, "SampleResource.on_post_collection - success.")
@@ -175,18 +184,47 @@ class SampleResource:
             resp.status = falcon.HTTP_400
             db_log_msg(self.index, req, "SampleResource.on_post_submit_binary - failed - no POST body.")
             return
-        # TODO parse respective query fields -> escape / sanitize input
         filename = req.params["filename"] if "filename" in req.params else None
         family = req.params["family"] if "family" in req.params else None
         version = req.params["version"] if "version" in req.params else None
-        is_dump = True if ("is_dump" in req.params and req.params["is_dump"] in ["True", "true", "1", 1]) else False
+        # names are stored and shown as given, so only what no name holds is refused: control
+        # characters and line breaks, a filename longer than file systems allow, and a family or
+        # version longer than updating a sample allows. Format characters stay (a joiner is part of
+        # a word, and a sample's filename may well carry a right-to-left override)
+        for field, value, max_length in (("filename", filename, 255), ("family", family, 64), ("version", version, 64)):
+            if value is not None and (not isinstance(value, str) or len(value) > max_length or any(unicodedata.category(char) in ("Cc", "Cs", "Zl", "Zp") for char in value)):
+                resp.data = jsonify({"status": "failed", "data": {"message": f"{field} may be at most {max_length} characters, without control characters or line breaks."}})
+                resp.status = falcon.HTTP_400
+                db_log_msg(self.index, req, f"SampleResource.on_post_submit_binary - failed - invalid {field}.")
+                return
+        # a blank value (falcon keeps "?is_dump=" as an empty string) is as good as absent
+        is_dump = False
+        if req.params.get("is_dump"):
+            if req.params["is_dump"] not in ["True", "true", "1", "False", "false", "0"]:
+                resp.data = jsonify({"status": "failed", "data": {"message": "is_dump must be one of true, false, 1 or 0."}})
+                resp.status = falcon.HTTP_400
+                db_log_msg(self.index, req, "SampleResource.on_post_submit_binary - failed - invalid is_dump.")
+                return
+            is_dump = req.params["is_dump"] in ["True", "true", "1"]
         base_address = 0
-        if "base_addr" in req.params:
+        if req.params.get("base_addr"):
             try:
                 base_address = int(req.params["base_addr"], 16)
+                if not 0 <= base_address < 2**64:
+                    raise ValueError
             except ValueError:
-                pass
-        bitness = int(req.params["bitness"]) if ("bitness" in req.params and req.params["bitness"] in ["32", "64"]) else 32
+                resp.data = jsonify({"status": "failed", "data": {"message": "base_addr must be a hexadecimal address below 2**64."}})
+                resp.status = falcon.HTTP_400
+                db_log_msg(self.index, req, "SampleResource.on_post_submit_binary - failed - invalid base_addr.")
+                return
+        bitness = 32
+        if req.params.get("bitness"):
+            if req.params["bitness"] not in ["32", "64"]:
+                resp.data = jsonify({"status": "failed", "data": {"message": "bitness must be 32 or 64."}})
+                resp.status = falcon.HTTP_400
+                db_log_msg(self.index, req, "SampleResource.on_post_submit_binary - failed - invalid bitness.")
+                return
+            bitness = int(req.params["bitness"])
         # binary itself
         binary = req.stream.read()
         binary_sha256 = hashlib.sha256(binary).hexdigest()
