@@ -403,7 +403,14 @@ class Worker(QueueRemoteCallee):
             minhash_bits = self.config.MINHASH_CONFIG.MINHASH_SIGNATURE_BITS
             signature_bytes = self.config.MINHASH_CONFIG.MINHASH_SIGNATURE_LENGTH * (1 if minhash_bits <= 8 else 4)
             kept_entries = [entry for entry in function_entries if not entry.xcfg and entry.minhash]
-            kept = [entry.getMinHash(minhash_bits=minhash_bits) for entry in kept_entries if len(entry.minhash) == signature_bytes]
+            kept = []
+            for entry in kept_entries:
+                if len(entry.minhash) == signature_bytes:
+                    # rebuilt from its bytes, it would write an empty composition over the function's:
+                    # it takes the one read with the entry, as deleteMinHashesForSample clears it
+                    minhash = entry.getMinHash(minhash_bits=minhash_bits)
+                    minhash.shingler_composition = entry.minhash_shingle_composition or {}
+                    kept.append(minhash)
             if len(kept) != len(kept_entries):
                 LOGGER.warning(
                     "Repairing MinHashes: dropping %d minhashes of sample %d that are not %d bytes long and have no disassembly.",

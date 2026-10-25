@@ -492,7 +492,8 @@ class MemoryStorage(StorageInterface):
                 # no disassembly to compute it from again: kept, and banded again - unless it is of
                 # another length than the configured signature, which does not fit the band projection
                 if len(function_entry.minhash) == signature_bytes:
-                    self.addMinHash(minhash)
+                    # rebuilt from its bytes, it carries no composition: the function keeps its own
+                    self.addMinHash(minhash, keep_composition=True)
                 kept_sample_ids.add(function_entry.sample_id)
         return kept_sample_ids
 
@@ -748,7 +749,7 @@ class MemoryStorage(StorageInterface):
             self._pichashes[function_entry.pichash].add((function_entry.family_id, sample_entry.sample_id, function_entry.function_id))
         return function_entry
 
-    def addMinHash(self, minhash: "MinHash") -> bool:
+    def addMinHash(self, minhash: "MinHash", keep_composition: bool = False) -> bool:
         if minhash.function_id is None:
             return False
         is_query_function = minhash.function_id < 0
@@ -757,15 +758,16 @@ class MemoryStorage(StorageInterface):
             LOGGER.warning("addMinHash() - no function with id %d, skipping its minhash.", minhash.function_id)
             return False
         functions[minhash.function_id].minhash = minhash.getMinHash()
-        functions[minhash.function_id].minhash_shingle_composition = minhash.getComposition()
+        if not keep_composition:
+            functions[minhash.function_id].minhash_shingle_composition = minhash.getComposition()
         # query functions are not indexed into bands, they are only ever used as query input
         if not is_query_function:
             self._addMinHashToBands(minhash)
         return True
 
-    def addMinHashes(self, minhashes: List["MinHash"]) -> None:
+    def addMinHashes(self, minhashes: List["MinHash"], keep_composition: bool = False) -> None:
         for minhash in minhashes:
-            self.addMinHash(minhash)
+            self.addMinHash(minhash, keep_composition=keep_composition)
 
     def createMatchingCache(self, function_ids: List[int], allow_self_return: bool = False, previous: Optional[MatchingCache] = None) -> MatchingCache:
         # previous is accepted for interface compatibility; MemoryStorage serves from memory
