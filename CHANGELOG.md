@@ -22,7 +22,8 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   sample and releasing its binary, or while storing one, left files in the `sample_binaries`
   bucket that nothing deleted, and a deleted sample's id left on a binary shared with another
   sample kept that binary after the other was deleted too. The job deletes the binaries none of
-  whose samples exists, takes the ids of samples that are gone off the binaries that stay, and
+  whose samples exists, takes the ids of samples that are gone off the binaries that stay (and
+  deletes one that this leaves with none, its last sample having been deleted while it ran), and
   deletes chunks without a file document once they are an hour old, since younger ones may be a
   store still running. Its result counts each (`binaries`, `stale_sample_ids`, `chunk_files`).
   `dry_run` works as for `POST /delete_orphaned_queue_files`: it is required in the query string,

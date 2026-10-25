@@ -1415,7 +1415,11 @@ class MongoDbStorage(StorageInterface):
         read is found, and a sample submitted during the sweep keeps its binary. Sample ids are not
         reused, so an id found missing stays missing and can be taken off. A binary is deleted the way
         _releaseBinaryFile deletes one, retired by the update that checks no sample is on it, so a
-        submission of the same bytes racing the sweep either keeps it or stores a fresh copy."""
+        submission of the same bytes racing the sweep either keeps it or stores a fresh copy.
+
+        A binary is counted when this sweep's retirement matched it. GridFS's delete() does not say
+        whether the file was still there, so a binary that a release or a second sweep running at
+        the same time deleted as well can be counted by a sweep that did not delete it, or twice."""
         # taken before anything is read: a chunk group older than this was complete before the sweep began
         chunk_cutoff = datetime.datetime.now(datetime.UTC) - self._ORPHANED_BINARY_CHUNKS_MIN_AGE
         report: Dict[str, Any] = {"dry_run": dry_run, "binaries": 0, "stale_sample_ids": 0, "chunk_files": 0}
@@ -1444,10 +1448,13 @@ class MongoDbStorage(StorageInterface):
             stale = [sample_id for sample_id in sample_ids if self._canLookUpSampleId(sample_id) and sample_id not in existing]
             if len(stale) < len(sample_ids):
                 # still the binary of a sample: only the samples that are gone come off it, so that
-                # it goes with the last one that exists rather than staying on their account
-                report["stale_sample_ids"] += len(stale)
-                if stale and not dry_run:
-                    self._getBinaryFiles().update_one({"_id": file_id}, {"$pullAll": {"metadata.sample_ids": stale}})
+                # it goes with the last one that exists rather than staying on their account - or
+                # goes here, when that one was deleted after the file was read: its release saw the
+                # gone ids still on the file and kept it
+                if stale and not dry_run and self._retireAndDeleteOrphanedBinary(file_id, stale):
+                    report["binaries"] += 1
+                else:
+                    report["stale_sample_ids"] += len(stale)
             elif dry_run or self._retireAndDeleteOrphanedBinary(file_id, stale):
                 report["binaries"] += 1
             else:
@@ -1468,7 +1475,8 @@ class MongoDbStorage(StorageInterface):
         return existing
 
     def _retireAndDeleteOrphanedBinary(self, file_id, stale_sample_ids: List[Any]) -> bool:
-        """Delete a binary none of whose samples exists, unless a sample has been linked to it since it was read."""
+        """Take the samples that are gone off a binary, and delete it if that leaves none on it,
+        unless a sample has been linked to it since it was read. True when it was deleted."""
         if stale_sample_ids:
             self._getBinaryFiles().update_one({"_id": file_id}, {"$pullAll": {"metadata.sample_ids": stale_sample_ids}})
         # retired as in _releaseBinaryFile, and also when a release cleared the hash already and died

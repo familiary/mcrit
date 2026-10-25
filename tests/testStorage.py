@@ -1572,6 +1572,29 @@ class MongoDbStorageTest(MemoryStorageTest):
         self.assertEqual(b"MZ double", self.storage.getSampleBinary(sample_a))
         self.assertEqual(2, self._numStoredBinaries())
 
+    def testABinaryWhoseLastSampleIsDeletedDuringTheSweepGoesWithIt(self):
+        """A binary naming a gone sample and one that exists when it is read: the other is deleted
+        before the sweep takes the gone one off, and its release, seeing that one still on the file,
+        keeps it. The sweep's update then leaves no sample on it, and the sweep deletes it there,
+        rather than leaving it under its hash until the next sweep."""
+        self.storage.clearStorage()
+        sample_a, sample_b = self._addTwoSamples()
+        payload = b"MZ" + bytes(range(256)) * 2000
+        self.storage.storeSampleBinary(sample_a, payload)
+        self.storage.storeSampleBinary(sample_b, payload)
+        self._deleteSampleButNotItsBinary(sample_a)
+        look_up, storage = self.storage._existingSampleIds, self.storage
+
+        def look_up_then_delete_b(sample_ids):
+            existing = look_up(sample_ids)
+            storage.deleteSample(sample_b)
+            return existing
+
+        with patch.object(self.storage, "_existingSampleIds", side_effect=look_up_then_delete_b):
+            report = self.storage.deleteOrphanedSampleBinaries()
+        self.assertEqual({"dry_run": False, "binaries": 1, "stale_sample_ids": 0, "chunk_files": 0}, report)
+        self.assertEqual(0, self._numStoredBinaries())
+
     def _numBandEntries(self):
         db = self.storage._getDb()
         return sum(len(d.get("function_ids", [])) for band_id in range(self.storage._storage_config.STORAGE_NUM_BANDS) for d in db["band_%d" % band_id].find({}))
