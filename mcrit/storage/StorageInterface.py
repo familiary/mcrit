@@ -1,7 +1,8 @@
 import datetime
 import logging
 import random
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Protocol, Set, Tuple, Union
+import re
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Protocol, Set, Tuple, Union
 
 from packaging import version
 
@@ -43,6 +44,94 @@ BAND_DF_REFERENCE_CUTOFFS = (50, 100, 200, 500, 1000)
 # The largest cutoff a coverage report can be asked about: it is compared against df inside a
 # MongoDB aggregation, and BSON integers are signed 64-bit, so a larger one cannot be encoded.
 BAND_DF_CUTOFF_MAX = 2**63 - 1
+
+
+_SHA256_PATTERN = re.compile("[0-9a-fA-F]{64}")
+
+
+def isSha256(value) -> bool:
+    """Whether value has the shape of a SHA256, 64 hex digits"""
+    return isinstance(value, str) and _SHA256_PATTERN.fullmatch(value) is not None
+
+
+class BandDfSkips:
+    """What the band df cutoff left out of one job's candidate generation (#201).
+
+    A candidate lookup that is handed one counts into it while it runs: every (query function,
+    band) pair it looks up, and those whose band hash it skipped for a posting list longer than
+    the cutoff, with that list's length. The coverage report says how much of the index a cutoff
+    skips; this says how much of one query it skipped, which is where a cutoff that has started
+    to bite shows first.
+
+    Counts are per query function id. A single-function lookup (getCandidatesForMinHash) counts
+    under function id 0, so per-function counts are only meaningful for one such call per object.
+    """
+
+    def __init__(self) -> None:
+        self.band_lookups = 0
+        self.band_lookups_skipped = 0
+        # band hits not fetched, summed per skipped lookup: a hash skipped for three query
+        # functions counts its df three times
+        self.postings_skipped = 0
+        self._bands_per_function: Dict[int, int] = {}
+        self._skipped_per_function: Dict[int, int] = {}
+        # why the skips could not be counted, or None when they were
+        self.unmeasured_reason: Optional[str] = None
+        # False when the lookup could not be handed this object at all, so not even the lookups
+        # were counted
+        self.lookups_counted = True
+
+    def addLookups(self, function_id: int, num_bands: int) -> None:
+        self.band_lookups += num_bands
+        self._bands_per_function[function_id] = self._bands_per_function.get(function_id, 0) + num_bands
+
+    def addSkipped(self, function_ids: Iterable[int], df: int) -> None:
+        """The band hash of a posting list `df` long was skipped for each of these query functions."""
+        for function_id in function_ids:
+            self.band_lookups_skipped += 1
+            self.postings_skipped += df
+            self._skipped_per_function[function_id] = self._skipped_per_function.get(function_id, 0) + 1
+
+    def markUnmeasured(self, reason: str) -> None:
+        self.unmeasured_reason = reason
+
+    def merge(self, other: "BandDfSkips") -> None:
+        self.band_lookups += other.band_lookups
+        self.band_lookups_skipped += other.band_lookups_skipped
+        self.postings_skipped += other.postings_skipped
+        for mine, theirs in ((self._bands_per_function, other._bands_per_function), (self._skipped_per_function, other._skipped_per_function)):
+            for function_id, count in theirs.items():
+                mine[function_id] = mine.get(function_id, 0) + count
+        self.unmeasured_reason = self.unmeasured_reason or other.unmeasured_reason
+        self.lookups_counted = self.lookups_counted and other.lookups_counted
+
+    def queryFunctionsCutOff(self, band_matches_required: int) -> int:
+        """Query functions the cutoff left with fewer unskipped bands than band_matches_required.
+
+        No corpus function can collect enough band hits to become such a function's candidate, so
+        the fuzzy path cannot find it at all; only PicHash can. A necessary condition only: a
+        function left with enough bands may still not collide on them. Only a requirement the
+        function could meet with every band counts: above its band count it is unfindable with or
+        without the cutoff, and that is not the cutoff's doing.
+        """
+        required = max(1, band_matches_required)
+        cut_off = 0
+        for function_id, skipped in self._skipped_per_function.items():
+            bands = self._bands_per_function.get(function_id, 0)
+            cut_off += skipped > 0 and required <= bands and bands - skipped < required
+        return cut_off
+
+    def toDict(self, band_matches_required: int = 1) -> Dict[str, Any]:
+        measured = self.unmeasured_reason is None
+        return {
+            "band_df_skips_measured": measured,
+            "band_df_skips_unmeasured_reason": self.unmeasured_reason,
+            "band_lookups": self.band_lookups if self.lookups_counted else None,
+            "band_lookups_skipped": self.band_lookups_skipped if measured else None,
+            "postings_skipped": self.postings_skipped if measured else None,
+            "query_functions_with_skipped_bands": len(self._skipped_per_function) if measured else None,
+            "query_functions_cut_off": self.queryFunctionsCutOff(band_matches_required) if measured else None,
+        }
 
 
 class BinaryStream(Protocol):
@@ -102,13 +191,14 @@ class StorageInterface:
         raise NotImplementedError
 
     # -> Set[function_id]
-    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None) -> Set[int]:
+    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None, skips: Optional[BandDfSkips] = None) -> Set[int]:
         """Given a MinHash, return all candidates from all matching bands.
 
         Args:
             minhash: a MinHash
             band_matches_required: the number of bands a minhash needs to match before being considered a candidate
             band_df_cutoff: skip band hashes held by more functions than this; None uses STORAGE_BAND_DF_CUTOFF, 0 means no cutoff
+            skips: counts the lookups and what the cutoff skipped of them, when given (#201)
 
         Returns:
             candidates: a set of function_ids
@@ -116,13 +206,16 @@ class StorageInterface:
         raise NotImplementedError
 
     # -> Dict[function_id, Set[function_id]]
-    def getCandidatesForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None) -> Dict[int, Set[int]]:
+    def getCandidatesForMinHashes(
+        self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None, skips: Optional[BandDfSkips] = None
+    ) -> Dict[int, Set[int]]:
         """Given MinHashes by function_id, return all candidates from all matching bands.
 
         Args:
             function_id_to_minhash: a dict mapping a function_id to a MinHash.
             band_matches_required: the number of bands a minhash needs to match before being considered a candidate
             band_df_cutoff: skip band hashes held by more functions than this; None uses STORAGE_BAND_DF_CUTOFF, 0 means no cutoff
+            skips: counts the lookups and what the cutoff skipped of them, when given (#201)
 
         Returns:
             candidates: a dict mapping a function_id to a set of candidate function_ids.
@@ -168,7 +261,20 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False) -> Optional["SampleEntry"]:
+    def getPresentSha256s(self, sha256s: Iterable[str]) -> Set[str]:
+        """Which of the given SHA256 values a stored sample (not a query sample) has, in as few round
+        trips as the storage allows - an import checks every sample of an export at once.
+
+        Args:
+            sha256s: The SHA256 values to look up. Any that is not 64 hex digits matches nothing and
+                is not looked up, so that no value can make a lookup too large to send.
+
+        Returns:
+            The subset of sha256s that samples are stored under.
+        """
+        raise NotImplementedError
+
+    def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False, sha256_verified=False) -> Optional["SampleEntry"]:
         """Add a SMDA report to storage to create its sample representation and return corresponding SampleEntry object.
         This also adds the sample's functions. If the sample's family is not in storage yet, it will be added.
         If a sample with the same SHA256 already exists in storage, smda_report is not added and None is returned.
@@ -176,6 +282,8 @@ class StorageInterface:
         Args:
             smda_report: the SmdaReport to add to the storage
             isQuery: True if this SmdaReport is associated with a matching query and its data shall not be persisted in the main DB
+            sha256_verified: True only if MCRIT disassembled smda_report itself from bytes of its sha256, rather than
+                taking the report as submitted (#270); recorded on the sample, ignored for a query
 
         Returns:
             A SampleEntry corresponding to smda_report or None, if SmdaReport was already added.
@@ -202,6 +310,7 @@ class StorageInterface:
     def importSampleEntry(self, sample_entry: "SampleEntry") -> Optional["SampleEntry"]:
         """Import a sample_entry to storage based on a previously exported SampleEntry.
         We assume that the family_id was already remapped by the MinHashIndex, meaning that only the sample_id needs to be adjusted
+        The sample is stored as sha256_verified False, whatever the export states: this instance has not seen its bytes.
         If a sample with the same SHA256 already exists in storage, sample_entry is not added and None is returned.
 
         Args:
@@ -213,10 +322,24 @@ class StorageInterface:
         raise NotImplementedError
 
     def discardImportedSample(self, sample_entry: "SampleEntry") -> None:
-        """Undo importSampleEntry for an import that failed: the sample, the functions it got, and its family counters.
+        """Undo importSampleEntry for an import that failed: the sample, the functions it got with
+        their minhashes and index entries, and its family counters.
 
         Args:
             sample_entry: the entry importSampleEntry returned
+        """
+        raise NotImplementedError
+
+    def discardImportedFamily(self, family_id: int) -> bool:
+        """Undo ensureFamily for an import that failed, once its samples are discarded: the family
+        is deleted only while no sample is filed under it, so that one another writer filed there
+        meanwhile keeps its family.
+
+        Args:
+            family_id: a family ensureFamily reported as added by this import
+
+        Returns:
+            True if the family was deleted
         """
         raise NotImplementedError
 
@@ -249,7 +372,8 @@ class StorageInterface:
 
         Args:
             family_id: the id of the sample to modify
-            update_information: a dictionary with update information for fields (family_name, is_library)
+            update_information: a dictionary with update information for fields (family_name, is_library, actors);
+                a rename onto an existing family merges this family's actors and tags into it
 
         Returns:
             True if family_id was contained in the storage and updated successfully, False otherwise
@@ -281,6 +405,54 @@ class StorageInterface:
         """
         raise NotImplementedError
 
+    def addTags(self, entity: str, entity_id: int, tags: List[str]) -> Optional[List[str]]:
+        """Add tags to a family, sample or function (#53); tags it already carries are kept once
+
+        Args:
+            entity: "family", "sample" or "function"
+            entity_id: the id of the entity; query samples and functions (negative ids) carry no tags
+            tags: the tags to add, normalised through mcrit.libs.tags.normalizeTags
+
+        Returns:
+            the entity's tags after the change, or None if there is no such entity
+
+        Raises:
+            ValueError: for an unknown entity or a list that holds an invalid tag, before anything is written
+            TagLimitError: (a ValueError) when the entity would carry more than mcrit.libs.tags.MAX_TAGS_PER_ENTITY
+                tags afterwards; nothing is added, and the check and the write are one atomic step
+        """
+        raise NotImplementedError
+
+    def removeTags(self, entity: str, entity_id: int, tags: List[str]) -> Optional[List[str]]:
+        """Remove tags from a family, sample or function (#53); tags it does not carry are ignored
+
+        Args:
+            entity: "family", "sample" or "function"
+            entity_id: the id of the entity; query samples and functions (negative ids) carry no tags
+            tags: the tags to remove, normalised through mcrit.libs.tags.normalizeTags
+
+        Returns:
+            the entity's tags after the change, or None if there is no such entity
+
+        Raises:
+            ValueError: for an unknown entity or a list that holds an invalid tag, before anything is written
+        """
+        raise NotImplementedError
+
+    def getTagCounts(self, entity: str) -> Dict[str, int]:
+        """The distinct tags on one kind of entity (#53)
+
+        Args:
+            entity: "family", "sample" or "function"
+
+        Returns:
+            each tag mapped to the number of entities that carry it, ordered by tag
+
+        Raises:
+            ValueError: for an unknown entity
+        """
+        raise NotImplementedError
+
     def deleteSample(self, sample_id: int) -> bool:
         """Remove a sample from the storage, also removes all functions of the sample.
         All minhashes will be removed from the bands.
@@ -290,6 +462,93 @@ class StorageInterface:
 
         Returns:
             True if sample_id was contained in the storage and deleted successfully, False otherwise
+        """
+        raise NotImplementedError
+
+    def getFunctionPicHashesBySampleId(self, sample_id: int) -> Dict[int, int]:
+        """The PicHash of each of a sample's functions by offset, read without their disassembly (#270).
+
+        Args:
+            sample_id: the id of the sample
+
+        Returns:
+            {offset: pichash}, empty for an unknown sample
+        """
+        raise NotImplementedError
+
+    # Replacing a sample indexed from a submitted report by the disassembly of its binary (#270).
+    #
+    # One job at a time holds a claim on the sample, recorded with it so that it holds across
+    # workers: claimSampleVerification, renewed by renewSampleVerification at each phase. The job
+    # stages the new analysis where no reader looks (stageSampleAnalysis), then swaps it in under
+    # the sample's id (swapSampleAnalysis). Every step of both checks the claim first, so a job
+    # that lost it - to deleteSample, which takes it over, or to an upload that judged it dead -
+    # stops, and removes what it wrote that no one else would.
+
+    def getSampleVerificationClaim(self, sample_id: int) -> Optional[Dict[str, Any]]:
+        """The claim held on a sample: {"token", "job_id", "claimed_at" (epoch seconds), "swap_started"}, or None."""
+        raise NotImplementedError
+
+    def claimSampleVerification(self, sample_id: int, token: str, job_id: Optional[str], stale_after: float, dead_token: Optional[str] = None) -> str:
+        """Claim an unverified sample for replacing its analysis by its binary's.
+
+        A claim is taken over when it is older than stale_after seconds, or when its token is
+        dead_token, which the caller passes once it has found the job holding it finished or
+        failed. What the job before staged is discarded then, unless it had begun the swap,
+        which is to be finished instead.
+
+        Args:
+            sample_id: the id of the sample
+            token: identifies the claiming job in the calls that follow
+            job_id: the queue job the claim is held for, recorded for the next claimant to check
+            stale_after: seconds after which another job's claim counts as abandoned
+            dead_token: a claim token known to belong to a job that ended
+
+        Returns:
+            "claimed" when token now holds the claim; "resume" when it does, and the job before
+            had begun to swap in an analysis that swapSampleAnalysis has to finish; "verified"
+            when the sample is verified already, "busy" when another job holds a live claim,
+            "missing" when there is no such sample.
+        """
+        raise NotImplementedError
+
+    def renewSampleVerification(self, sample_id: int, token: str) -> bool:
+        """Date a claim to now; False if token no longer holds it."""
+        raise NotImplementedError
+
+    def releaseSampleVerification(self, sample_id: int, token: str) -> None:
+        """Give up a claim without changing the sample. What was staged under it is discarded,
+        unless its swap had begun, which stays recorded for the next upload to finish at once.
+        A claim token no longer holds is left alone."""
+        raise NotImplementedError
+
+    def stageSampleAnalysis(self, sample_id: int, smda_report: "SmdaReport", token: str) -> bool:
+        """Store smda_report's functions, disassembly and extras for a claimed sample where no
+        reader sees them, recorded on the sample; a failure discards them.
+
+        Returns:
+            False when token does not hold the claim (anything staged is discarded then)
+        """
+        raise NotImplementedError
+
+    def swapSampleAnalysis(self, sample_id: int, token: str, filename: Optional[str] = None, family: Optional[str] = None, version: Optional[str] = None) -> Dict[str, Any]:
+        """Swap the analysis staged for a claimed sample in for its current one, keeping its sample_id.
+
+        The new functions are stored under the sample first, carrying over the labels of the
+        functions at the same offset relative to the base address, as they are right before the
+        old ones go; then the old functions go with everything derived from them (band entries,
+        pichash counts, the picblockhash index, function ranges, disassembly); then the sample
+        takes the new analysis' fields and is marked sha256_verified. Until then a reader may
+        see both function sets under the sample, never none. filename, family and version
+        replace the sample's when given; otherwise, and for is_library and component, it keeps
+        what it holds when the swap ends. The new functions are unhashed. Family counters move
+        by the functions actually written and removed.
+
+        Returns:
+            {"status": "replaced", "old_num_functions", "new_num_functions", "labels_carried",
+            "labels_dropped"}; {"status": "sample_deleted"} when the sample was deleted meanwhile,
+            with nothing of the new analysis left behind; {"status": "claim_lost"} when another
+            job took the claim over.
         """
         raise NotImplementedError
 
@@ -407,14 +666,29 @@ class StorageInterface:
         assert smda_report is not None
         return RebuiltSmdaReport(smda_report, extras_missing=smda_extras is None, num_functions_without_disassembly=num_functions_without_disassembly)
 
-    def getFunctionsBySampleId(self, sample_id: int) -> Optional[List["FunctionEntry"]]:
+    def getFunctionsBySampleId(self, sample_id: int, with_xcfg: bool = True) -> Optional[List["FunctionEntry"]]:
         """For a given sample_id, get all corresponding FunctionEntries.
 
         Args:
             sample_id: a sample_id
+            with_xcfg: False leaves each entry's disassembly (xcfg) out - most of what a function
+                weighs, and nothing matching reads
 
         Returns:
             A list of FunctionEntries or None, if sample_id does not exist
+        """
+        raise NotImplementedError
+
+    def getFunctionsBySampleIdInBatches(self, sample_id: int, batch_size: int = 1000) -> Iterator[List["FunctionEntry"]]:
+        """getFunctionsBySampleId one batch at a time, for a caller that should not hold all entries of a large sample at
+        once (the export).
+
+        Args:
+            sample_id: a sample_id
+            batch_size: the number of FunctionEntries per batch
+
+        Returns:
+            An iterator over lists of FunctionEntries, empty if sample_id does not exist
         """
         raise NotImplementedError
 
@@ -471,19 +745,8 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO remove this?
-    def clearMatchingCache(self) -> None:
-        """Clears the temporary matching cache
-
-        Returns:
-            None
-        """
-        raise NotImplementedError
-
-    # TODO: make a MatchingCacheInterface for all backends.
-    # TODO rename -> get?
     def createMatchingCache(self, function_ids: List[int], allow_self_return: bool = False, previous: Optional["MatchingCache"] = None) -> "MatchingCache":
-        """Creates a temporary matching cache, for a list of function_ids
+        """Create a temporary matching cache for a list of function_ids.
 
         Args:
             function_ids: list of function ids
@@ -538,12 +801,13 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO check if a minhash can ever not have a function id
-    def addMinHash(self, minhash: "MinHash") -> bool:
+    def addMinHash(self, minhash: "MinHash", keep_composition: bool = False) -> bool:
         """Add a MinHash object to the respective functions in storage.
 
         Args:
             minhash: the minhash to add
+            keep_composition: leave the shingle composition stored with the function as it is,
+                instead of writing the one the MinHash carries
 
         Returns:
             True if the the respective function exists, and the MinHash could be added,
@@ -551,29 +815,37 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    def addMinHashes(self, minhashes: List["MinHash"]) -> None:
+    def addMinHashes(self, minhashes: List["MinHash"], keep_composition: bool = False) -> None:
         """Add multiple MinHash objects at once. MinHashes, that cannot be added
         (e.g. because of missing function ids) will be ignored.
 
         Args:
             minhashes: the list of MinHash objects to add
+            keep_composition: leave the shingle compositions stored with the functions as they are,
+                instead of writing the ones the MinHashes carry - for MinHashes rebuilt from the
+                bytes a function was stored with, such as an import's, which carry none
 
         Returns:
             None
         """
         raise NotImplementedError
 
-    # TODO dict of what?
     def getContent(self) -> Dict[str, Any]:
+        """Return a JSON-compatible storage snapshot.
+
+        The mapping contains ``families``, ``samples`` and ``functions`` keyed by their IDs and
+        ``bands`` keyed by band number, then band hash. It also has ``smda_extras`` and
+        base64-encoded ``sample_binaries``, which older snapshots may omit.
+
+        Only MemoryStorage implements this; MongoDbStorage raises NotImplementedError.
+        """
         raise NotImplementedError
 
-    # TODO dict of what?
-    def addContent(self, content: Dict[str, Any]) -> None:
-        # remaps ids, filters sha256
-        raise NotImplementedError
-
-    # TODO dict of what?
     def setContent(self, content: Dict[str, Any]) -> None:
+        """Replace storage from a snapshot mapping returned by :meth:`getContent`.
+
+        Only MemoryStorage implements this; MongoDbStorage raises NotImplementedError.
+        """
         raise NotImplementedError
 
     def addFamily(self, family_name: str) -> int:
@@ -586,6 +858,23 @@ class StorageInterface:
             family_id of the added (or already existing) family name
         """
         raise NotImplementedError
+
+    def ensureFamily(self, family_name: str) -> Tuple[int, bool]:
+        """Add family, if not already known, and say whether this call added it (#299). An import
+        removes the families it added should it fail, so a backend that two writers share has to
+        decide this atomically - of two writers adding one name, only one may be told it did. This
+        default looks the name up and then adds it, which is atomic only for a single writer.
+
+        Args:
+            family_name: The name of the family to add
+
+        Returns:
+            family_id of the added (or already existing) family name, and True when this call added it
+        """
+        family_id = self.getFamilyId(family_name)
+        if family_id is not None:
+            return family_id, False
+        return self.addFamily(family_name), True
 
     def deleteOrphanedQueryData(self) -> Dict[str, int]:
         """Delete the query functions whose query sample is gone and the query disassembly whose
@@ -687,7 +976,6 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO find out if it is really possible that a Function Object has no MinHash.
     def getMinHashByFunctionId(self, function_id: int) -> Optional[bytes]:
         """Get the MinHash's bytes of a function, if the function exists and has a MinHash object.
 
@@ -700,17 +988,17 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO can this happen, that the Function has no pichash?
-    # TODO Maybe remove this function, or restore original behavior?
-    # -> Dict[pichash, Set[Tuple[sample_id, function_id]]]
+    # -> Dict[pichash, Set[Tuple[family_id, sample_id, function_id]]]
     def getPicHashMatchesByFunctionId(self, function_id: int) -> Optional[Dict[int, Set[Tuple[int, int, int]]]]:
-        """Get the PicHash for a given function_id and also return all other sample_id/function_id pairs having the same PicHash
+        """Get the PicHash for a given function_id and also return all functions having the same PicHash
 
         Args:
             function_id: the function id for PicHash matching
 
         Returns:
-            None if the function_id does not exist, or does not have a pichash. Otherwise a dict containing the functions pichash as key and the following value: a set of (sample_id, function_id) having the given pichash
+            None if the function_id does not exist, or does not have a pichash (a function whose report
+            carried none is stored with 0). Otherwise a dict containing the functions pichash as key and
+            the following value: a set of (family_id, sample_id, function_id) having the given pichash
         """
         raise NotImplementedError
 
@@ -776,7 +1064,7 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    def getStats(self, with_pichash=True) -> Dict[str, Union[int, Dict[int, int]]]:
+    def getStats(self, with_pichash: bool = True) -> Dict[str, Any]:
         """Get statistics for the stored data, as a dict with counts per type of entry.
 
         Args:
@@ -838,7 +1126,8 @@ class StorageInterface:
 
         Args:
             sample_ids: a list of sample_ids
-            progress_reporter: (optional) might be passed by worker to inquiry progress of this DB only operation
+            progress_reporter: (optional) a UniqueBlocksProgressReporter, as Worker.getUniqueBlocks passes
+                it, whose phases this fills, or any reporter with set_total, step and poll
 
         Returns:
             a dictionary with the isolated blocks
@@ -873,6 +1162,11 @@ class StorageInterface:
 
     def findFunctionByString(self, search_tree: NodeType, cursor: Optional[FullSearchCursor] = None, max_num_results: int = 100) -> Dict[int, "FunctionEntry"]:
         """Given a parsed search tree, return all FunctionEntry objects that match the terms we are searching.
+        A plain search term matches the function name and the labels that differ from it (#301): "term"
+        finds a function named so or labelled so before a rename, "NOT term" one that neither its name
+        nor any such label matches. "function_name:?term" is the name alone. Every label is searched by
+        its stored path, as every field is: "function_labels.function_label:?term" (substring),
+        "function_labels.function_label:term" (exact), "function_labels.username:term".
 
         Args:
             search_tree: a parsed SearchQueryTree
@@ -968,10 +1262,10 @@ class StorageInterface:
     def getBandDfCutoffCoverage(self, band_df_cutoff: Optional[int] = None, progress_reporter=None) -> Dict[str, Any]:
         """Measure how much of the band index STORAGE_BAND_DF_CUTOFF skips, per band and in total.
 
-        The cutoff drops a band hash whose posting list is longer than it, and nothing on the query
-        path says how much that is: counting skipped postings per lookup would roughly double each
-        lookup's index work. This is the offline answer - how many band hashes and postings there
-        are, and how many of them sit in posting lists over the cutoff. As the corpus grows, posting
+        The cutoff drops a band hash whose posting list is longer than it. Each matching report
+        counts what that skipped of its own query (BandDfSkips, `info.matching.candidate_generation`);
+        this is the corpus-wide answer - how many band hashes and postings there are, and how many
+        of them sit in posting lists over the cutoff. As the corpus grows, posting
         lists lengthen and a fixed cutoff skips a growing share; this is how that becomes visible.
 
         Args:
@@ -1121,9 +1415,30 @@ class StorageInterface:
         the rest of the index; how many functions had one (#142)."""
         raise NotImplementedError
 
-    def setMinHashVersionForSamples(self, smda_version: str, sample_ids: Optional[List[int]] = None, except_sample_ids: Optional[Iterable[int]] = None) -> None:
+    def setMinHashVersionForSamples(
+        self, smda_version: str, sample_ids: Optional[List[int]] = None, except_sample_ids: Optional[Iterable[int]] = None, finish_pending: bool = False
+    ) -> None:
         """Record which smda escaped the minhashes of the samples (all when None) (#142), and at
-        which shingler revision they were computed (#238); except_sample_ids are left as they are."""
+        which shingler revision they were computed (#238); except_sample_ids are left as they are.
+        With finish_pending, the samples also stop being pending (getSamplesWithPendingMinHashes):
+        only the callers that also drop their disassembly where configured finish a sample. Without
+        it, a pending sample stays pending as stored by this smda and the running shingler revision:
+        every caller stamps only once it rehashed all of the sample's functions it could."""
+        raise NotImplementedError
+
+    def getSamplesWithPendingMinHashes(self, threshold_version: str) -> List[int]:
+        """The samples nothing has finished since they were stored - submitted with deferred
+        hashing, or still waiting for (or having lost) their minhash job - by an smda at or above
+        the escaper compatibility threshold and the running shingler revision.
+        setMinHashVersionForSamples with finish_pending ends a sample's wait; imported samples and
+        those stored before the marker existed never wait."""
+        raise NotImplementedError
+
+    def getSamplesWithUnhashedFunctions(self, sample_ids: List[int]) -> Set[int]:
+        """Those of sample_ids that still hold a function large enough to hash, without a minhash,
+        whose disassembly is stored - one that has none cannot be hashed (repairMinHashes skips it
+        as well). Answered from the function ids, minhashes and sizes, and whether a disassembly is
+        stored, without loading function documents or disassembly."""
         raise NotImplementedError
 
     def getSamplesWithStaleMinHashes(self, threshold_version: str) -> List[int]:
@@ -1175,9 +1490,11 @@ class StorageInterface:
         raise NotImplementedError
 
     def createBandhashProjection(self, minhash):
-        """Calculate a projection for index permutation based on a given minhash
+        """Calculate a projection for index permutation from the configuration
         Args:
-            minhash: the MinHash used as reference
+            minhash: unused - the projection depends on the configuration alone. It used to be drawn
+                from the length of this minhash, so whichever minhash a process banded first (an
+                imported one included) decided the band keys of every later one.
         Returns:
             a dict containing signature indices used for bandhashing by band id
         """
@@ -1188,7 +1505,7 @@ class StorageInterface:
             band_index = 0
             for band_size, num_bands in self._storage_config.STORAGE_BANDS.items():
                 for _ in range(num_bands):
-                    index_sequence = [index for index in range(len(minhash.getMinHashInt()))]
+                    index_sequence = [index for index in range(self._minhash_config.MINHASH_SIGNATURE_LENGTH)]
                     random.shuffle(index_sequence)
                     band_projection[band_index] = index_sequence[:band_size]
                     band_index += 1
@@ -1258,3 +1575,10 @@ class StorageInterface:
             hashed_band_data = MinHash.hashData(band_data, 0)
             band_hashes[band_index] = hashed_band_data
         return band_hashes
+
+    def _hasBandableLength(self, minhash_bytes: bytes) -> bool:
+        """Whether a stored minhash can have band entries. Imports stored minhashes unchecked, and one
+        shorter than the configured signature, or not a whole number of >8-bit entries, never had any:
+        reading or banding it raises, so deleting or repairing its sample has to skip it."""
+        entry_size = 1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4
+        return len(minhash_bytes) % entry_size == 0 and len(minhash_bytes) >= entry_size * self._minhash_config.MINHASH_SIGNATURE_LENGTH

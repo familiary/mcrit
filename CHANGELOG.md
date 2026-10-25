@@ -15,6 +15,901 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Added
+
+- **Four opt-in options for the unique-blocks cover** ([#283]), the other directions the issue
+  proposes, so they can be evaluated against the current cover before any of them becomes a default.
+  All are off by default and leave the cover unchanged unless given. `gentle_length_score` lets
+  blocks past 11 instructions lose length score as 11 / length rather than 1 / (length - 10): a
+  12-instruction block's length score is about 92 instead of 50, so it no longer ranks below a
+  4-instruction block (57). `max_blocks_per_function` caps how many blocks one function of one
+  sample adds to the cover. `demote_generic_blocks` ranks function exits (a block ending in a return
+  that only restores registers and the stack, calls, checks the stack cookie or sets the return
+  value to zero, -1, a flag, a register, a small constant or a local) and blocks that are at least
+  half wildcards behind every other block reaching as many samples; the heuristic is Intel-centric.
+  `exclude_picblockhashes` is a negative set, for siblings that are not in the index: it goes in the
+  body of a POST to either `/uniqueblocks` route, the job stores it as a file rather than in its
+  arguments, and `mcrit.storage.UniqueBlocksResult.picBlockHashesOfReport` computes it from an SMDA
+  report locally. The first three are query parameters on both routes, all four are arguments of
+  `McritClient.requestUniqueBlocksForSamples` and `requestUniqueBlocksForFamily`, and the result's
+  statistics always echo the first three, even when off, and count the blocks the negative set
+  removed. Over the REST API and `McritClient`, an empty negative set and a cap of 0 make the same
+  job as leaving them out. `UniqueBlocksResult.generateBlockCover` takes the cap and the demotion
+  from those statistics, so given the job's `covers_required` and no size filters, the rule MCRITweb
+  renders is the one the job picked.
+
+- **Families, samples and functions carry `tags`**, free labels such as `packed`, `reviewed` or
+  the namespaced `source:vt`. `POST /{families|samples|functions}/{id}/tags` adds and `DELETE` on
+  the same path removes the tags named in a JSON body `{"tags": [...]}`; both answer the entity's
+  resulting tags, 404 for an unknown id (query samples and functions carry no tags) and 400 for
+  a malformed body or an invalid tag, without writing any of the list. There is deliberately no
+  replace-all, so two analysts tagging the same entity at once cannot erase each other's tags,
+  and no per-tag author. `GET /tags?entity=family|sample|function` answers the distinct tags with
+  how many entities carry each. `McritClient.addTags(entity, entity_id, tags)`,
+  `removeTags(...)` and `getTags(entity)` wrap them, and refuse an unknown entity before sending.
+  - A tag is stripped and lower-cased, then has to be 1-64 letters, digits, spaces, dots, colons,
+    underscores or dashes starting with a letter or digit - so `$where` or an empty tag is
+    refused rather than stored.
+  - One request names at most 100 tags, counted as sent and before any is looked at, and an
+    entity carries at most 256; both answer 400 naming the cap, and an add past the entity cap
+    adds none of its tags. MongoDB checks the entity cap in the write that adds the tags (a
+    `$expr` on the size of the union of stored and new tags in the update's filter), so two
+    concurrent adds cannot pass it together, and re-adding tags an entity at the cap carries is
+    not refused. The caps are `MAX_TAGS_PER_REQUEST` and `MAX_TAGS_PER_ENTITY` in
+    `mcrit.libs.tags`. Without them one POST of 60,000 tags took ~30 s, since the list was
+    deduplicated in quadratic time, and grew the document towards MongoDB's 16 MB limit; the
+    deduplication is linear now, and the request log names the number of tags, not the tags.
+  - `GET /tags` is not paginated: the answer holds one entry per distinct tag, so it grows with
+    the tag vocabulary (at most 64 characters a tag), not with the number of tagged entities,
+    and every page would have to count all tagged entities again. The entities carrying one tag
+    are found by the paginated search `tags:<tag>`.
+  - The search takes `tags:packed` (or `tag:packed`) for "some tag is packed", `tags:!=packed`
+    (or `NOT tag:packed`) for "no tag is packed" and `tags:?pack` for a substring, MongoDB's own
+    semantics for an array field, which the in-memory storage now follows for list fields too.
+    The value is normalised like a tag, so `tag:Packed` finds `packed`. A plain search term does
+    not look at tags, so existing searches find what they found before.
+  - A rename takes the family's tags along, as it does its actors: onto an unused name they move
+    with it, onto an existing family they are merged into that family's, behind its own. Renaming
+    family 0 (the unknown family) copies them instead, because family 0 stays and keeps its tags.
+    A merge is not capped at 256, since a rename is no tagging request to refuse and dropping
+    tags would lose them; a family merged past the cap takes no new tag until some are removed.
+    Moving a sample to another family moves none: family tags stay on the family, and go with it
+    when its last sample leaves and it is deleted, as its actors do.
+  - Exports carry sample and function tags in their entries and family tags as `family_tags`,
+    which an import merges into what the target knows; an older importer ignores the key. Tags
+    of a sample the target already holds are not merged, because the import skips that sample
+    as a whole. An imported tag this instance would not accept is dropped, not the import, and
+    so are those past the entity cap: an entity keeps the first that fit, in the exported order.
+  - A function's dict - its REST answer, an export entry, a report - leaves `tags` out while the
+    function carries none, instead of an empty list in every function of a whole-corpus export
+    (~12 bytes each). Read it with a default, as `FunctionEntry.fromDict` does. Families and
+    samples always carry the key.
+  - **Stored data**: entities stored before read as untagged, so there is no migration. MongoDB
+    gets a `tags` index on `families`, `samples` and `functions`, built by the first start after
+    the upgrade, which waits for it. The one on `functions` is sparse and function documents leave
+    the field out while it is empty, so the index holds the tagged functions only; its first build
+    on an existing corpus still reads every function document once, but adds no entries.
+    `tags:!=x` has to look at every entity on either backend, as a negated condition on any field
+    does ([#53]).
+
+- **`docs/api_reference.md`, a REST API reference generated from the route table**, listing
+  every route with its methods, what it does and the `McritClient` method that calls it.
+  `python -m mcrit.server.api_reference` rewrites it (`--check` exits 1 when it is stale), every
+  responder now carries the docstring it is described by, and `tests/testApiReference.py` fails
+  when the committed file no longer matches the code, when a route is undocumented, or when a
+  public client method has no docstring or return annotation. Every public `McritClient` method
+  is now typed and documented with the route it calls ([#54]).
+
+- **`QUEUE_TRANSIENT_JOB_RETENTION_SECONDS` (default 0, off) expires finished ingestion and
+  maintenance jobs (#294).** With a positive value, the queue clean-up deletes such jobs that
+  finished longer ago than that, then their GridFS result and file parameters; a pass deletes at
+  most 1,000, oldest first. Matching, query, cross compare, unique-block and
+  `getBandDfCutoffCoverage` jobs, unknown methods, and failed or terminated jobs are never expired
+  by it. At the default nothing is deleted, as before. A deleted job costs about 7 ms, so a full
+  1,000-job pass takes about 7 s on a local mongod. Queue start creates an index on `payload.method`
+  and `finished_at` for the clean-up query, which takes a moment on a large queue. `finished_at` is
+  naive local time, so keep the retention well above any clock or time zone offset between hosts. A
+  deployment that ships its own config modules needs the setting added; without it the default
+  applies.
+
+- **Samples carry `sha256_verified`: whether MCRIT disassembled them itself from bytes of that
+  sha256 (#270, #297).** It is `true` for a sample indexed from a `POST /samples/binary` upload, and
+  `false` for one indexed from a submitted SMDA report (`POST /samples`, the IDA plugin) or brought
+  in by `POST /import` - whatever the export states, since this instance never saw the bytes.
+  Samples stored before this release have no value and read as `null`, as do query samples and
+  samples an older release imports from a newer export. The field is part of every sample listing,
+  `GET /samples/sha256/{sha256}`, search results, job results and exports. The 409 answer to a
+  binary upload of a known sha256 carries `sample_id` and `sha256_verified`.
+
+- **A binary uploaded for a sample indexed from a report replaces its analysis with MCRIT's own
+  disassembly of the bytes (#270, #306).** `POST /samples/binary` answers 409 only for a sample that
+  is `sha256_verified: true`. For one that is `false` or `null` it queues the job, which
+  disassembles the binary and swaps the result in under the same `sample_id`, however well the
+  report agreed. The old functions go with their minhashes, band entries, pichash counts,
+  picblockhash index entries, function ranges and disassembly; the new ones are hashed. Labels move
+  to the new function at the same offset from the base address, as they are right before the swap.
+  Family, version and filename are the upload's when it names them, otherwise what the sample holds
+  when the swap ends, and so are `is_library` and `component`; a change made while the job runs is
+  kept. Afterwards `sha256_verified: true` vouches that the stored analysis is MCRIT's disassembly
+  of those bytes, not for the metadata. The job result's `verification` gives the old and new
+  function counts, how many labels were carried over or dropped, and, for information, how far the
+  report agreed: the share of functions at the same offset with the same PicHash, of the larger set.
+  The new analysis is staged in `functions_staging`, `xcfg_staging` and `smda_extras_staging` first,
+  where no reader looks, and a failure there leaves the sample as it was. The swap then writes the
+  new functions under the sample before it removes the old ones: from then until the old ones are
+  gone, a reader sees both function sets under the sample, never none. A job that dies in between
+  leaves both in place until the next upload of the binary finishes the swap; `verify_corpus` lists
+  such a sample under `unfinished_replacements`. A claim on the sample lets one job at a time
+  replace it, so a second upload meanwhile gets `in_progress`. It records the queue job: the claim
+  of a job the queue shows finished or failed is taken over at once, one it shows running only after
+  `QUEUE_VERIFICATION_CLAIM_TIMEOUT` (default 3600 s). What the upload says about the sample is
+  recorded when the swap begins and applied only after that, so a job that loses its claim before
+  leaves the sample as it was, and the upload finishing a swap applies its own metadata, else the
+  recorded one. If adding the new functions' pichash counts fails, or the job dies there, the count
+  index is marked incomplete instead of trusting counts that may be partial, and
+  `MongoDbStorage.rebuildPicHashCountIndex()` rebuilds it. `deleteSample` takes the claim over
+  first, so that a job under way stops: a sample deleted meanwhile stays deleted, and the result
+  says `sample_deleted`. Only a deletion that lands while the job copies the new functions in, with
+  the job dying before it checks its claim again, can leave functions under the deleted sample id;
+  `verify_corpus` lists them under `functions_without_sample`. NOTE that an IDA plugin report has a
+  function set of its own: labels on functions smda does not find at the same offset are dropped,
+  and counted in the result. On 76 Malpedia binaries of 26 families, against their smda 5.0.1
+  disassembly, smda 4.8.0 and 4.9.0 reports agreed to at least 0.992 and 5.0.1 with tail call
+  resolution to at least 0.942, while the report of another sample of the same family agreed to at
+  most 0.264. Offsets are compared from the base address: disassembled at bases 0x1000000 and
+  0x10000000 higher, an icedid dump kept all 170 of its PicHashes at the same relative offsets, a
+  conti dump 246 of 250.
+
+- **`python -m mcrit.migrations.verify_corpus` checks a corpus for data older releases let in (#270,
+  #306).** It writes nothing. It reports samples whose stored functions do not number their
+  `statistics.num_functions`, functions without a sample or of another family than their sample's,
+  MinHashes of another length than the configured signature, and stored binaries whose sha256 is not
+  their sample's (`--hash-binaries` hashes the bytes instead of trusting the recorded hash). It also
+  reports family counters that disagree with samples and functions, replacements an upload left
+  unfinished, deletions that died after claiming their sample, and staged documents no sample
+  records any more, and counts samples by `sha256_verified`. It prints JSON and exits with 1 when it
+  finds a problem, like `migrate_xcfg_split --mode verify`. It runs one aggregation over
+  `functions`, projected to three fields before grouping by sample, and projected scans of the rest.
+  It never reads disassembly, and its memory grows with the number of samples, not functions: on a
+  synthetic corpus of 3M functions in 12,000 samples it took 5.7 s and 92 MB, against 2.2 s for 1M.
+  See [docs/migration-v1.7.0.md](docs/migration-v1.7.0.md#checking-a-corpus-for-older-data).
+
+- **Every matching report says what candidate generation left out of it** ([#201], #303), under
+  `info.matching.candidate_generation`: how many (query function, band) lookups
+  `STORAGE_BAND_DF_CUTOFF` skipped of how many, the band hits not fetched for them, the query
+  functions that lost a band, those it cut off (fewer bands left than `band_matches_required`, so
+  only PicHash can still match them) and what the shortlist dropped. `degraded` is true only when
+  the cutoff cut a query function off; shortlist drops are by design and never set it. A degraded
+  job logs one INFO line. This is the per-query side of the coverage report: a fixed cutoff starting
+  to bite shows on the queries it bites instead of recall eroding without a trace, and it is the
+  data that decides whether WAND/MaxScore is worth building. On MongoDB the skipped hashes come from
+  the `(band_hash, df)` index entries inside the band lookup's own aggregation (no band document
+  read, no extra round trip), which repeats the lookup's index seeks: on a synthetic 20-band corpus
+  the band lookup went from 0.137 s to 0.172 s per 1,000 query functions, under 2 µs per lookup. The
+  new setting `STORAGE_BAND_DF_COUNT_SKIPS` (default `True`) turns that off. Switched off, without a
+  trusted df, or with a storage class that predates the count, `band_df_skips_measured` is `false`
+  with the reason and the skip counts are `null`; a result left unmeasured by an incomplete df index
+  is not cached. Matches are unchanged and `RESULTS_VERSION` is not bumped: a report cached before
+  this has no `candidate_generation` key, which reads as "not measured", and comparing a query over
+  time needs `force_recalculation`.
+
+### Changed
+
+- **Function labels are searched with the qualified field, now from an index and on both storages
+  (#302).** `function_labels.function_label:?term` finds a function by any of its labels,
+  `function_labels.function_label:term` by an exact one and `function_labels.username:name` by who
+  gave it; a plain term matches `function_name` with the query it had (see below for very large
+  searches), and since #301 the labels other than the name besides. On MongoDB the label field had
+  worked by walking every function document; it now uses a new sparse
+  `function_labels.function_label` index. The memory storage found nothing for such a path; it now
+  resolves it into the list of labels and compares element-wise as MongoDB does (`?` / `=` when
+  one label matches, `!?` / `!=` when none does). It matches with Python's regex,
+  whose case folding differs from MongoDB's for a few non-ASCII letters (the dotted capital I).
+  A search of nothing but label conditions, with a `?` among them, is first tried as the regex it
+  was, walking the index of the sort order for a fixed 50 ms: a term that many labels match fills
+  its page that way as fast as before (6 -> 5 ms over 250,000 functions; 34 -> 28 ms with 48,600
+  distinct labels). Only a probe that runs out lists the distinct labels (a `distinct` over the
+  index, 30-160 ms) and hands the ones that may match over as an `$in`, paired with the regex so
+  that the page is exactly what the regex finds. Probe, listing and query share the search time
+  limit, the listing at most half of what the probe left, so the search never takes longer than the
+  limit; a listing too slow for its half leaves the search to the regex, for an hour. An exact label
+  went 260-480 ms -> 1 ms, a rare substring 260-480 ms -> 80-220 ms. The labels are listed once per
+  search, past 16 MiB of them the search is the regex, and a negated label term (`!?`, `NOT`) always
+  is. A label condition next to a condition on another field is the query it always was: neither
+  probed nor listed for.
+  The `$in` / `$nin` lists of one query, names and labels alike, now share 1 MiB and 500,000 tests
+  of a term against a listed value, and a repeated term is transpiled once; a term past that budget
+  is the regex. For the names this bounds very large searches (the 51st `?` term of an OR over
+  10,000 names becomes a regex), which before could build a query MongoDB refuses: such a search
+  is now answered as the regex or with a 400, not a 500. The names keep the case folding of their
+  `$in` from #170 (Python's).
+  Also: the memory storage filters a function search before it sorts and keeps only a page of
+  matches (1.9-2.3 s -> 0.1-0.3 s for a search sorted by name over 250,000 functions), and MongoDB
+  search results no longer load an inline `_xcfg` (a corpus `migrate_xcfg_split` has not run on), so
+  they carry no disassembly, as on a migrated corpus. NOTE that the first start after upgrading
+  builds the new index, reading every function document (0.3 s for 250,000 here, 0.7 s with inline
+  disassembly; expect proportionally longer on a large corpus).
+
+- **A plain function search term also finds a function by its labels (#301, #307).** `term`
+  matches the name and every label that differs from it, so a renamed function is found by the
+  name it had and a labelled one by its label; `NOT term` keeps a function that neither matches.
+  `function_name:?term` is the name alone. MongoDB keeps those labels in a derived field of the
+  function document, `_other_labels`, with a sparse index: absent where a function has none, so
+  the index holds only renamed or user-labelled functions, typically a few hundred. A label equal
+  to the name, as an import or a report gives every named function, is none. Every write that
+  renames or labels a function derives it in the same update; it never appears in API answers or
+  exports. The memory storage derives the same labels on the fly, with the case folding caveat of
+  #302.
+  Or-ing the field into the name query would cost a sort by name its walk of the
+  `(function_name, function_id)` index (4.7 -> 98-167 ms for a common term over 250,000
+  functions, the 23 -> 420 ms #301 reports). A plain term instead matches the terms against the
+  list of other labels, searches the functions with none matching by the name query it had, and
+  those with one through the sparse index, merging the two pages in the sort order. Each process
+  keeps that list, and which of its labels each of the last 256 terms matches, until a write
+  changes the other labels: every such write, in any process, increments `other_labels_version`
+  in `settings`, and a search reads only that counter. Over 250,000 functions with 500 other
+  labels (medians of three interleaved runs) a term no other label matches costs 1-2 ms more (no
+  hit 21.1 -> 23.3 ms, rare term 21.8 -> 23.6 ms), and one that some 200 match 4-12 ms, mostly
+  fetching the functions now found by such a label (medium term 25.8 -> 29.4 ms, common term by
+  name 27.4 -> 39.4 ms). With 22,000 other labels a term few of them match costs 0-6 ms more, and
+  one that thousands match 9-26 ms (common term 34.8 -> 60.7 ms).
+  NOTE that the first start after upgrading derives the field when at most 100,000 functions carry
+  labels (0.74 s for 87,700 here). A larger database logs, once an hour at most, that
+  `python -m mcrit.migrations.migrate_other_labels` is due (`dry-run`, `apply`, `verify`;
+  batched and resumable, 1.1-4.0 s for 100,000 labelled functions); until it has run, a plain term
+  finds a function by such a label only if it was renamed or labelled since. A fill or a migrated
+  function that fails is logged or reported and passed over. A process of an older MCRIT does not
+  keep the field; re-run `apply` after one has written. See
+  [docs/migration-other-labels.md](docs/migration-other-labels.md).
+
+- **`POST /samples/binary` refuses `is_dump`, `bitness` and `base_addr` values it used to misread.**
+  `is_dump=yes` was read as false, so a dump was disassembled as an unmapped file; `bitness=16`
+  became 32 and an unparsable `base_addr` became 0, each without a word. They are now answered with
+  400 and nothing is enqueued. `is_dump` takes `true`/`True`/`1` or `false`/`False`/`0`, `bitness`
+  32 or 64, `base_addr` a hexadecimal address from 0 to 2**64 - 1, and a blank value (`is_dump=`)
+  still means the parameter is absent. A `filename` longer than 255 characters, a `family` or
+  `version` longer than 64, or any of them with a control character (a newline, a tab, a NUL, an
+  escape sequence) or a line separator, is refused the same way; other characters, spaces and
+  non-ASCII included, are stored as given, as before. A client that sent such a value and got a
+  sample anyway now has to correct it.
+
+- **`UniqueBlocksResult.generateBlockCover` no longer rescans every block after each pick**
+  ([#283]). It now uses the same cover as `Worker.getUniqueBlocks`, which keeps the blocks in a heap
+  by how many samples each reached when last checked, a count that only shrinks, and rechecks only
+  the block on top until its count is current. It picks the same cover, faster the more blocks it
+  picks: with `covers_required=10`, 20,000 blocks over 50 samples take about 0.1 s instead of 2 s
+  when each reaches 1 to 3 of them, and 0.06 s instead of 0.4 s when they reach up to all 50.
+
+- **Minhashes are stored as BSON binary instead of hex text**, half the bytes per signature. On
+  a 7,244-sample corpus with 64.8% of its functions hashed, that is 5.7% of `functions`
+  uncompressed, 342 MiB of its 6,018 MiB, and an estimated 12.9% on disk after snappy, about
+  299 MiB of its 2,318 MiB. Minhashes stored as hex before are still read, so nothing has to be
+  migrated. `python -m mcrit.migrations.migrate_minhash_binary --mode binary` converts
+  them, and `--mode count` says how many are left. It connects the way MCRIT does, with the
+  credentials and flags MCRIT is configured with (`STORAGE_MONGODB_USERNAME`, `_PASSWORD`,
+  `_FLAGS`); `--uri` takes a complete MongoDB URI instead, and the database is then `--db`, else
+  the one the URI names, else the configured one. It logs progress every 10 batches (of 2,000
+  minhashes by default) and one summary line per collection. MongoDB reuses the space this frees,
+  and only `compact` returns it to the filesystem. Exports and the REST API still carry hex.
+  NOTE that this changes the stored data shape. An MCRIT from before this release fails on a
+  binary minhash (`bytes.fromhex` refuses `bytes`), so upgrade the server and every worker
+  together, and run `--mode revert` with them stopped before going back to an older release.
+  `--mode revert` refuses to start while the job queue holds queued or in-progress jobs, unless
+  `--force` is given; an idle server holds none, so the check does not replace stopping it.
+  Scripts that read `functions.minhash` directly get `bytes` for functions hashed after the
+  upgrade, hex for those hashed before it until the migration runs, and `""` for functions not
+  hashed yet.
+
+- **`GET /status?with_pichash=True` counts the distinct pichashes from the pichash count index**
+  while that index is complete, instead of a `$group` over the whole functions collection on every
+  call. Measured on a synthetic corpus of 2,000,000 functions with 569,898 distinct pichashes on a
+  local mongod 8.0, median of 5: 1.21 s before, 0.18 s after. The cost now follows the number of
+  distinct hashes, not the number of functions.
+  - Only count documents with `df > 0` are counted, so a hash a sample delete has decremented to 0
+    is not, also when the delete died before removing that document.
+  - An incomplete index, for instance after `recalculatePicHashes` until `rebuildPicHashCountIndex`
+    has run, falls back to the grouping as before.
+  - A function without a pichash is no longer counted as one more distinct hash by the grouping, so
+    the two answers agree. On a corpus where every function has a pichash nothing changes.
+
+- **Behaviour change: `McritClient(raw_responses=True)` now answers the `requests.Response` from
+  ten more methods** - `respawn`, `addBinarySample`, `modifyFamily`, `deleteFamily`,
+  `modifySample`, `deleteSample`, `getExportData`, `addImportData`,
+  `requestUniqueBlocksForSamples` and `requestUniqueBlocksForFamily` never checked the mode and
+  answered the parsed data, or `None` for a failed request. A caller in raw mode that relied on
+  that gets the response now, like from every other request method. `search_families`,
+  `search_samples` and `search_functions` are unchanged and still answer the parsed data in raw
+  mode; `getSamplesByFamilyId` and `awaitResult` do not work in raw mode. A test reads the
+  client's source and fails for a request method that ignores the mode ([#54]).
+
+- **`client submit --mode malpedia` skipped every dump (#280).** The filename pattern lacked the
+  underscore before `dump`, so only `_unpacked` files were collected, with no warning. It now takes
+  `_dump_0x...`, `_dump7_0x...` and `_dump10_0x...` names. Some dumps carry a label after the
+  address, such as `_dump7_0x00350000_loader` (9 of the 109 dumps among 281 samples of 29 families
+  downloaded from Malpedia for #283's evaluation), which `get_base_addr` did not read, so once
+  collected they would have been disassembled as files. In every submit mode, a Malpedia dump name
+  now gives its base address with a label after it; other filenames still need the address at their
+  end.
+
+- **`client submit --mode recursive` printed every file and submitted none (#281).** A leftover
+  `continue` after the progress line made the submission unreachable. Now that files are submitted,
+  a file directly in the given folder gets no family, where it would have been named after the
+  first folder of the working directory.
+
+- **`client submit` added an empty sample for a file SMDA found no functions in.** Dir mode already
+  skipped it; file, recursive and malpedia mode, and with them every mode run with `--worker`, which
+  submits each file in file mode, now skip it too, and all four say so.
+
+- **`client submit --mode recursive` ignored `--force_update`.** A file already in MCRIT is now
+  updated to the family and version its folders name, as dir mode updates it to `--family` and
+  `--version`. What no folder names, MCRIT keeps: the version of a file directly in a family folder,
+  and both for a file directly in the given folder.
+
+- **`client submit --smda` in file mode never found a report's sample in MCRIT.** It looked up the
+  sha256 of the `.smda` file instead of the one the report names, so a report of a known sample was
+  uploaded again and `--force_update` changed nothing. It now reads the report's sha256, as dir mode
+  does; dir mode with `--worker` runs each file in file mode and gets the same. Such a report is no
+  longer uploaded, so the function names in it are no longer added as labels to the known sample,
+  which dir mode without `--worker` never did either.
+
+- **`client submit --mode dir --smda` ignored `--force_update`.** It skipped a known report's
+  sample, with a warning when the report named another family or version. Dir and file mode now
+  update the sample to what the report would have been submitted as: the report's family and
+  version, unless `--family` or `--version` is given. What is empty there, MCRIT keeps.
+
+- **`client submit --mode dir --worker` ignored `--force_update`.** Dir mode hands every file to a
+  worker, also one already in MCRIT, and the worker's `client submit <file>` lacked the flag.
+  Recursive mode updates such a file before reaching its worker, and malpedia mode takes no
+  `--force_update`, so only dir mode passes it on. An empty `--family` or `--version`, which was
+  dropped before, now reaches the worker too.
+
+- **`client submit --mode dir` named the folder, not the file, when skipping a file already in
+  MCRIT.**
+
+- **TODO comments the code already resolves are removed**, and `StorageInterface.getContent` and
+  `setContent` document the snapshot they hold. `clearMatchingCache`, a no-op in both storages, and
+  the `addContent` stub, which neither storage implemented, are gone from the storage interface;
+  nothing in MCRIT or MCRITweb called them. No behaviour changes.
+
+- **Behaviour change: unknown job and result ids answer 404 on the job and result routes (#291).**
+  `GET /jobs/{id}`, `GET /jobs/{id}/result`, `GET /results/{id}`, `GET /results/{id}/job` and
+  `DELETE /jobs/{id}` used to answer 200 with `data: null` (or `num_deleted: 0`) for an id that
+  does not exist; they now answer 404 with `{"status": "failed", "data": {"message": ...}}`.
+  Malformed ids are still 400. A job that exists but has no result yet still answers 200 with
+  `data: null`, as does a stored JSON `null` result. A result whose job is gone is still served
+  in full by `/results/{id}` (also with `compact=true`), and `/results/{id}/job` answers 404 for
+  it. With the default client, `deleteJob` on an unknown id now returns `None` instead of
+  `{'num_deleted': 0}`. With `raise_client_errors=True`, `deleteJob`, `getJobData`,
+  `getResultForJob`, `getResult` and `getJobForResult` raise `McritNotFound` where they returned
+  a value, and `awaitResult` raises it instead of `JobTerminatedError` for an unknown job, and
+  instead of returning `None` when a finished job's result is removed before it is read; the
+  default client is unchanged there. MCRITweb's `/api` passthrough relays these 404s to its API
+  users; its UI is unaffected.
+
+- **A function entry built with its MinHash dropped the MinHash's shingle composition (#292).**
+  `FunctionEntry.__init__` stored it under a misspelled attribute, so `toDict` fell back to an
+  empty composition: memory storage kept none for functions added with their MinHash, and kept
+  the old one when a sample's MinHashes were deleted. The class-level default that hid the typo
+  (marked "FIXME MongoDbStorage fails without this") is gone.
+
+- **Memory storage: substring search (`?`, `!?`) disagreed with MongoDB on values that are not
+  text (#293).** `!?` left out every entry whose field is missing or a number (`sample_id:!?0` found
+  nothing), where MongoDB's negated regex includes them all. `pichash:?…` and `timestamp:?…` never
+  matched, where MongoDB matches the hex digits and the text they are stored as, and a list such as
+  a family's `actors` never matched, where MongoDB matches it when one of its elements does.
+
+- **Pichashes and picblockhashes are stored zero-padded to 16 hex digits ([#145])**, so that
+  their string order is their numeric order: the MongoDB backend now answers range conditions on
+  `pichash` and sorts (and pages) function searches by it. A new instance is padded from the
+  start. An existing one keeps its variable-width values, and keeps rejecting both, until
+  `python -m mcrit.migrations.migrate_pichash_padding --mode pad` has rewritten them and set the
+  `pichash_padded` settings flag (`--mode verify` checks, `--mode unpad` rolls back); every other
+  reader accepts both widths meanwhile, and `/status` reports `pichash_padded`. Stop the server
+  and workers for the migration and restart them afterwards. It drops the two indexes keyed on the
+  stored spelling - `pichash_counts` and the inverted `picblockhashes` index - and marks them
+  incomplete, since left behind they would miss every lookup: the cutoff would drop every PicHash
+  match, and `getUniqueBlocks` would report every shared block with a leading zero as unique (15
+  blocks unique to a sample that has none, in the test data). Both fall back to reading the
+  functions collection, correctly but slowly, until `rebuildPicHashCountIndex()` and
+  `rebuildPicBlockHashIndex()` (`GET /rebuild_picblockhash_index`) have run. Unique-block results
+  and the YARA rules built from them name blocks by the stored hex, so on a padded instance those
+  names are 16 digits wide. A run that finds nothing to rewrite (a repeated `pad`, or `pad` on an
+  instance padded from the start) keeps both indexes. Until the migration is complete a value may
+  be stored in both spellings; the cutoff (`MINHASH_PICHASH_MAX_MATCHES`) sums the holders of both
+  and keeps or drops the value as a unit, and without its count index it counts them the slow way
+  and logs a warning, with the same results. Only values of 0..2^64-1 fit 16 digits, so a report or
+  import naming a pichash or picblockhash outside that range is now refused: `POST /samples`
+  answers 400, a query job fails, and `POST /import` refuses the export (#266).
+  Padding -5 would have stored `"0x-000000000000005"`, which nothing reads back. Older releases
+  stored such values unchecked (-5 as `"-0x5"`); `pad` and `unpad` leave them alone, and `verify`
+  reports them as a problem until their sample is deleted. A pichash-sorted search pages through
+  a new (`_pichash`, `function_id`) index like the other sort fields, instead of sorting the whole
+  `functions` collection for every page; the first start after upgrading builds it once.
+
+### Fixed
+
+- **`POST /import` answers 400 for an export it refuses, and stores nothing of it (#266).** An
+  export of another shingler or MinHash configuration, or of a version that is too old, was answered
+  with 200 and `data: null`, which a client could not tell from success (`McritClient` with
+  `raise_client_errors=True` now raises `McritBadRequest` where it returned `None`). A missing or
+  non-text version was a 500, and any text sorting above `"0.0.0"` was accepted, `latest` and
+  `0.0.0rc1` included, because versions were compared as strings; they are now compared by PEP 440
+  ordering. All of these are answered with 400 ("Import rejected: ..."), as is an export whose
+  structure cannot be read: a section missing or no mapping; a sample, present here already or not,
+  whose architecture is neither text nor null; a field missing from the entry of a sample to be
+  stored, or its `is_library` not a boolean; a family id that is no number, or that names two
+  families; a family name other than text or null; family actors that are not a list; a function
+  whose pichash is neither a number nor null; content that does not inflate (corrupt, truncated,
+  encrypted) or parse; JSON nested too deeply; and what the storage cannot hold (#300, below). A
+  refused export stores nothing, its families included, which a malformed export used to leave
+  behind. A sample's stated number of functions is only reported back as skipped, and one that is
+  missing or no count is read as 0. `MinHashIndex.addImportData` raises `ImportRejected`, a
+  `ValueError`, where it returned `None`.
+
+- **`POST /import`: what an accepted export changes.** A sample whose family the export names null,
+  as older versions export a report without a family, used to land in a family named null and now
+  goes to the default family. An error while storing, a failed MongoDB insert say, is still a 500,
+  and removes everything the import had added (#299, below). The actors of families the import found
+  are merged last and only once everything else is stored, so a failure no longer changes them, and
+  an error merging them is logged rather than failing an import that is otherwise complete.
+
+- **A failed `POST /import` could leave the samples it removed in the function ranges and PicHash
+  counts.** On MongoDB, `discardImportedSample`, which rolls back an import that failed after
+  storing its functions, deleted the functions but neither their function ranges nor their PicHash
+  counts. Those were left behind when the failure came after they were written - the ranges are
+  the last index an import writes, and the counts came just before them - so a range could name a
+  sample that was gone and a hash stay counted too often until `rebuildPicHashCountIndex` ran. Both
+  are now taken out with the functions. The PicHashes of imported functions are counted right after
+  the insert, so that the rollback takes out only what was counted; where functions may be stored
+  without being counted (the counting failed, or removing what a failed insert wrote did), the
+  count index is marked for its rebuild and the rollback leaves the counts alone. Functions whose
+  PicHashes could not be counted are also removed before the import fails: no family has counted
+  them yet, and the rollback would have lowered their family by them. The rollback also lowers the
+  family function counters by the functions it finds stored; on either storage, a counter update
+  that failed left functions stored that their family had not counted, which the rollback then took
+  off it. On MongoDB the import now removes the functions with their PicHash counts before failing,
+  and then takes back the families it had counted; memory storage counts each function before
+  storing it. Every family then keeps its counters, unless removing the functions fails as well: the
+  families counted stay raised for the rollback to lower, while the family whose counter failed is
+  lowered by functions it never counted, until `POST /recompute_family_stats` runs.
+
+- **Memory storage: deleting a sample left its PicHashes behind.** `deleteSample` and
+  `discardImportedSample` emptied a PicHash's set of matches but kept the key, so `isPicHash` stayed
+  true and `num_pichashes` counted hashes no function carried. The key is now removed with its last
+  match. MongoDB storage is not affected.
+
+- **Memory storage: `/rebuild_index` held every MinHash of the corpus in one list.** The bands are
+  now rebuilt one work package at a time, with the same result, and the progress total is exactly
+  the number of work packages (it was one too many when the count divided evenly).
+
+- **`POST /import`: an import that fails while storing leaves nothing behind (#299, #304).** Its
+  MinHashes were added after the rollback, so a failure there left samples stored without band
+  entries, which a retry then skipped as present. They are part of it now, and the rollback also
+  takes out the band entries of the samples it removes, as well as a sample that failed after it was
+  stored but before the import learnt of it (a family counter overflowing on MongoDB, say). The
+  families the import created go too, but only while no sample is filed under them. Every writer now
+  ensures its family's document after filing a sample, and the rollback looks for samples again
+  after deleting the family, so a sample filed meanwhile keeps a family document; that family's
+  counters can then miss it until `/recompute_family_stats` runs. When the document of the family a
+  writer looked up is gone and another id holds its name by then, `addSmdaReport`, `modifySample`
+  and imports file the sample under that family instead. `num_families_imported` counts the families
+  the import created, where it counted every family with a higher id than any before it, another
+  writer's included. On MongoDB, `family_name` gets a unique index and a family is added by an
+  upsert, which the index makes atomic, so two writers adding one name no longer both create it. A
+  database that holds a name twice already cannot get the index: it logs an error at startup naming
+  the duplicates and merges nothing; two writers upserting the same new name at the same moment can
+  still both insert it there, until the duplicates are merged or renamed and the next start creates
+  the index. `/recompute_family_stats` no longer re-creates a missing family document under a name
+  another family carries: it files that id's samples and functions under the family of the name and
+  reports them as `num_families_merged`, not as created. The import still fails with the error that
+  failed it (500), and an error while rolling back is logged. `StorageInterface.ensureFamily(name)`
+  answers the family id and whether the call created it; its default looks the name up and calls
+  `addFamily`, which a backend shared by several writers has to override to decide atomically, as
+  both built-in ones do. Backends implement `discardImportedFamily` too.
+
+- **`POST /import` refuses with 400 what MongoDB cannot store, and caps decompression per import
+  (#300, #304).** An integer beyond signed 64 bit in a sample or function entry (`binary_size`,
+  `statistics`, `num_blocks`, ...), a mapping key holding a NUL, a pichash or picblockhash hash or
+  offset outside unsigned 64 bit, or `picblockhashes` other than a list of mappings holding a
+  numeric `hash` and `offset` passed validation and failed on MongoDB at insert, with a 500 after
+  part of the import was written, while memory storage stored them. Both now refuse them before
+  storing anything; checking costs about 1 s per 210,000 functions. A pichash of null, which failed
+  on MongoDB too, is imported as 0, as a function SMDA reports without one is stored. Compressed
+  content is capped across the whole import as well, at 20 times the size of the request body or 64
+  MiB if that is more: four 70 KB blobs, each under its own cap, inflated to 32 MiB. Exports of the
+  live corpus inflate to at most 11.6 times, so they stay below it. MongoDB storage updates the
+  picblockhash index in one pass over an import's functions instead of one per sample, with the same
+  updates in the same order: 7 s instead of 20 s of Python for 300 samples of 700 functions.
+  `MinHashIndex.addImportData` takes the size of the export as an optional `import_size`.
+
+- **`POST /import` holds one sample's functions at a time, not the export's (#304, #309).** It kept
+  every sample's parsed functions until the last was written, then built MinHash objects, band
+  postings and MongoDB updates for all of them at once: on a synthetic export of 300 samples x 700
+  functions (35 MB compressed, minhashes drawn from 20,000 distinct ones) the server peaked at 4.1
+  GB RSS. The validation pass still reads and checks the whole export before the first write, as
+  #266 and #300 require, but now lets go of each sample's entries once checked; the write pass reads
+  and checks each sample again and stores it with its functions before reading the next. Each pass
+  draws on an inflation budget of its own, of the same size, so content read twice is not counted
+  twice against the cap of #300. Only each banded function's id and minhash bytes are kept until the
+  minhashes are banded, in one call as before, so that a band hash shared across samples stays one
+  update. MongoDB storage now bands one band at a time from a matrix of band hashes, and looks up
+  the functions and writes its minhash and band updates 10,000 at a time, with the same documents as
+  result. base85 is decoded with numpy, 13 times faster than `base64.b85decode`. Same export,
+  measured before the checks of #300 were added: 4.1 GB to 0.54 GB peak and 143 s to 115 s; with
+  210,000 distinct minhashes 4.1 GB to 0.62 GB and 414 s to 361 s, nearly all of it band upserts;
+  the validation pass alone 1.7 GB and 13 s to 0.27 GB and 6 s. With them, on 100 samples x 700
+  functions and without the database's own time, what the import adds to the process falls from 820
+  MiB to 93 MiB. Banding is the one step that still grows with the export, by 1.1 to 1.4 kB per
+  function. An uncompressed export is parsed whole by `json.loads` before any of this: 406 MB of
+  JSON still peaks at 2.5 GB (4.6 GB before). As samples are now stored one by one, a later sample
+  that fails finds the earlier ones stored, counted and indexed; the rollback of #299 takes them
+  back too, except their pichash counts if counting failed: those stay untrusted until
+  `rebuildPicHashCountIndex` runs, and a database left without functions clears them at its next
+  start instead of trusting them again.
+
+- **Imports, repairs and memory recalculations keep each function's shingle composition (#310).**
+  With `MINHASH_TRACK_SHINGLES` on, a function could lose its `minhash_shingle_composition` wherever
+  its MinHash was rebuilt from the stored bytes and added again: the rebuilt MinHash carries no
+  composition and wrote an empty one over the function's. This hit every function `POST /import`
+  stored, on both storages; the functions without disassembly that `/repair_minhashes` keeps, on
+  both storages; and those that `/recalculate_minhashes` keeps on memory storage. `addMinHash` and
+  `addMinHashes` take `keep_composition`, which the import and the memory recalculation set, to
+  write only the minhash. A repair gives each kept MinHash the composition read with its function,
+  since `deleteMinHashesForSample` has cleared the stored one by then. Every other caller writes the
+  MinHash's composition, as before.
+
+- **The unique-blocks cover broke score ties by dict order** ([#283]). A block's score is 80% the
+  samples it covers and 20% its length, and with one input sample every unique block of 7 to 11
+  instructions scores exactly 100.0. Among those the cover took whichever the storage happened to
+  return last. Ties are now broken by how many hex digits of the block's YARA string are fixed,
+  wildcards not counted, and then by the lowest picblockhash, in both `Worker.getUniqueBlocks` and
+  `UniqueBlocksResult.generateBlockCover`. The same input now always gives the same cover. Scores,
+  the length scoring and every default are unchanged. This prefers longer fixed patterns, not
+  necessarily more distinctive ones: whether it makes rules better, and whether any of the issue's
+  other directions, opt-in above, should become a default, still need the evaluation the issue
+  proposes. `RESULTS_VERSION` is now 3, and since every report job is keyed on it, cached match and
+  unique-blocks reports alike are recomputed once on their next request.
+
+- **On MongoDB, a unique block found in several functions was represented by whichever one the
+  query answered first** ([#283]). It now takes the lowest `function_id`, as memory storage did, so
+  its function, sample and offset, and with `max_blocks_per_function` the cover, no longer depend
+  on document order.
+
+- **A unique-blocks job for samples listed its first option as its family** ([#283]).
+  `Job.family_id` read the job's second argument, which for a samples request is whichever option
+  came first, such as `covers_required`; it now reads `family_id` by name.
+
+- **`UniqueBlocksResult.generateBlockCover` stopped after one block for `required_per_sample=0`**
+  ([#283]). It now clamps it to 1, as `Worker.getUniqueBlocks` already did with `covers_required`,
+  and answers the same 1-of-1 cover as the job.
+
+- **A unique-blocks job's progress overshot 100% on MongoDB and stayed at 0% on memory storage.**
+  On MongoDB it jumped to 100% once the candidates were eliminated and could then read 200%, or
+  far more after the full scan that an instance without the picblockhash index falls back to; on
+  memory storage it stayed at 0% until the end. Each phase now fills a fixed share, so progress only
+  grows and ends at 100%. A terminated job used to be noticed only at the end, and on MongoDB also
+  during that scan and after the elimination. It is now also noticed at each phase boundary and
+  while the Worker builds the blocks' escaped byte strings. On MongoDB, storage also checks while it
+  collects, eliminates (with the index, once per 20,000 candidates) and scores the candidates, and
+  while it extracts their instructions.
+
+- **`McritClient.requestUniqueBlocksForSamples` and `requestUniqueBlocksForFamily` ignored
+  `raw_responses`** and answered the parsed job id; they now answer the `requests.Response`, as most
+  other request methods do. A caller that set `raw_responses` but took the job id from these two
+  methods' answers now has to read it from the response.
+
+- **The in-memory search compares a list field element-wise, as MongoDB does.** `actors:APT28`
+  compared the whole `actors` list with the string, so it and `actors:?apt` found nothing on
+  `MemoryStorage` while MongoDB found every family with that actor, and `actors:!=APT28` found
+  every family rather than those without it. A condition now holds when some element satisfies
+  it, and a negated one when none does, for every list field; a test on `actors` runs against
+  both backends ([#53]).
+
+- **The queue's `BaseRemoteCallerClass.awaitResult` returns `None` for a job that does not exist or
+  is deleted while it polls (#294)**, as it does for a failed or terminated one, instead of raising
+  `AttributeError`. `McritClient.awaitResult` is a different method and is unchanged.
+
+- **`DELETE /samples/{sample_id}` answers 404 for an unknown sample (#295).** It queued a deletion
+  job for any id and answered 202 with its job id, and the job then did nothing. The families route
+  already checked first. Repeating the deletion of a sample, once its first deletion has run, is now
+  a 404 as well.
+
+- **A worker that released its own jobs left the queue counters showing them in progress (#296).**
+  `MongoQueue.release_all_jobs` requeued the jobs a consumer still held but never touched the
+  counters: `in_progress` kept counting them and `queued` never did, so the status page showed work
+  that no longer ran. A job that had used its last attempt was also left without a failure, so jobs
+  awaiting it (`await_jobs`) waited forever. The worker loops call it to reconcile their locks when
+  a job's `error()` or `complete()` write was lost to a database outage, and `Worker`,
+  `SingleJobWorker` and `SpawningWorker` call it when they leave their `with` block. It now goes
+  through the per-job release that `release_orphaned_jobs` already used for dead workers. Counters
+  already skewed stay so until `GET /jobs/stats?with_refresh=true` recounts them. `LocalQueue`
+  gained a no-op `release_all_jobs`, as its jobs are never held across an exit.
+
+- **`GET /complete_minhashes` now finishes the samples it hashes, as hashing on submission does
+  (#298).** It is how samples submitted with deferred hashing (`addReport` with
+  `calculate_hashes=False`) get their minhashes, but it never recorded which smda produced them and
+  never dropped their disassembly under `STORAGE_DROP_DISASSEMBLY`. Every such sample stayed in
+  `num_samples_with_stale_minhashes` on `/status` and was rehashed by the next `/repair_minhashes`,
+  and its `xcfg` stayed stored on an instance configured to drop it. A stored sample is now marked
+  `minhash_pending` (with a new sparse index) until hashing on submission or this job finishes it.
+  After hashing, the job finishes every pending sample with no function left to hash, whichever run
+  hashed it, so a retried, repeated or overlapping job and a sample with nothing large enough to
+  hash are finished too. `/repair_minhashes` and `recalculateMinHashes` record versions but leave
+  samples pending, as they never drop disassembly, now as hashed by the running smda; the next
+  complete finishes them. Functions without disassembly ([#42]) do not hold their sample back. A
+  function smda cannot rebuild fails the whole job, as before, and the job then finishes no sample.
+  Finishing reads only ids, sizes and whether disassembly is stored: 0.6 s and under 1 MB for 300
+  samples of 210,000 functions, before the disassembly is dropped. The job is still
+  `updateMinHashes`, now with `finish_samples=True`, so MCRITweb files it where it did, though its
+  parameters read `updateMinHashes(None, True)`. Upgrade the workers before the server: an older
+  worker fails the job with a `TypeError` on `finish_samples`. `StorageInterface` gains
+  `getSamplesWithPendingMinHashes` and `getSamplesWithUnhashedFunctions`, and
+  `setMinHashVersionForSamples` a `finish_pending` flag, which a storage of your own has to
+  implement. NOTE that samples stored before this release carry no marker and are never finished by
+  `/complete_minhashes`, including those it already hashed: nothing records which smda or shingler
+  revision computed their minhashes. They stay listed as stale until `/repair_minhashes` rehashes
+  them, and their `xcfg` stays stored either way. The same holds for a pending sample stored by an
+  smda older than the escaper compatibility threshold, or before the shingler revision changed,
+  until `/repair_minhashes` or `recalculateMinHashes` has rehashed it.
+
+- **A function without a sample failed every matching job that met it** (#305). Functions whose
+  sample document is gone (left by imports of older releases, #270, by a delete that stopped
+  half-way, or by a sample deleted while a job ran) hit an `AssertionError` as soon as a PicHash or
+  MinHash match reached them. Matches against such samples are now left out, they no longer take a
+  place in the matching shortlist, and the job logs one warning with how many samples and matches it
+  left out. Comparing such a function with `GET /matches/function/{a}/{b}` answers 404 instead of
+  failing. That route also flagged two functions without a PicHash (stored as PicHash 0) as a
+  PicHash match and no longer does; the rest of that fix is the PicHash 0 entry under Security
+  (#265, #305). Internally, `MatcherInterface._restrictToShortlist` no longer returns a single
+  function's candidates when it cannot resolve sample ids; no shipped matcher reaches that branch.
+
+- **A pic_hash that isn't an integer no longer half-stores a sample.** A report's
+  `metadata.pic_hash` comes straight from the submitter, and a dict such as `{"$eq": ...}` was
+  stored as a sub-document; the insert then failed halfway, leaving a sample without its function
+  range and family statistics. It's refused now with the rest of the out-of-range values (see the
+  zero-padded pichash entry). `POST /samples` also answers 400 instead of 500 for any report smda
+  refuses as malformed.
+
+### Security
+
+- A sample whose SMDA report had no timestamp (missing or empty) was stored, but reading it back
+  failed, so the sample listing, the sample itself, its family with samples, the export and every
+  matching job that reached it answered with an error, and the sample could not be deleted through
+  the API. A stored timestamp that cannot be read is now treated as no timestamp. Samples stored
+  earlier read back the same way, without a migration.
+
+- A sample whose SMDA report had no `statistics` was stored in full before submitting it failed with
+  a server error, and from then on every matching job that found a match in it failed with
+  `KeyError: 'num_functions'`. The family counters now count the functions that were stored instead
+  of the figure the report states, the matchers count a sample's functions when its statistics hold
+  none, and importing an export that holds such a sample works.
+
+- The function counter of a family could be set to any value by a report's
+  `statistics.num_functions`; a very large claim saturated it, after which every later report into
+  that family was stored without being counted or hashed. A family now counts the functions that
+  were actually stored, for submitted reports as well as for imports (the sample is counted when its
+  entry is imported and its functions as they are imported). A counter that is already off stays
+  so until `POST /recompute_family_stats` resets it from the stored functions.
+
+- A function in a submitted report whose offset is not one of its blocks, or an AArch64 prologue
+  with an operand such as `#-010`, made the fuzzy shingler raise, which failed every minhash batch
+  holding it (including `complete_minhashes`, `repair_minhashes` and `recalculate_minhashes`, the
+  last after it had already dropped all hashes). The shingler now treats such a function as having
+  no stack frame. A function the shinglers still fail on no longer fails its batch, see below.
+
+- The `sha256` of a submitted SMDA report is now checked to be 64 hex digits; anything else
+  (including a JSON object, which MongoDB read as a query operator and resolved to an existing
+  sample) is answered with 400 and nothing is stored. A report smda refuses as malformed is also
+  answered with 400 instead of a server error.
+
+- A function in a submitted report whose `pic_hash` is not an unsigned 64-bit integer is now
+  answered with 400 and nothing of the report is stored. Before, the in-memory storage stored -1,
+  2**64, 1.5, strings and booleans as they came, and a PicHash like `{"$ne": 0}` or `[1]` failed
+  with a 500 after the sample had already been partly stored.
+
+- Functions whose report carries no PicHash are stored with PicHash 0. The vs and vs-group matchers
+  and the MongoDB sample matching treated 0 as a hash like any other and reported every such
+  function as an exact match of every other one; the in-memory storage failed sample matching, and
+  moving such a sample or its family to another family, with `KeyError: 0`. On MongoDB, a query for
+  PicHash `0000000000000000` answered with every such function. A PicHash of 0 now never matches.
+  Cached matching results from before are recomputed on their next request.
+
+- `POST /import` no longer attaches functions to a sample it did not create. An export entry whose
+  own `sha256` differed from its key, or named a sample already present (including one added by a
+  second import running at the same time), was reported as imported and its functions were stored
+  under the sample id of the exporting instance, on whatever local sample held that id or on none.
+  `importSampleEntry` now returns None for a known sha256, as its interface documents, and the
+  import skips such a sample together with its functions and counts it as skipped. Functions
+  attached by earlier imports are not detached; a sample whose `statistics.num_functions` is lower
+  than its number of functions is worth checking.
+
+- `POST /import` drops imported minhashes whose length is not the configured signature length. Such
+  a minhash used to be stored and banded next to the code it was copied from, and every matching job
+  that drew it as a candidate then failed. The function is still imported, without a minhash, and a
+  minhash repair computes it again. Minhashes of a wrong length stored by earlier imports keep
+  failing matching jobs until `/repair_minhashes` rehashes their sample, if it has disassembly.
+
+- The band projection for the `random` band strategy is derived from the configured signature length
+  instead of from the first minhash a process happens to band. An imported minhash of another length
+  could previously change the band hashes of everything that process wrote afterwards, or make every
+  later banding fail. For correctly configured instances the projection is unchanged.
+
+- A single function that cannot be minhashed no longer fails every batch holding it, on every run.
+  That is one smda cannot rebuild from its stored disassembly (for example an imported `xcfg`
+  holding only an offset), which failed `/complete_minhashes`, `/repair_minhashes`,
+  `/recalculate_minhashes` and `/recalculate_pichashes`, or one the shinglers fail on, from a
+  submitted report or an import, which failed the three minhash jobs, the last of them,
+  `/recalculate_minhashes`, after it had already dropped all hashes. Such a function is skipped and
+  stays unhashed, with a warning naming it, like one without disassembly, and the rest of its batch
+  is hashed.
+  `/recalculate_pichashes` does not stamp its sample as rehashed. `/repair_minhashes` leaves a
+  sample with such a function alone, keeping its minhashes and its stale mark, and counts it as
+  skipped. `/recalculate_minhashes` does not record such a sample as current, so a later repair
+  tries it again.
+
+- Deleting a sample or family, and `/repair_minhashes`, no longer fail on a stored minhash shorter
+  than the configured signature (or not a whole number of entries), as an earlier import could have
+  stored. It never had band entries and is skipped with a warning; before, the sample could not be
+  deleted through the API and every repair run stopped at it.
+
+- `/rebuild_index` no longer stops half way after having emptied the band collections when it meets
+  a function without a minhash field or with a minhash of the wrong length. Those functions are left
+  out with a warning and the rest is indexed.
+
+- `POST /import` limits what it decompresses. Compressed sample content is accepted only as deflate
+  (or stored) data and only up to 20 times its encoded size, or 8 MiB if that is more; anything
+  else is answered with 400 instead of growing the server by gigabytes. Exports of the live corpus
+  inflate to 4 times their encoded size at the median and 11.6 at most. A body that is not JSON is
+  now answered with 400 instead of 500. An export that compresses better than that has to be
+  imported uncompressed. The whole export is read before any sample is stored, so a refused import
+  leaves no sample or function behind.
+
+- A family is attributed to at most 64 actors. `PUT /families/{id}` answers 400 for a longer list,
+  and an import or a family rename that merges into another family adds the first actors that fit
+  and logs a warning for the rest. Deduplication of actor names now takes linear time instead of
+  quadratic. Families already holding more actors keep them.
+
+- **A cross compare takes every sample it names once, and at most 1,000 of them.** With
+  `sample_group_only=true` each child job held the functions and disassembly of every other sample
+  named at once, a repeated id once per repetition: naming a sample of 1,000 functions 40 times in a
+  103-byte path made one child hold 41,000 function entries for +495 MiB. Repeated ids are now
+  dropped before the child jobs are made, and a vs-group child reads the other samples one at a time
+  without their disassembly, keeping their function ids and the functions sharing a PicHash with its
+  own. Reports are unchanged. The id list was bounded only by the length of a URL; more than 1,000
+  distinct samples (`MAX_CROSS_COMPARE_SAMPLES` in `mcrit.index.MinHashIndex`) now answer 400.
+
+- **The plain `mcrit worker` stops a matching or unique-blocks job after `QUEUE_WORKER_JOB_TIMEOUT`
+  seconds** (default 3600, `0` for no limit). Its heartbeat kept a job claimed however long it ran,
+  so a job a request can make long held the worker as long. The matching jobs (sample, vs, vs-group,
+  cross, query) and unique blocks now fail after the limit and are retried like any failing job, up
+  to `QUEUE_MAX_ATTEMPTS` times, as a `spawningworker` job process is after
+  `QUEUE_SPAWNINGWORKER_CHILDREN_TIMEOUT`. They only read the index. Binary submission and the
+  minhash updates are not timed, as an interruption between storing a function's minhash and its band
+  postings would leave it out of fuzzy matching with nothing to repair it, and neither is corpus
+  maintenance (`rebuild*`, `recalculate*`, `repair*`, `doDbCleanup`, deletions, modifications), which
+  takes as long as the corpus is large. Needs `SIGALRM` (POSIX) and the worker in the main thread;
+  otherwise it warns and runs unbounded.
+
+- **A unique-blocks request with a large `covers_required` no longer holds a worker for hours.**
+  When `covers_required` is more than the blocks can reach, the greedy cover selects every unique
+  block, rescanning and resorting all of them, with a list lookup against those already selected,
+  for each one: cubic in the number of blocks. `GET
+  /uniqueblocks/samples/{id}?covers_required=1000000000` for 2,000 unique blocks took 33 s against
+  0.07 s at the default 10. The cover now keeps its candidates in a heap and re-scores only the one
+  on top; it selects the same blocks in the same order, so results and `RESULTS_VERSION` are
+  unchanged.
+
+- **A full band posting list no longer drops whole samples from the index.** Without
+  `STORAGE_BAND_BUCKET_SIZE` a band hash is one document, which MongoDB refuses to grow past 16 MiB
+  (about 1.35 million function ids). Copies of one function share all their band hashes, so a
+  function submitted over and over fills them. Each later sample holding that function then failed
+  its minhash job at the first full band with every band after it left unwritten, and the job's
+  retry found the minhashes stored and stamped the sample as indexed. The refused postings are now
+  left out, with an entry in the `error` collection and a warning naming the band and the hash, and
+  the rest of the sample is indexed. A function holding a full hash is still not found through that
+  band; `STORAGE_BAND_BUCKET_SIZE` lifts the cap (docs/TUNING.md). Main already has the bucketing,
+  off by default, so the default is unchanged.
+
+- **`STORAGE_MAX_EXPORT_SIZE` bounds what an export holds.** The cap counted the JSON size of each
+  sample's function entries, while `GET /export` held them as Python objects, loaded a sample's
+  functions all at once, left family names and actors uncounted, and for `compress=true` counted
+  only the compressed text: an uncompressed export held about 11 times the bytes it counted (346 MiB against 32.3 MB on 360 samples), and `GET /export/{ids}` answered
+  500 past the cap. Both routes now read a sample's functions 1,000 at a time
+  (`getFunctionsBySampleIdInBatches`), keep only the entries' JSON text, count all of it before
+  keeping it and send it as it is. Past the cap both routes answer `{"status": "failed"}`. The
+  response is the same JSON; `MinHashIndex.getExportData()` still returns Python objects,
+  `getExportJson()` the text.
+
+- **A cross compare of about a thousand samples that share no code failed in its last step.**
+  `MatcherCross` ordered the clustering tree with one recursive call per tree level, and samples
+  that share no code cluster into a chain as deep as there are samples, so `combineMatchesToCross`
+  raised `RecursionError` at Python's default limit, leaving the result `null`. The tree is now
+  walked with an explicit stack in the same order, so every cross compare that finished before
+  yields the same result.
+
+- **Behaviour change: `mcrit server` listens on `127.0.0.1:8000` by default**, as the README always
+  said, instead of on every interface. With `MCRIT_AUTH_TOKEN` unset, also the default, the old bind
+  answered anyone who could route to port 8000: `POST /respawn`, `DELETE /jobs` and `GET /export`
+  included. The default is the IPv4 loopback only: where `localhost` resolves to `::1` first, use
+  `http://127.0.0.1:8000` or set `MCRIT_SERVER_BIND=[::1]:8000`. `MCRIT_SERVER_BIND` (`<host>:<port>`) now sets the address for waitress and gunicorn
+  alike; waitress used to ignore `GunicornConfig.BIND`. A bind without a host, such as `:8000`, is
+  read as `127.0.0.1:8000` with a notice, where gunicorn used to take it as every interface. A
+  server that other hosts have to reach, for example in a container, needs
+  `MCRIT_SERVER_BIND=0.0.0.0:8000` (or `BIND` set in its `GunicornConfig.py`), and a
+  `MCRIT_AUTH_TOKEN` unless the network keeps everyone else out; without that such a deployment
+  shows as connection refused from every other host after the upgrade.
+
+- **Behaviour change: an instance without `MCRIT_AUTH_TOKEN` refuses what a foreign web page makes a
+  browser send**, with a 403. A page the analyst merely opened could wipe the instance with a form
+  `POST /respawn`, add samples with a `text/plain` `POST /import`, queue jobs with an `<img>` on a
+  job-scheduling `GET`, and after DNS rebinding read everything. Requests that come from a browser
+  (they carry `Origin` or `Sec-Fetch-*` headers, or a `Mozilla/` User-Agent other than PowerShell's) are now refused for a
+  `Host` other than an IP address, `localhost` or a name in the comma-separated
+  `MCRIT_ALLOWED_HOSTS` (`*` allows any), for being marked `cross-site` or `same-site`, or for an
+  `Origin` other than the API's own. The `GET` routes that schedule a job (the `/rebuild_*`,
+  `/recalculate_*`, `/complete_minhashes` and `/band_df_cutoff_coverage` routes,
+  `/matches/sample/...` and `/uniqueblocks/...`) are no longer served to a browser at all; call them
+  with `McritClient`, curl or another API client. Requests that are not from a browser, such as
+  `McritClient`, MCRITweb and the IDA plugin, are unaffected whatever name they use for the server,
+  and nothing is checked when `MCRIT_AUTH_TOKEN` is set. A browser reaching an instance under a name
+  (a domain, or a reverse proxy passing its own) needs that name in `MCRIT_ALLOWED_HOSTS`; a
+  single-label name listed there can be rebound by anyone who can resolve it on the analyst's
+  network.
+
+- **`mcrit client query -o` writes its report only under a valid job id.** The file was named after
+  the job id exactly as the server answered it, so an id such as
+  `../../.docker/config` put the server's JSON outside the `-o` directory as `.docker/config.json`,
+  overwriting any file of that name, before the report was parsed. An answer that is not a 24-character
+  hex job id, as the server issues them, now ends the query with a message and writes nothing.
+
+- **Workers no longer import modules from their working directory.** The job processes of `mcrit
+  spawningworker` (`python -m mcrit`) and the processes behind the hashing and matching pools and
+  their resource trackers (`python -c`) had the working directory first on `sys.path`, so a `mcrit/`,
+  `multiprocessing/` or similar module placed there ran in them. The job processes now start with
+  `-P`. `mcrit server`, `worker`, `spawningworker` and `singlejobworker` set `PYTHONSAFEPATH` at
+  startup, so everything they spawn inherits it, including pool processes replaced after a crash.
+  Code that uses the pools as a library gets it only while a pool is being created. A source checkout
+  that is not installed has to be on `PYTHONPATH` for the spawning worker.
+
+- **`mcrit client` escapes control characters in what other users stored.** `queue`, `search`,
+  `query` and the warnings of the `dir` and `malpedia` submit modes printed family names, versions,
+  filenames, the sha256 of a submitted report and job parameters raw, so one submission could erase
+  or hide lines, forge a match row or set the window title in another user's terminal. Control
+  characters in them now print as `\x1b`, `\n` and so on.
+
+- **`mcrit client submit --worker` no longer runs modules found in the directory it is started
+  from.** The per-file children ran as `python -m mcrit`, which puts the working directory first on
+  `sys.path`: a `json.py`, `requests/` or `mcrit/` among the files being submitted ran in every
+  child. The children now start with `-P`, and with the interpreter that runs the parent instead of
+  whatever `python` is first on `PATH`. A source checkout that is not installed has to be on
+  `PYTHONPATH` for `--worker`.
+
+- **A file name that is not valid UTF-8 no longer ends a bulk `mcrit client submit`.** The output of
+  a `--worker` child was decoded strictly, and under a locale with a strict stdout (`en_US.UTF-8`)
+  printing such a name raised `UnicodeEncodeError`. The bytes now print as escapes and the run
+  continues: `\xef` in what a `--worker` child printed, `\udcef` in the lines of the command itself.
+
+- **Matching copies of one function no longer pairs every copy with every other.** Copies of one
+  function share a PicHash. The PicHash stage paired each own copy with every copy a sample holds
+  and, as self matches, with every other own copy, so m own copies against n copies cost m*n plus
+  m*(m-1) entries: 2,000 copies in a 1.6 MB `POST /query` took +1 GiB. Now each own copy is matched
+  with the first copy (lowest function id) a sample holds, that sample's other copies are each
+  matched with one own copy, and each own copy is self matched with the next own copy. Every own
+  function still matches every sample holding the code and every copy of it is matched, so counts,
+  percentages and sample summaries are unchanged. What changes is the per-function match lists in a
+  report, where both sides hold several copies. Example: own functions A, B, C share a PicHash, and
+  sample X holds x1 and x2 with it. Before, A, B and C each listed x1 and x2 (6 matches) and each
+  listed the other two as self matches (6). Now the lists hold A-x1, B-x1, C-x1, B-x2 (4), and A-B,
+  B-C, C-A as self matches (3); A-x2, C-x2 and the self matches A-C, B-A, C-B are no longer listed.
+  Functions that occur once per sample are listed exactly as before. The shortlist
+  (`MINHASH_MATCHING_SHORTLIST_SIZE`) still votes by the pairs it would have had, so it picks the
+  same samples. In MCRITweb, the function table of a result counts matched functions, MinHash and
+  PicHash matches per own function from these lists, so copies of one function can now show
+  different counts: A, B and C showed 2, 2 and 2 matched functions in X and now show 1, 2 and 1;
+  the table filtered to one sample lists one row per remaining pair. What remains linear
+  is m own copies against s samples holding the code, which still list m*s matches. `RESULTS_VERSION`
+  goes to 3, so earlier cached results are recomputed on their next request.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct
@@ -1490,6 +2385,7 @@ date, the version, and what changed.
 [1.9.0]: https://github.com/danielplohmann/mcrit/compare/v1.8.1...v1.9.0
 [#44]: https://github.com/danielplohmann/mcrit/issues/44
 [#142]: https://github.com/danielplohmann/mcrit/issues/142
+[#145]: https://github.com/danielplohmann/mcrit/issues/145
 [#147]: https://github.com/danielplohmann/mcrit/pull/147
 [#149]: https://github.com/danielplohmann/mcrit/issues/149
 [#150]: https://github.com/danielplohmann/mcrit/issues/150
@@ -1509,6 +2405,7 @@ date, the version, and what changed.
 [#42]: https://github.com/danielplohmann/mcrit/issues/42
 [#207]: https://github.com/danielplohmann/mcrit/issues/207
 [#210]: https://github.com/danielplohmann/mcrit/issues/210
+[#54]: https://github.com/danielplohmann/mcrit/issues/54
 [#94]: https://github.com/danielplohmann/mcrit/issues/94
 [#241]: https://github.com/danielplohmann/mcrit/issues/241
 [#93]: https://github.com/danielplohmann/mcrit/issues/93
@@ -1529,5 +2426,7 @@ date, the version, and what changed.
 [#252]: https://github.com/danielplohmann/mcrit/issues/252
 [#249]: https://github.com/danielplohmann/mcrit/issues/249
 [#57]: https://github.com/danielplohmann/mcrit/issues/57
+[#53]: https://github.com/danielplohmann/mcrit/issues/53
 [#68]: https://github.com/danielplohmann/mcrit/issues/68
 [#95]: https://github.com/danielplohmann/mcrit/issues/95
+[#283]: https://github.com/danielplohmann/mcrit/issues/283

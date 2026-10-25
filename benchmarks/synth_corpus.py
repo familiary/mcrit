@@ -45,7 +45,10 @@ def load_population(database):
     frequencies = {}
     sizes = {}
     for document in database.functions.find({"minhash": {"$ne": ""}}, {"minhash": 1, "sample_id": 1, "_id": 0}):
-        frequencies[document["minhash"]] = frequencies.get(document["minhash"], 0) + 1
+        # binary, or hex text in a corpus stored before; this script works on the hex form
+        minhash = document["minhash"]
+        signature_hex = minhash.hex() if isinstance(minhash, bytes) else minhash
+        frequencies[signature_hex] = frequencies.get(signature_hex, 0) + 1
         sizes[document["sample_id"]] = sizes.get(document["sample_id"], 0) + 1
     signatures = list(frequencies)
     counts = np.array([frequencies[signature] for signature in signatures], dtype=np.int64)

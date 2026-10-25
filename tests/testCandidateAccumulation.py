@@ -52,7 +52,7 @@ class CannedBandStorage(MongoDbStorage):
     def _getDb(self):
         return self._canned_database
 
-    def _collectBandHashTargets(self, function_id_to_minhash):
+    def _collectBandHashTargets(self, function_id_to_minhash, skips=None):
         return self._targets, self._claimed_by
 
 

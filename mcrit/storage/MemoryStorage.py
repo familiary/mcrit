@@ -2,29 +2,33 @@ import base64
 import datetime
 import functools
 import hashlib
+import heapq
 import io
 import logging
 import operator
 import re
+import time
 import uuid
 from collections import defaultdict
 from copy import copy, deepcopy
-from itertools import zip_longest
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 from packaging import version as packaging_version
 from picblocks.blockhasher import BlockHasher
+from smda.SmdaConfig import SmdaConfig
 
 from mcrit.index.SearchCursor import FullSearchCursor
 from mcrit.index.SearchQueryTree import AndNode, BaseVisitor, FilterSingleElementLists, NodeType, OrNode, PropagateNot, SearchConditionNode, SearchFieldResolver
+from mcrit.libs.tags import MAX_TAGS_PER_ENTITY, TagLimitError, checkTagEntity, mergeTags, normalizeTags, tagLimitMessage
 from mcrit.minhash.MinHash import MinHash
 from mcrit.minhash.MinHasher import MINHASH_SHINGLER_REVISION
 from mcrit.storage.FamilyEntry import FamilyEntry
-from mcrit.storage.FunctionEntry import FunctionEntry
+from mcrit.storage.FunctionEntry import OTHER_LABELS_FIELD, FunctionEntry, checkSubmittedPicHashes, picBlockHashEntries
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
 from mcrit.storage.MatchingCache import MatchingCache, StorageBackedMatchingCache
 from mcrit.storage.SampleEntry import TIMESTAMP_FORMAT, SampleEntry
-from mcrit.storage.StorageInterface import BinaryStream, StorageInterface
+from mcrit.storage.StorageInterface import BandDfSkips, BinaryStream, StorageInterface, isSha256
+from mcrit.storage.UniqueBlocksResult import UniqueBlocksProgressReporter, blockScore
 
 if TYPE_CHECKING:  # pragma: no cover
     from smda.common.SmdaFunction import SmdaFunction
@@ -37,6 +41,9 @@ LOGGER = logging.getLogger(__name__)
 
 # Helper Methods for search
 def _get_field_once(object, field):
+    if field == OTHER_LABELS_FIELD and isinstance(object, FunctionEntry):
+        # derived on the fly here, where MongoDB stores it: the labels that differ from the name
+        return object.getOtherLabels()
     try:
         return getattr(object, field)
     except Exception:
@@ -47,12 +54,29 @@ def _get_field_once(object, field):
         pass
 
 
+# the fields of a label that MongoDB stores (FunctionLabelEntry.toDict)
+_STORED_LABEL_FIELDS = ("function_label", "username", "timestamp")
+
+
 def _get_field(object, field):
     dot_index = field.find(".")
     if dot_index >= 0:
         first_field = field[:dot_index]
         remaining_fields = field[dot_index + 1 :]
-        return _get_field(_get_field_once(object, first_field), remaining_fields)
+        inner = _get_field_once(object, first_field)
+        if isinstance(inner, list):
+            # a path into a list reaches into each of its elements, as in MongoDB:
+            # "function_labels.function_label" is the list of label strings
+            values = []
+            for element in inner:
+                if isinstance(element, FunctionLabelEntry) and remaining_fields not in _STORED_LABEL_FIELDS:
+                    # a label carries its function_id here, never in MongoDB's label documents
+                    values.append(None)
+                    continue
+                value = _get_field(element, remaining_fields)
+                values.extend(value if isinstance(value, list) else [value])
+            return values
+        return _get_field(inner, remaining_fields)
     else:
         return _get_field_once(object, field)
 
@@ -97,16 +121,29 @@ class MemorySearchTranspiler(BaseVisitor):
         }
         # NOTE: the substring operators "?" / "!?" are handled by the early return below
         # and deliberately have no entry here.
+        # A list field (tags, #53) is compared element-wise, the way MongoDB treats an array: a
+        # condition holds when some element satisfies it, and the negated operators "!=" / "!?"
+        # hold when no element matches the positive one - so an empty list satisfies only those.
         value = node.value
         if node.operator.endswith("?"):
+            # Python's case folding, which differs from MongoDB's (PCRE's) for a few non-ASCII letters
             regex = re.compile(re.escape(node.value), re.IGNORECASE)
             inverse = node.operator == "!?"
 
+            def matches(value):
+                # matched as MongoDB stores the value: a datetime as text, a pichash in hex
+                if isinstance(value, datetime.datetime):
+                    value = value.strftime(TIMESTAMP_FORMAT)
+                elif node.field == "pichash" and isinstance(value, int):
+                    value = hex(value)
+                # a regex never matches a missing or non-string value in MongoDB, so "!?" always does
+                return isinstance(value, str) and regex.search(value) is not None
+
             def check_regex(entry):
                 value = _get_field(entry, node.field)
-                if not isinstance(value, str):
-                    return False
-                return (regex.search(value) is not None) ^ inverse
+                # MongoDB matches a list when one of its elements matches
+                found = any(matches(element) for element in value) if isinstance(value, list) else matches(value)
+                return found ^ inverse
 
             return check_regex
 
@@ -115,8 +152,7 @@ class MemorySearchTranspiler(BaseVisitor):
         chosen_operator = string_to_operator[node.operator]
         is_ordering = node.operator in ("<", "<=", ">", ">=")
 
-        def compare(entry):
-            entry_value = _get_field(entry, node.field)
+        def compare_value(entry_value):
             if isinstance(entry_value, datetime.datetime):
                 # compared as stored in MongoDB: as text, which orders like the datetime
                 entry_value = entry_value.strftime(TIMESTAMP_FORMAT)
@@ -124,6 +160,16 @@ class MemorySearchTranspiler(BaseVisitor):
                 # nothing orders against a missing value, as in MongoDB
                 return False
             return chosen_operator(entry_value, compared)
+
+        def compare(entry):
+            entry_value = _get_field(entry, node.field)
+            if isinstance(entry_value, list):
+                # MongoDB matches a list when one of its elements does, and "!=" when none is equal
+                if node.operator == "!=":
+                    return all(compare_value(element) for element in entry_value)
+                # like MongoDB, a range only compares elements of the same type as the value (#53)
+                return any((not is_ordering or type(element) is type(compared)) and compare_value(element) for element in entry_value)
+            return compare_value(entry_value)
 
         return compare
 
@@ -167,6 +213,8 @@ class MemoryStorage(StorageInterface):
         self._bands = {band_number: {} for band_number in range(self._storage_config.STORAGE_NUM_BANDS)}
         self._minhash_versions: Dict[int, str] = {}
         self._minhash_shingler_revisions: Dict[int, int] = {}
+        # sample_id -> (smda version, shingler revision) it was stored by, until its minhashes are recorded
+        self._minhash_pending: Dict[int, Tuple[str, int]] = {}
         self._counters = defaultdict(lambda: 0)
         # initialize query sample/function ids
         if self._counters["query_samples"] == 0:
@@ -176,6 +224,8 @@ class MemoryStorage(StorageInterface):
         # caches
         self._sample_by_sha256 = {}
         self._sample_id_to_function_ids = defaultdict(list)
+        # sample_id -> the claim of the job replacing its analysis, and what that job staged (#270)
+        self._verification_claims: Dict[int, Dict[str, Any]] = {}
         unknown_family_id = self.addFamily("")
         assert unknown_family_id == 0
 
@@ -202,7 +252,6 @@ class MemoryStorage(StorageInterface):
         """For MemoryStorage, this is a dummy function and we do not persist logging messages"""
         logging.info(event_msg)
 
-    # TODO check if this works
     def deleteSample(self, sample_id: int) -> bool:
         if not self.isSampleId(sample_id):
             return False
@@ -216,27 +265,10 @@ class MemoryStorage(StorageInterface):
             self._smda_extras.pop(sample_id, None)
             return True
         for function_id in function_ids:
-            function_entry = self._functions[function_id]
-            minhash = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
-            # remove function
-            del self._functions[function_id]
-            # remove pichash entries
-            if function_entry.pichash:
-                self._pichashes[function_entry.pichash].remove((function_entry.family_id, sample_id, function_id))
-            # remove minhash entries, if necessary
-            if not minhash or not minhash.hasMinHash():
-                continue
-            band_hashes = self.getBandHashesForMinHash(minhash)
-            for band_number, band_hash in sorted(band_hashes.items()):
-                if band_hash not in self._bands[band_number]:
-                    continue
-                # delete function id from bandhash
-                self._bands[band_number][band_hash].remove(function_id)
-                # delete bandhash if empty
-                if not self._bands[band_number][band_hash]:
-                    del self._bands[band_number][band_hash]
+            self._removeFunction(function_id, sample_id)
         # remove references
         del self._sample_id_to_function_ids[sample_id]
+        self._verification_claims.pop(sample_id, None)
         # in case to samples with same sha256 are added and then removed, it could crash, so remove entry safely
         self._sample_by_sha256.pop(self._samples[sample_id].sha256, None)
 
@@ -252,6 +284,133 @@ class MemoryStorage(StorageInterface):
         if sample_entry.family_id != 0 and not any(s.family_id == sample_entry.family_id for s in self._samples.values()):
             self._families.pop(sample_entry.family_id, None)
         return True
+
+    def getFunctionPicHashesBySampleId(self, sample_id: int) -> Dict[int, int]:
+        if sample_id not in self._samples:
+            return {}
+        return {self._functions[function_id].offset: self._functions[function_id].pichash for function_id in self._sample_id_to_function_ids[sample_id]}
+
+    def _heldClaim(self, sample_id: int, token: str) -> Optional[Dict[str, Any]]:
+        claim = self._verification_claims.get(sample_id)
+        if claim is None or claim["token"] != token or sample_id not in self._samples:
+            return None
+        return claim
+
+    def getSampleVerificationClaim(self, sample_id: int) -> Optional[Dict[str, Any]]:
+        claim = self._verification_claims.get(sample_id)
+        if claim is None:
+            return None
+        # a swap here is a single call, never left half done
+        return {"token": claim["token"], "job_id": claim["job_id"], "claimed_at": claim["claimed_at"], "swap_started": False}
+
+    def claimSampleVerification(self, sample_id: int, token: str, job_id: Optional[str], stale_after: float, dead_token: Optional[str] = None) -> str:
+        sample_entry = self._samples.get(sample_id)
+        if sample_entry is None:
+            return "missing"
+        if sample_entry.sha256_verified is True:
+            return "verified"
+        claim = self._verification_claims.get(sample_id)
+        if claim is not None and claim["token"] not in (token, dead_token) and time.time() - claim["claimed_at"] < stale_after:
+            return "busy"
+        # what a dead job staged goes with its claim
+        self._verification_claims[sample_id] = {"token": token, "job_id": job_id, "claimed_at": time.time(), "staged": None}
+        return "claimed"
+
+    def renewSampleVerification(self, sample_id: int, token: str) -> bool:
+        claim = self._heldClaim(sample_id, token)
+        if claim is None:
+            return False
+        claim["claimed_at"] = time.time()
+        return True
+
+    def releaseSampleVerification(self, sample_id: int, token: str) -> None:
+        if self._heldClaim(sample_id, token) is not None:
+            del self._verification_claims[sample_id]
+
+    def stageSampleAnalysis(self, sample_id: int, smda_report: "SmdaReport", token: str) -> bool:
+        claim = self._heldClaim(sample_id, token)
+        if claim is None:
+            return False
+        assert smda_report.sha256 == self._samples[sample_id].sha256
+        new_entry = SampleEntry(smda_report, sample_id=sample_id, family_id=0, sha256_verified=True)
+        # built aside, nothing reads them before the swap
+        function_entries = [self._buildFunctionEntry(new_entry, smda_function) for smda_function in smda_report.getFunctions()]
+        claim["staged"] = (new_entry, function_entries, SampleEntry.smdaExtrasOf(smda_report))
+        return True
+
+    def swapSampleAnalysis(self, sample_id: int, token: str, filename: Optional[str] = None, family: Optional[str] = None, version: Optional[str] = None) -> Dict[str, Any]:
+        claim = self._heldClaim(sample_id, token)
+        if claim is None:
+            return {"status": "sample_deleted" if sample_id not in self._samples else "claim_lost"}
+        assert claim["staged"] is not None
+        new_entry, new_function_entries, smda_extras = claim["staged"]
+        # the sample as it is now, not as it was when the job began
+        current_entry = self._samples[sample_id]
+        if family is not None and family != current_entry.family:
+            self.modifySample(sample_id, {"family_name": family})
+        family_id = current_entry.family_id
+        old_function_ids = list(self._sample_id_to_function_ids[sample_id])
+        labels_by_offset = {}
+        for function_id in old_function_ids:
+            function_entry = self._functions[function_id]
+            if function_entry.function_labels:
+                labels_by_offset[function_entry.offset - current_entry.base_addr] = function_entry.function_labels
+        labels_carried = 0
+        new_offsets = set()
+        for function_entry in new_function_entries:
+            function_entry.family_id = family_id
+            relative_offset = function_entry.offset - new_entry.base_addr
+            new_offsets.add(relative_offset)
+            function_entry.function_labels = [deepcopy(label) for label in labels_by_offset.get(relative_offset, [])]
+            labels_carried += len(function_entry.function_labels)
+        labels_dropped = sum(len(labels) for offset, labels in labels_by_offset.items() if offset not in new_offsets)
+        for function_id in old_function_ids:
+            self._removeFunction(function_id, sample_id)
+        for function_entry in new_function_entries:
+            self._registerFunction(function_entry)
+        self._sample_id_to_function_ids[sample_id] = [function_entry.function_id for function_entry in new_function_entries]
+        new_entry.family_id = family_id
+        new_entry.family = current_entry.family
+        new_entry.filename = filename if filename is not None else current_entry.filename
+        new_entry.version = version if version is not None else current_entry.version
+        new_entry.is_library = current_entry.is_library
+        new_entry.component = current_entry.component
+        self._samples[sample_id] = new_entry
+        self._smda_extras[sample_id] = smda_extras
+        # the new functions are unhashed, whatever escaper hashed the old ones
+        self._minhash_versions.pop(sample_id, None)
+        self._minhash_shingler_revisions.pop(sample_id, None)
+        self._updateFamilyStats(family_id, 0, len(new_function_entries) - len(old_function_ids), 0)
+        del self._verification_claims[sample_id]
+        self._updateDbState()
+        return {
+            "status": "replaced",
+            "old_num_functions": len(old_function_ids),
+            "new_num_functions": len(new_function_entries),
+            "labels_carried": labels_carried,
+            "labels_dropped": labels_dropped,
+        }
+
+    def _removeFunction(self, function_id: int, sample_id: int) -> None:
+        """Remove a regular function along with its pichash and band entries."""
+        function_entry = self._functions.pop(function_id)
+        # 0 is a function without a PicHash, never indexed; an emptied bucket goes with its last holder
+        if function_entry.pichash:
+            matches = self._pichashes.get(function_entry.pichash)
+            if matches is not None:
+                matches.discard((function_entry.family_id, sample_id, function_id))
+                if not matches:
+                    del self._pichashes[function_entry.pichash]
+        # one that cannot have been banded is not read at all
+        if not self._hasBandableLength(function_entry.minhash):
+            return
+        minhash = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
+        for band_number, band_hash in sorted(self.getBandHashesForMinHash(minhash).items()):
+            if band_hash not in self._bands[band_number]:
+                continue
+            self._bands[band_number][band_hash].remove(function_id)
+            if not self._bands[band_number][band_hash]:
+                del self._bands[band_number][band_hash]
 
     def modifySample(self, sample_id: int, update_information: dict) -> bool:
         if not self.isSampleId(sample_id):
@@ -269,17 +428,21 @@ class MemoryStorage(StorageInterface):
             # update sample_entry and function_entries with new family information
             self._samples[sample_id].family = family_name
             self._samples[sample_id].family_id = family_id
+            num_functions_moved = 0
             for function_id, function_entry in self._functions.items():
                 if function_entry.sample_id == sample_id:
                     function_entry.family_id = family_id
                     self._functions[function_id] = function_entry
-                    self._pichashes[function_entry.pichash].remove((old_family_id, sample_id, function_id))
-                    self._pichashes[function_entry.pichash].add((family_id, sample_id, function_id))
-            # update family information itself
+                    # 0 is what a function without a PicHash is stored with, and never indexed
+                    if function_entry.pichash:
+                        self._pichashes[function_entry.pichash].remove((old_family_id, sample_id, function_id))
+                        self._pichashes[function_entry.pichash].add((family_id, sample_id, function_id))
+                    num_functions_moved += 1
+            # update family information itself, by the functions moved as MongoDbStorage does
             self._families[old_family_id].num_samples -= 1
-            self._families[old_family_id].num_functions -= self._samples[sample_id].statistics["num_functions"]
+            self._families[old_family_id].num_functions -= num_functions_moved
             self._families[family_id].num_samples += 1
-            self._families[family_id].num_functions += self._samples[sample_id].statistics["num_functions"]
+            self._families[family_id].num_functions += num_functions_moved
             if self._samples[sample_id].is_library:
                 self._families[old_family_id].num_library_samples -= 1
                 self._families[family_id].num_library_samples += 1
@@ -330,9 +493,17 @@ class MemoryStorage(StorageInterface):
             new_num_functions = new_family_info.num_functions + old_family_info.num_functions
             new_num_lib_samples = new_family_info.num_library_samples + old_family_info.num_library_samples
             # the attribution moves with the samples: a rename onto an existing family merges
-            # both actor lists (a review of #57 caught the rename dropping them)
-            merged_actors = FamilyEntry.normalizeActors(list(new_family_info.actors or []) + list(old_family_info.actors or []))
+            # both actor lists (a review of #57 caught the rename dropping them), up to MAX_ACTORS
+            # as an import does - uncapped, renaming many families into one grew it without bound
+            merged_actors, num_dropped = FamilyEntry.mergeActors(new_family_info.actors, old_family_info.actors)
+            if num_dropped:
+                LOGGER.warning(
+                    "Family %d would be attributed to more than %d actors, dropping %d actors of merged family %d.", new_family_id, FamilyEntry.MAX_ACTORS, num_dropped, family_id
+                )
             self._families[new_family_id].actors = merged_actors
+            # and so do its tags (#53), as a union with those the target carries already, which is
+            # not capped at MAX_TAGS_PER_ENTITY (see mcrit.libs.tags)
+            self._families[new_family_id].tags = mergeTags(new_family_info.tags, old_family_info.tags)
             # update family_entry
             if family_id == 0:
                 self._families[0].num_samples = 0
@@ -351,10 +522,50 @@ class MemoryStorage(StorageInterface):
             for function_id, function_entry in self._functions.items():
                 if family_id == function_entry.family_id:
                     self._functions[function_id].family_id = new_family_id
-                    self._pichashes[function_entry.pichash].remove((family_id, function_entry.sample_id, function_id))
-                    self._pichashes[function_entry.pichash].add((new_family_id, function_entry.sample_id, function_id))
+                    if function_entry.pichash:
+                        self._pichashes[function_entry.pichash].remove((family_id, function_entry.sample_id, function_id))
+                        self._pichashes[function_entry.pichash].add((new_family_id, function_entry.sample_id, function_id))
         self._updateDbState()
         return True
+
+    def _getTaggableEntry(self, entity: str, entity_id: int) -> Optional[Union[FamilyEntry, SampleEntry, FunctionEntry]]:
+        # the stored object itself, not a copy: getSampleById and getFunctionById hand out copies
+        if checkTagEntity(entity) == "family":
+            return self._families.get(entity_id)
+        if entity_id < 0:
+            return None
+        if entity == "sample":
+            return self._samples.get(entity_id)
+        return self._functions.get(entity_id)
+
+    def addTags(self, entity: str, entity_id: int, tags: List[str]) -> Optional[List[str]]:
+        tags = normalizeTags(tags)
+        entry = self._getTaggableEntry(entity, entity_id)
+        if entry is None:
+            return None
+        merged = mergeTags(entry.tags, tags)
+        # a union past the cap is refused as a whole, as MongoDbStorage refuses it
+        if len(merged) > MAX_TAGS_PER_ENTITY:
+            raise TagLimitError(tagLimitMessage(entity, entity_id, len(entry.tags)))
+        entry.tags = merged
+        return list(entry.tags)
+
+    def removeTags(self, entity: str, entity_id: int, tags: List[str]) -> Optional[List[str]]:
+        tags = normalizeTags(tags)
+        entry = self._getTaggableEntry(entity, entity_id)
+        if entry is None:
+            return None
+        removed = set(tags)
+        entry.tags = [tag for tag in entry.tags if tag not in removed]
+        return list(entry.tags)
+
+    def getTagCounts(self, entity: str) -> Dict[str, int]:
+        entries = {"family": self._families, "sample": self._samples, "function": self._functions}[checkTagEntity(entity)]
+        counts: Dict[str, int] = defaultdict(int)
+        for entry in entries.values():
+            for tag in entry.tags:
+                counts[tag] += 1
+        return dict(sorted(counts.items()))
 
     def deleteOrphanedQueryData(self) -> Dict[str, int]:
         # query entries live in their own collections here, keyed like the regular ones
@@ -404,11 +615,29 @@ class MemoryStorage(StorageInterface):
         return True
 
     def recomputeFamilyStats(self, progress_reporter=None) -> Dict[str, Any]:
-        report: Dict[str, Any] = {"num_families": 0, "num_families_corrected": 0, "num_families_created": 0, "corrections": {}}
+        report: Dict[str, Any] = {"num_families": 0, "num_families_corrected": 0, "num_families_created": 0, "num_families_merged": 0, "corrections": {}}
+        missing_family_names: Dict[int, str] = {}
         for sample_entry in self._samples.values():
             if sample_entry.family_id not in self._families:
-                self._families[sample_entry.family_id] = FamilyEntry(family_name=sample_entry.family, family_id=sample_entry.family_id)
+                missing_family_names.setdefault(sample_entry.family_id, sample_entry.family)
+        for family_id, family_name in missing_family_names.items():
+            other_family_id = self.getFamilyId(family_name)
+            if other_family_id is None:
+                self._families[family_id] = FamilyEntry(family_name=family_name, family_id=family_id)
                 report["num_families_created"] += 1
+                continue
+            # a name is one family, as in MongoDbStorage: its samples and functions are filed there
+            LOGGER.warning("Family %d has no entry, and its name %r is family %d's: its samples and functions are filed there.", family_id, family_name, other_family_id)
+            for sample_entry in self._samples.values():
+                if sample_entry.family_id == family_id:
+                    sample_entry.family_id = other_family_id
+            for function_id, function_entry in self._functions.items():
+                if function_entry.family_id == family_id:
+                    function_entry.family_id = other_family_id
+                    if function_entry.pichash:
+                        self._pichashes[function_entry.pichash].discard((family_id, function_entry.sample_id, function_id))
+                        self._pichashes[function_entry.pichash].add((other_family_id, function_entry.sample_id, function_id))
+            report["num_families_merged"] += 1
         functions_by_family: Dict[int, int] = {}
         for function_entry in self._functions.values():
             functions_by_family[function_entry.family_id] = functions_by_family.get(function_entry.family_id, 0) + 1
@@ -430,17 +659,20 @@ class MemoryStorage(StorageInterface):
         num_hashed = 0
         for function_id in self._sample_id_to_function_ids[sample_id]:
             function_entry = self._functions[function_id]
-            minhash = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
-            if not minhash or not minhash.hasMinHash():
+            if not function_entry.minhash:
                 continue
             num_hashed += 1
-            for band_number, band_hash in sorted(self.getBandHashesForMinHash(minhash).items()):
+            # as in deleteSample, one that cannot have been banded is not read
+            band_hashes = {}
+            if self._hasBandableLength(function_entry.minhash):
+                band_hashes = self.getBandHashesForMinHash(function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS))
+            for band_number, band_hash in sorted(band_hashes.items()):
                 if band_hash in self._bands[band_number]:
                     self._bands[band_number][band_hash] = [fid for fid in self._bands[band_number][band_hash] if fid != function_id]
                     if not self._bands[band_number][band_hash]:
                         del self._bands[band_number][band_hash]
             function_entry.minhash = b""
-            function_entry.shingler_composition = {}
+            function_entry.minhash_shingle_composition = {}
         self._minhash_versions.pop(sample_id, None)
         self._minhash_shingler_revisions.pop(sample_id, None)
         return num_hashed
@@ -448,6 +680,7 @@ class MemoryStorage(StorageInterface):
     def deleteRehashableMinHashes(self, progress_reporter=None) -> Set[int]:
         self._bands = {band_number: {} for band_number in self._bands}
         kept_sample_ids: Set[int] = set()
+        signature_bytes = self._minhash_config.MINHASH_SIGNATURE_LENGTH * (1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4)
         for function_entry in self._functions.values():
             minhash = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
             if not minhash or not minhash.hasMinHash():
@@ -456,8 +689,11 @@ class MemoryStorage(StorageInterface):
                 function_entry.minhash = b""
                 function_entry.minhash_shingle_composition = {}
             else:
-                # no disassembly to compute it from again: kept, and banded again
-                self.addMinHash(minhash)
+                # no disassembly to compute it from again: kept, and banded again - unless it is of
+                # another length than the configured signature, which does not fit the band projection
+                if len(function_entry.minhash) == signature_bytes:
+                    # rebuilt from its bytes, it carries no composition: the function keeps its own
+                    self.addMinHash(minhash, keep_composition=True)
                 kept_sample_ids.add(function_entry.sample_id)
         return kept_sample_ids
 
@@ -468,12 +704,37 @@ class MemoryStorage(StorageInterface):
         self._bands = {band_number: {} for band_number in self._bands}
         return num_deleted
 
-    def setMinHashVersionForSamples(self, smda_version: str, sample_ids: Optional[List[int]] = None, except_sample_ids: Optional[Iterable[int]] = None) -> None:
+    def setMinHashVersionForSamples(
+        self, smda_version: str, sample_ids: Optional[List[int]] = None, except_sample_ids: Optional[Iterable[int]] = None, finish_pending: bool = False
+    ) -> None:
         excepted = set(except_sample_ids or [])
         for sample_id in list(self._samples) if sample_ids is None else sample_ids:
             if sample_id in self._samples and sample_id not in excepted:
                 self._minhash_versions[sample_id] = smda_version
                 self._minhash_shingler_revisions[sample_id] = MINHASH_SHINGLER_REVISION
+                if finish_pending:
+                    self._minhash_pending.pop(sample_id, None)
+                elif sample_id in self._minhash_pending:
+                    self._minhash_pending[sample_id] = (smda_version, MINHASH_SHINGLER_REVISION)
+
+    def getSamplesWithPendingMinHashes(self, threshold_version: str) -> List[int]:
+        threshold = packaging_version.parse(threshold_version)
+        return sorted(
+            sample_id
+            for sample_id, (smda_version, shingler_revision) in self._minhash_pending.items()
+            if sample_id in self._samples and not self._isStaleMinHashVersion(smda_version, threshold) and shingler_revision == MINHASH_SHINGLER_REVISION
+        )
+
+    def getSamplesWithUnhashedFunctions(self, sample_ids: List[int]) -> Set[int]:
+        return {
+            sample_id
+            for sample_id in sample_ids
+            if sample_id in self._samples
+            and any(
+                not function_entry.minhash and function_entry.xcfg and self.isHashableBySize(function_entry.num_instructions, function_entry.num_blocks)
+                for function_entry in (self._functions[function_id] for function_id in self._sample_id_to_function_ids[sample_id])
+            )
+        }
 
     def getSamplesWithStaleMinHashes(self, threshold_version: str) -> List[int]:
         threshold = packaging_version.parse(threshold_version)
@@ -542,8 +803,10 @@ class MemoryStorage(StorageInterface):
                 assert matched_function_id is not None
                 self._functions[matched_function_id].function_labels.append(new_function_entry_label)
 
-    def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False) -> Optional["SampleEntry"]:
+    def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False, sha256_verified=False) -> Optional["SampleEntry"]:
         assert smda_report.sha256 is not None
+        # refused as MongoDbStorage refuses it, before any of the report is stored
+        checkSubmittedPicHashes(smda_report)
         sample_entry = None
         if isQuery:
             sample_entry = SampleEntry(smda_report, sample_id=-1 * self._useCounter("query_samples"), family_id=0)
@@ -557,7 +820,7 @@ class MemoryStorage(StorageInterface):
         else:
             if not self.getSampleBySha256(smda_report.sha256):
                 family_id = self.addFamily(smda_report.family or "")
-                sample_entry = SampleEntry(smda_report, sample_id=self._useCounter("samples"), family_id=family_id)
+                sample_entry = SampleEntry(smda_report, sample_id=self._useCounter("samples"), family_id=family_id, sha256_verified=sha256_verified)
                 self._samples[sample_entry.sample_id] = sample_entry
                 self._sample_by_sha256[sample_entry.sha256] = sample_entry.sample_id
                 self._smda_extras[sample_entry.sample_id] = SampleEntry.smdaExtrasOf(smda_report)
@@ -566,7 +829,9 @@ class MemoryStorage(StorageInterface):
                     function_entry = self._addFunction(sample_entry, smda_function)
                     function_ids.append(function_entry.function_id)
                 self._sample_id_to_function_ids[sample_entry.sample_id] = function_ids
-                self._updateFamilyStats(family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))
+                # the functions stored, as deleteSample counts them: the report's statistics are its own claim
+                self._updateFamilyStats(family_id, +1, len(function_ids), int(sample_entry.is_library))
+                self._minhash_pending[sample_entry.sample_id] = (SmdaConfig().VERSION, MINHASH_SHINGLER_REVISION)
             else:
                 LOGGER.warning("Sample %s already existed, skipping.", smda_report.sha256)
         return sample_entry
@@ -575,11 +840,21 @@ class MemoryStorage(StorageInterface):
         if not self.getSampleBySha256(sample_entry.sha256):
             sample_id = self._useCounter("samples")
             sample_entry.sample_id = sample_id
+            # whatever the export says: this instance has never seen the sample's bytes (#270)
+            sample_entry.sha256_verified = False
             self._samples[sample_id] = sample_entry
             self._sample_by_sha256[sample_entry.sha256] = sample_id
-            self._updateFamilyStats(sample_entry.family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))
+            # its functions are counted as they are imported, not by the statistics the export states;
+            # the caller learns of the sample only once this returns, as in MongoDbStorage
+            try:
+                self._updateFamilyStats(sample_entry.family_id, +1, 0, int(sample_entry.is_library))
+            except Exception:
+                del self._samples[sample_id]
+                self._sample_by_sha256.pop(sample_entry.sha256, None)
+                raise
             return sample_entry
-        # the entry still carries the id it had in the export, which here may well be another sample's
+        # not this entry's sample: the entry still carries the id it had in the export, which here may
+        # well be another sample's, so the caller must not attach the entry's functions to its sample_id
         LOGGER.warning("Sample %s already existed, skipping.", sample_entry.sha256)
         return None
 
@@ -589,21 +864,48 @@ class MemoryStorage(StorageInterface):
         # only the sample this entry was imported as, as MongoDbStorage does
         if stored is None or stored.sha256 != sample_entry.sha256:
             return
+        num_functions_discarded = 0
         for function_id in self._sample_id_to_function_ids.pop(sample_id, []):
             function_entry = self._functions.pop(function_id, None)
-            if function_entry is not None and function_entry.pichash:
-                self._pichashes.get(function_entry.pichash, set()).discard((function_entry.family_id, sample_id, function_id))
+            if function_entry is None:
+                continue
+            num_functions_discarded += 1
+            if function_entry.pichash:
+                matches = self._pichashes.get(function_entry.pichash)
+                if matches is not None:
+                    matches.discard((function_entry.family_id, sample_id, function_id))
+                    if not matches:
+                        del self._pichashes[function_entry.pichash]
+            # and its band entries, of which a failed addMinHashes may have left none
+            if not self._hasBandableLength(function_entry.minhash):
+                continue
+            for band_number, band_hash in self.getBandHashesForMinHash(function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)).items():
+                band_function_ids = self._bands[band_number].get(band_hash)
+                if band_function_ids is not None and function_id in band_function_ids:
+                    band_function_ids.remove(function_id)
+                    if not band_function_ids:
+                        del self._bands[band_number][band_hash]
         del self._samples[sample_id]
         self._sample_by_sha256.pop(sample_entry.sha256, None)
-        # the mirror of importSampleEntry's increment; the family stays, as in MongoDbStorage
-        self._updateFamilyStats(sample_entry.family_id, -1, -sample_entry.statistics["num_functions"], -int(sample_entry.is_library))
+        # the mirror of the increments of importSampleEntry and of its functions' imports; the family
+        # stays, as in MongoDbStorage
+        self._updateFamilyStats(sample_entry.family_id, -1, -num_functions_discarded, -int(sample_entry.is_library))
         self._updateDbState()
+
+    def discardImportedFamily(self, family_id: int) -> bool:
+        if family_id == 0 or family_id not in self._families or any(sample_entry.family_id == family_id for sample_entry in self._samples.values()):
+            return False
+        del self._families[family_id]
+        self._updateDbState()
+        return True
 
     def importFunctionEntry(self, function_entry: "FunctionEntry") -> Optional["FunctionEntry"]:
         function_entry.function_id = self._useCounter("functions")
         if function_entry.function_name and len(function_entry.function_labels) == 0:
             new_function_entry_label = FunctionLabelEntry(function_entry.function_name, "mcrit-import")
             function_entry.function_labels.append(new_function_entry_label)
+        # counted before it is stored, as in importFunctionEntries
+        self._updateFamilyStats(function_entry.family_id, 0, 1, 0)
         # add function to regular storage
         self._functions[function_entry.function_id] = function_entry
         if function_entry.sample_id not in self._sample_id_to_function_ids:
@@ -621,6 +923,9 @@ class MemoryStorage(StorageInterface):
             if function_entry.function_name and len(function_entry.function_labels) == 0:
                 new_function_entry_label = FunctionLabelEntry(function_entry.function_name, "mcrit-import")
                 function_entry.function_labels.append(new_function_entry_label)
+            # counted before it is stored, so that discardImportedSample, which takes off the functions
+            # it finds stored, never takes off one its family did not count
+            self._updateFamilyStats(function_entry.family_id, 0, 1, 0)
             # add function to regular storage
             self._functions[function_entry.function_id] = function_entry
             if function_entry.sample_id not in self._sample_id_to_function_ids:
@@ -632,7 +937,6 @@ class MemoryStorage(StorageInterface):
                 self._pichashes[function_entry.pichash].add((function_entry.family_id, function_entry.sample_id, function_entry.function_id))
         return function_entries
 
-    # TODO return type?
     def getLibraryInfoForSampleId(self, sample_id: int) -> Optional[Dict[str, str]]:
         if sample_id not in self._samples:
             return None
@@ -654,16 +958,20 @@ class MemoryStorage(StorageInterface):
             function_entry = FunctionEntry(sample_entry, smda_function, -1 * self._useCounter("query_functions"), minhash=minhash)
             self._query_functions[function_entry.function_id] = function_entry
             return function_entry
-        else:
-            function_entry = FunctionEntry(sample_entry, smda_function, self._useCounter("functions"), minhash=minhash)
+        function_entry = self._buildFunctionEntry(sample_entry, smda_function, minhash=minhash)
+        self._registerFunction(function_entry, minhash=minhash)
+        return function_entry
+
+    def _buildFunctionEntry(self, sample_entry: "SampleEntry", smda_function: "SmdaFunction", minhash: Optional["MinHash"] = None) -> "FunctionEntry":
+        """A regular function's entry with its block hashes, not yet stored."""
+        function_entry = FunctionEntry(sample_entry, smda_function, self._useCounter("functions"), minhash=minhash)
         image_lower = sample_entry.base_addr
         image_upper = image_lower + sample_entry.binary_size
-        picblockhashes = []
-        for hash_entry in self.blockhasher.getBlockhashesForFunction(smda_function, image_lower, image_upper, hash_size=8):
-            for block_entry in hash_entry["offset_tuples"]:
-                block_entry["hash"] = hash_entry["hash"]
-                picblockhashes.append(block_entry)
-        function_entry.picblockhashes = picblockhashes
+        function_entry.picblockhashes = picBlockHashEntries(self.blockhasher, smda_function, image_lower, image_upper)
+        return function_entry
+
+    def _registerFunction(self, function_entry: "FunctionEntry", minhash: Optional["MinHash"] = None) -> None:
+        """Store a regular function built by _buildFunctionEntry, with its pichash and band entries."""
         self._functions[function_entry.function_id] = function_entry
         if minhash and minhash.hasMinHash():
             minhash.function_id = function_entry.function_id
@@ -671,10 +979,9 @@ class MemoryStorage(StorageInterface):
         if function_entry.pichash:
             if function_entry.pichash not in self._pichashes:
                 self._pichashes[function_entry.pichash] = set()
-            self._pichashes[function_entry.pichash].add((function_entry.family_id, sample_entry.sample_id, function_entry.function_id))
-        return function_entry
+            self._pichashes[function_entry.pichash].add((function_entry.family_id, function_entry.sample_id, function_entry.function_id))
 
-    def addMinHash(self, minhash: "MinHash") -> bool:
+    def addMinHash(self, minhash: "MinHash", keep_composition: bool = False) -> bool:
         if minhash.function_id is None:
             return False
         is_query_function = minhash.function_id < 0
@@ -683,15 +990,16 @@ class MemoryStorage(StorageInterface):
             LOGGER.warning("addMinHash() - no function with id %d, skipping its minhash.", minhash.function_id)
             return False
         functions[minhash.function_id].minhash = minhash.getMinHash()
-        functions[minhash.function_id].minhash_shingle_composition = minhash.getComposition()
+        if not keep_composition:
+            functions[minhash.function_id].minhash_shingle_composition = minhash.getComposition()
         # query functions are not indexed into bands, they are only ever used as query input
         if not is_query_function:
             self._addMinHashToBands(minhash)
         return True
 
-    def addMinHashes(self, minhashes: List["MinHash"]) -> None:
+    def addMinHashes(self, minhashes: List["MinHash"], keep_composition: bool = False) -> None:
         for minhash in minhashes:
-            self.addMinHash(minhash)
+            self.addMinHash(minhash, keep_composition=keep_composition)
 
     def createMatchingCache(self, function_ids: List[int], allow_self_return: bool = False, previous: Optional[MatchingCache] = None) -> MatchingCache:
         # previous is accepted for interface compatibility; MemoryStorage serves from memory
@@ -725,13 +1033,8 @@ class MemoryStorage(StorageInterface):
         cache_data["sample_id_to_func_ids"] = sample_to_func_ids
         return cache_data
 
-    def clearMatchingCache(self) -> None:
-        """no dedicated cache - no cleanup"""
-        return
-
     def getSampleIds(self) -> List[int]:
-        # TODO is deepcopy necessary?
-        return deepcopy(list(self._samples.keys()))
+        return list(self._samples)
 
     def getSamplesByFamilyId(self, family_id: int) -> Optional[List[SampleEntry]]:
         if family_id not in self._families:
@@ -739,8 +1042,7 @@ class MemoryStorage(StorageInterface):
         return [self._samples[sample_id] for sample_id in self._samples if self._samples[sample_id].family_id == family_id]
 
     def getFamilyIds(self) -> List[int]:
-        # TODO is deepcopy necessary?
-        return deepcopy(list(self._families.keys()))
+        return list(self._families)
 
     def isSampleId(self, sample_id: int) -> bool:
         return sample_id in self._samples or sample_id in self._query_samples
@@ -790,11 +1092,15 @@ class MemoryStorage(StorageInterface):
         return None
 
     def addFamily(self, family_name: str) -> int:
+        return self.ensureFamily(family_name)[0]
+
+    def ensureFamily(self, family_name: str) -> Tuple[int, bool]:
         family_id = self.getFamilyId(family_name)
-        if family_id is None:
-            family_id = self._useCounter("families")
-            self._families[family_id] = FamilyEntry(family_name=family_name, family_id=family_id)
-        return family_id
+        if family_id is not None:
+            return family_id, False
+        family_id = self._useCounter("families")
+        self._families[family_id] = FamilyEntry(family_name=family_name, family_id=family_id)
+        return family_id, True
 
     def getFunctionsByIds(self, function_ids: List[int]) -> Dict[int, "FunctionEntry"]:
         function_entries = {}
@@ -819,7 +1125,7 @@ class MemoryStorage(StorageInterface):
         return None
 
     # TODO does this need to be more efficient?
-    def getFunctionsBySampleId(self, sample_id: int) -> Optional[List["FunctionEntry"]]:
+    def getFunctionsBySampleId(self, sample_id: int, with_xcfg: bool = True) -> Optional[List["FunctionEntry"]]:
         if sample_id in self._samples or sample_id in self._query_samples:
             function_ids = self._sample_id_to_function_ids[sample_id]
             function_entries = []
@@ -830,8 +1136,18 @@ class MemoryStorage(StorageInterface):
                     function_entry = self._functions[function_id]
                 function_entries.append(function_entry)
             # TODO is deepcopy necessary?
-            return deepcopy(function_entries)
+            # without disassembly: the memo hands each xcfg over as None instead of copying it
+            memo = {} if with_xcfg else {id(entry.xcfg): None for entry in function_entries if entry.xcfg is not None}
+            return deepcopy(function_entries, memo)
         return None
+
+    def getFunctionsBySampleIdInBatches(self, sample_id: int, batch_size: int = 1000) -> Iterator[List["FunctionEntry"]]:
+        if sample_id not in self._samples and sample_id not in self._query_samples:
+            return
+        functions = self._query_functions if sample_id < 0 else self._functions
+        function_ids = self._sample_id_to_function_ids[sample_id]
+        for start in range(0, len(function_ids), batch_size):
+            yield deepcopy([functions[function_id] for function_id in function_ids[start : start + batch_size]])
 
     def getFunctionIdsBySampleId(self, sample_id: int) -> Optional[List["int"]]:
         function_ids = None
@@ -872,8 +1188,13 @@ class MemoryStorage(StorageInterface):
                 entries[sample_id] = entry
         return entries
 
+    def getPresentSha256s(self, sha256s: Iterable[str]) -> Set[str]:
+        return {sha256 for sha256 in sha256s if isSha256(sha256) and sha256 in self._sample_by_sha256}
+
     def getSampleBySha256(self, sha256: str, is_query=False) -> Optional["SampleEntry"]:
         sample_entry = None
+        if not isinstance(sha256, str):
+            return None
         if is_query:
             # query_samples are not covered by the _sample_by_sha256 index
             for query_sample_entry in self._query_samples.values():
@@ -919,7 +1240,8 @@ class MemoryStorage(StorageInterface):
         if function_id not in self._functions:
             return None
         pichash = self._functions[function_id].pichash
-        if pichash is None:
+        # 0 is what a function without a PicHash is stored with, and never indexed
+        if not pichash:
             return None
         return {pichash: deepcopy(self._pichashes[pichash])}
 
@@ -928,7 +1250,7 @@ class MemoryStorage(StorageInterface):
         for function_id in function_ids:
             if function_id in self._functions:
                 pichash = self._functions[function_id].pichash
-                if pichash is None:
+                if not pichash:
                     continue
                 # a hash over MINHASH_PICHASH_MAX_MATCHES keeps its key with no holders, as in MongoDbStorage
                 pichashes[pichash] = deepcopy(self._pichashes[pichash]) if self._isPicHashWithinMatchCount(pichash) else set()
@@ -959,15 +1281,20 @@ class MemoryStorage(StorageInterface):
         return None
 
     # -> Dict[function_id, Set[function_id]]
-    # TODO optimize or move to interface
-    def getCandidatesForMinHashes(self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None) -> Dict[int, Set[int]]:
+    def getCandidatesForMinHashes(
+        self, function_id_to_minhash: Dict[int, "MinHash"], band_matches_required=1, band_df_cutoff=None, skips: Optional[BandDfSkips] = None
+    ) -> Dict[int, Set[int]]:
         candidates = {}
         for function_id, minhash in function_id_to_minhash.items():
-            candidates[function_id] = self.getCandidatesForMinHash(minhash, band_matches_required=band_matches_required, band_df_cutoff=band_df_cutoff)
+            candidates[function_id] = self._getCandidatesForMinHash(minhash, band_matches_required, band_df_cutoff, skips, function_id)
         return candidates
 
     # -> Set[function_id]
-    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None) -> Set[int]:
+    def getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required=1, band_df_cutoff=None, skips: Optional[BandDfSkips] = None) -> Set[int]:
+        return self._getCandidatesForMinHash(minhash, band_matches_required, band_df_cutoff, skips, 0)
+
+    def _getCandidatesForMinHash(self, minhash: "MinHash", band_matches_required, band_df_cutoff, skips: Optional[BandDfSkips], function_id: int) -> Set[int]:
+        """getCandidatesForMinHash, with the query function `skips` counts the lookups under."""
         if not minhash.hasMinHash():
             return set()
         # as in MongoDbStorage: the job's cutoff, else STORAGE_BAND_DF_CUTOFF, and a posting list
@@ -975,17 +1302,29 @@ class MemoryStorage(StorageInterface):
         cutoff = getattr(self._storage_config, "STORAGE_BAND_DF_CUTOFF", 0) if band_df_cutoff is None else band_df_cutoff
         candidates = {}
         band_hashes = self.getBandHashesForMinHash(minhash)
+        if skips is not None:
+            skips.addLookups(function_id, len(band_hashes))
+            # counting is free here, but the switch means the same on every backend
+            if not getattr(self._storage_config, "STORAGE_BAND_DF_COUNT_SKIPS", True):
+                skips.markUnmeasured("disabled")
+                skips = None
         for band_number, band_hash in sorted(band_hashes.items()):
-            if band_hash in self._bands[band_number] and (cutoff <= 0 or len(self._bands[band_number][band_hash]) <= cutoff):
-                for function_id in self._bands[band_number][band_hash]:
-                    if function_id not in candidates:
-                        candidates[function_id] = 0
-                    candidates[function_id] += 1
+            posting_list = self._bands[band_number].get(band_hash)
+            if posting_list is None:
+                continue
+            if cutoff > 0 and len(posting_list) > cutoff:
+                if skips is not None:
+                    skips.addSkipped((function_id,), len(posting_list))
+                continue
+            for candidate_id in posting_list:
+                if candidate_id not in candidates:
+                    candidates[candidate_id] = 0
+                candidates[candidate_id] += 1
         # reduce candidates based on banding requirements
         valid_candidates = set([])
-        for function_id, hit_count in candidates.items():
+        for candidate_id, hit_count in candidates.items():
             if hit_count >= band_matches_required:
-                valid_candidates.add(function_id)
+                valid_candidates.add(candidate_id)
         return valid_candidates
 
     def getUnhashedFunctions(self, function_ids: Optional[List[int]] = None, only_function_ids=False) -> List[Union[int, "FunctionEntry"]]:
@@ -1013,11 +1352,11 @@ class MemoryStorage(StorageInterface):
             self._functions[function_id].xcfg = {}
 
     def deleteXcfgForSampleId(self, sample_id: int) -> None:
-        for function_id, function_entry in self._functions.items():
-            if sample_id == function_entry.sample_id:
-                self._functions[function_id].xcfg = {}
+        if sample_id < 0:
+            return
+        for function_id in self._sample_id_to_function_ids.get(sample_id, []):
+            self._functions[function_id].xcfg = {}
 
-    # TODO dict of what?
     def getContent(self) -> Dict[str, Any]:
         content = {
             "families": {family_id: family.toDict() for family_id, family in self._families.items()},
@@ -1033,7 +1372,6 @@ class MemoryStorage(StorageInterface):
         }
         return content
 
-    # TODO dict of what?
     def setContent(self, content: Dict[str, Any]) -> None:
         self._families = {int(k): FamilyEntry.fromDict(v) for k, v in content["families"].items()}
         self._samples = {int(k): SampleEntry.fromDict(v) for k, v in content["samples"].items()}
@@ -1067,6 +1405,8 @@ class MemoryStorage(StorageInterface):
             "num_bands": len(self._bands),
             # None signals "not computed", so that consumers can distinguish it from an actual count of 0
             "num_pichashes": len(self._pichashes) if with_pichash else None,
+            # pichashes are kept as integers here, so their order is always numeric (#145)
+            "pichash_padded": True,
         }
         return stats
 
@@ -1079,6 +1419,7 @@ class MemoryStorage(StorageInterface):
             self._bands[band_number][band_hash].append(minhash.function_id)
 
     def getUniqueBlocks(self, sample_ids: List[int], progress_reporter=None) -> Dict:
+        progress = UniqueBlocksProgressReporter.wrap(progress_reporter)
         # query once to get all blocks from the functions of our samples
         block_statistics: Dict[str, Any] = {
             "by_sample_id": {sample_id: {"sample_id": sample_id, "total_blocks": 0, "characteristic_blocks": 0, "unique_blocks": 0} for sample_id in sample_ids},
@@ -1087,6 +1428,9 @@ class MemoryStorage(StorageInterface):
         }
         candidate_picblockhashes: Dict[int, Dict[str, Any]] = {}
         wanted_sample_ids = set(sample_ids)
+        # a step per function would slow the loops noticeably, so each phase reports only once it is
+        # done, which is also when a terminated job is noticed
+        progress.start_phase("collect", 1)
         for function_id, entry in self._functions.items():
             sample_id = entry.sample_id
             # the blocks of the samples asked about only, as MongoDbStorage reads them; a block
@@ -1112,6 +1456,7 @@ class MemoryStorage(StorageInterface):
             for sample_id in entry["samples"]:
                 block_statistics["by_sample_id"][sample_id]["total_blocks"] += 1
         LOGGER.info(f"Found {len(candidate_picblockhashes)} candidate picblock hashes")
+        progress.start_phase("eliminate", 1)
         for functiond_id, entry in self._functions.items():
             sample_id = entry.sample_id
             if sample_id not in wanted_sample_ids:
@@ -1128,19 +1473,15 @@ class MemoryStorage(StorageInterface):
         LOGGER.info(f"Reduced to {len(candidate_picblockhashes)} unique picblock hashes")
         # iterate over candidates by function_id and extract instructions
         function_id_to_block_offsets = {}
+        progress.start_phase("score", 1)
         for picblockhash, entry in candidate_picblockhashes.items():
             candidate_picblockhashes[picblockhash]["samples"] = sorted(list(entry["samples"]))
             # we calculate the score for this block as 80% of how well it covers the samples and 20% how far its size is away from an "ideal" signature block
-            sample_score = 100.0 * len(entry["samples"]) / len(sample_ids)
-            length_score = 100.0
-            if entry["length"] < 7:
-                length_score = 100.0 - (100.0 * (7 - entry["length"]) / 7)
-            elif entry["length"] > 10:
-                length_score = 100.0 * (1 / (entry["length"] - 10))
-            candidate_picblockhashes[picblockhash]["score"] = 0.8 * sample_score + 0.2 * length_score
+            candidate_picblockhashes[picblockhash]["score"] = blockScore(len(entry["samples"]), len(sample_ids), entry["length"])
             if entry["function_id"] not in function_id_to_block_offsets:
                 function_id_to_block_offsets[entry["function_id"]] = []
             function_id_to_block_offsets[entry["function_id"]].append((entry["offset"], picblockhash))
+        progress.start_phase("extract", 1)
         for function_id, entry in self._functions.items():
             if function_id not in function_id_to_block_offsets.keys():
                 continue
@@ -1156,6 +1497,9 @@ class MemoryStorage(StorageInterface):
                 if block_instructions is None:
                     continue
                 candidate_picblockhashes[picblockhash]["instructions"] = block_instructions
+        # called directly rather than by Worker.getUniqueBlocks, which finishes its own
+        if progress is not progress_reporter:
+            progress.finish()
         return {"statistics": block_statistics, "unique_blocks": candidate_picblockhashes}
 
     def rebuildPicBlockHashIndex(self, progress_reporter=None) -> int:
@@ -1222,30 +1566,36 @@ class MemoryStorage(StorageInterface):
         }
 
     def rebuildMinhashBandIndex(self, progress_reporter=None):
-        # TODO while minhashes are considerably small, there is a still chance that the
-        # sum of all minhashes will eventually exceed available memory on a given system.
-        # in this case we can start doing batches in our database interation already
-        minhashes = []
-        # get all minhash objects from all functions
-        for function_id, function_entry in self._functions.items():
-            if function_entry.minhash:
-                minhash_obj = function_entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS)
-                minhashes.append(minhash_obj)
+        # Collect the entries first, for the progress total, without constructing MinHash objects; the
+        # bands are then fed from this snapshot, not from the dict a concurrent writer may change. As in
+        # MongoDbStorage, leave out any minhash of another length than the configured signature, which
+        # would fail the rebuild after the bands were reset. Not _hasBandableLength: that also admits a
+        # longer one.
+        signature_bytes = self._minhash_config.MINHASH_SIGNATURE_LENGTH * (1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4)
+        num_skipped = 0
+        bandable_entries = []
+        for function_entry in list(self._functions.values()):
+            if function_entry.minhash and len(function_entry.minhash) != signature_bytes:
+                num_skipped += 1
+            elif function_entry.minhash:
+                bandable_entries.append(function_entry)
+        num_minhashes = len(bandable_entries)
+        if num_skipped:
+            LOGGER.warning("Left %d functions out of the band index, their minhashes are not %d bytes long; recalculating minhashes indexes them.", num_skipped, signature_bytes)
         # drop band collections
         # recreate indices for band collections
         for band_id in range(self._storage_config.STORAGE_NUM_BANDS):
             self._bands[band_id] = {}
-        # re-add minhashes in batches
-        batch_size = self._minhash_config.MINHASH_BAND_REBUILD_WORK_PACKAGE_SIZE
+        # re-add minhashes in batches, decoding one work package at a time
+        batch_size = max(1, self._minhash_config.MINHASH_BAND_REBUILD_WORK_PACKAGE_SIZE)
         if progress_reporter:
-            progress_reporter.set_total((len(minhashes) // batch_size) + 1)
-        for minhash_batch in zip_longest(*[iter(minhashes)] * batch_size):
-            minhash_batch = [mh for mh in minhash_batch if mh is not None]
-            for mh in minhash_batch:
+            progress_reporter.set_total((num_minhashes + batch_size - 1) // batch_size)
+        for offset in range(0, num_minhashes, batch_size):
+            for mh in [entry.getMinHash(self._minhash_config.MINHASH_SIGNATURE_BITS) for entry in bandable_entries[offset : offset + batch_size]]:
                 self._addMinHashToBands(mh)
             if progress_reporter:
                 progress_reporter.step()
-        return len(minhashes)
+        return num_minhashes
 
     ##### helpers for search ######
 
@@ -1334,13 +1684,14 @@ class MemoryStorage(StorageInterface):
 
     def findFunctionByString(self, search_tree: NodeType, cursor: Optional[FullSearchCursor] = None, max_num_results: int = 100) -> Dict[int, "FunctionEntry"]:
         result_dict = {}
-        # TODO also search through function labels once we have implemented them
-        search_fields = ["function_name"]
+        # a plain term matches the name and the labels that differ from it (#301), as on MongoDB;
+        # "function_labels.function_label" searches every label, resolved to the list of label strings
+        search_fields = ["function_name", OTHER_LABELS_FIELD]
         filter = self._get_search_filter(search_fields, search_tree, cursor)
         sort_key = self._get_sort_key_from_cursor(cursor)
-        for entry in sorted(self._functions.values(), key=sort_key):
-            if filter(entry):
-                result_dict[entry.function_id] = entry
-            if len(result_dict) >= max_num_results:
-                break
+        # filtered before sorted: one pass over the functions per page (the cursor is part of the
+        # filter), and only the page's worth of matches is ordered instead of every function
+        matches = (entry for entry in self._functions.values() if filter(entry))
+        for entry in heapq.nsmallest(max_num_results, matches, key=sort_key):
+            result_dict[entry.function_id] = entry
         return result_dict

@@ -1,9 +1,11 @@
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
 import subprocess
+import sys
 
 from dotenv import load_dotenv
 from smda.common.SmdaReport import SmdaReport
@@ -14,6 +16,21 @@ from mcrit.storage.FamilyEntry import FamilyEntry
 from mcrit.storage.FunctionEntry import FunctionEntry
 from mcrit.storage.MatchingResult import MatchingResult
 from mcrit.storage.SampleEntry import SampleEntry
+
+# C0 and C1 control characters and DEL, which a terminal acts on instead of showing them
+# and the bidirectional overrides and isolates, which reorder the text around them
+CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+def printable(value):
+    """str() of a value the server answered, with its control characters escaped as repr() writes them.
+
+    Family names, versions, filenames, the sha256 of a submitted report and job parameters are free
+    text any API user can store; printed raw, an escape sequence among them moves the cursor, erases
+    or hides lines or sets the window title in the terminal of whoever lists them.
+    """
+    return CONTROL_CHARACTERS.sub(lambda match: repr(match.group(0))[1:-1], str(value))
+
 
 ### Helper functionality for submissions
 
@@ -35,9 +52,13 @@ def is_pe_or_elf(input_path):
 def get_base_addr(input_path):
     """
     If provided path ends with 0x[0-9a-fA-F]{8,16}, we assume that this is an IMAGEBASE address.
+    A Malpedia dump, <sha256>_dump7_0x00400000, may carry more after its address, such as a label
+    in <sha256>_dump7_0x00400000_loader (#280).
     """
     base_addr = None
     baddr_match = re.search(re.compile("0x(?P<base_addr>[0-9a-fA-F]{8,16})$"), input_path)
+    if not baddr_match:
+        baddr_match = re.search(re.compile(r"(?:^|[/\\])[0-9a-f]{64}_dump\d*_0x(?P<base_addr>[0-9a-fA-F]{8,16})(?![0-9a-fA-F])"), input_path)
     if baddr_match:
         base_addr = int(baddr_match.group("base_addr"), 16)
     return base_addr
@@ -188,14 +209,18 @@ def getSmdaReportFromFilepath(args, filepath):
 
 
 def submitViaSubprocess(args, filepath):
-    command = ["python", "-m", "mcrit", "client", "submit"]
+    # sys.executable rather than "python", which may be another interpreter and not know -P; -P keeps the
+    # working directory, often the folder of files being submitted, off the child's sys.path, where -m would
+    # put it first and run any json.py or mcrit/ found there
+    command = [sys.executable, "-P", "-m", "mcrit", "client", "submit"]
     if args.server:
         command.extend(["--server", args.server])
     if args.apitoken:
         command.extend(["--apitoken", args.apitoken])
-    if args.family:
+    # an empty family or version is passed on too, as the modes apply it without a worker
+    if args.family is not None:
         command.extend(["--family", args.family])
-    if args.version:
+    if args.version is not None:
         command.extend(["--version", args.version])
     if args.library:
         command.extend(["--library"])
@@ -205,15 +230,20 @@ def submitViaSubprocess(args, filepath):
         command.extend(["--output", args.output])
     if args.smda:
         command.extend(["--smda"])
+    # dir mode leaves a file already in MCRIT to its worker, where recursive mode handles it itself
+    # and malpedia mode takes no --force_update
+    if args.force_update and args.mode == "dir":
+        command.extend(["--force_update"])
     command.append(filepath)
     console_handle = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         stdout_result, stderr_result = console_handle.communicate(timeout=args.worker_timeout)
-        stdout_result = stdout_result.strip().decode("utf-8")
+        # the child echoes file paths, which need not be UTF-8: a strict decode ended the whole bulk run here
+        stdout_result = stdout_result.strip().decode("utf-8", errors="backslashreplace")
         if stdout_result:
             print("STDOUT logs from subprocess: ", stdout_result)
         if stderr_result:
-            stderr_result = stderr_result.strip().decode("utf-8")
+            stderr_result = stderr_result.strip().decode("utf-8", errors="backslashreplace")
             print("STDERR logs from subprocess: ", stderr_result)
     except subprocess.TimeoutExpired:
         print(f"Processing {str(filepath)} with a spawned worker timed out during processing.")
@@ -247,7 +277,10 @@ class McritConsole:
             "-l", "--library", action="store_true", help="Set/Override SmdaReport with the library flag (only in modes: file/dir/recursive, default: False)."
         )
         client_submit.add_argument(
-            "-u", "--force_update", action="store_true", help="Force update of family/version/library, even if file is already in MCRIT (only in modes: file/dir, default: False)."
+            "-u",
+            "--force_update",
+            action="store_true",
+            help="Force update of family/version/library, even if file is already in MCRIT (only in modes: file/dir/recursive, default: False).",
         )
         client_submit.add_argument("-x", "--executables_only", action="store_true", help="Only process files that are parsable PE or ELF files (default: False).")
         client_submit.add_argument("-o", "--output", type=str, help="Optionally store SMDA reports in folder OUTPUT, which is created if not existing.")
@@ -342,24 +375,24 @@ class McritConsole:
             print("Family Search Results")
             for family_id, entry in result["search_results"].items():
                 family_entry = FamilyEntry.fromDict(entry)
-                print(f"{family_entry}")
+                print(printable(family_entry))
             print("*" * 20)
         result = self.client.search_samples(args.search_term)
         if result["search_results"]:
             print("Sample Search Results")
             for sample_id, entry in result["search_results"].items():
                 sample_entry = SampleEntry.fromDict(entry)
-                print(f"{sample_entry}")
+                print(printable(sample_entry))
             print("*" * 20)
         result = self.client.search_functions(args.search_term)
         if result["search_results"]:
             print("Function Search Results")
             for function_id, entry in result["search_results"].items():
                 function_entry = FunctionEntry.fromDict(entry)
-                print(f"{function_entry}")
+                print(printable(function_entry))
 
     def _handle_queue(self, args):
-        result = self.client.getQueueData(filter=args.filter)
+        result = self.client.getQueueData(filter=args.filter) or []
         for entry in result:
             job_id = entry.job_id
             result_id = entry.result
@@ -368,7 +401,7 @@ class McritConsole:
             finished = entry.finished_at if entry.finished_at is not None else "-"
             method = entry.parameters
             progress = entry.progress
-            print(f"{job_id} {result_id} | {created} {started} {finished} | {method} - {progress}")
+            print(printable(f"{job_id} {result_id} | {created} {started} {finished} | {method} - {progress}"))
 
     def _handle_query(self, args):
         # run a number of sanity checks first
@@ -401,6 +434,11 @@ class McritConsole:
                 )
             else:
                 job_id = self.client.requestMatchesForUnmappedBinary(readFileContent(args.filepath), disassemble_locally=False, force_recalculation=args.force_recalculation)
+        # the job id is whatever the server answered and names the report file written below,
+        # so a server, or anyone answering for it, could otherwise place that file anywhere
+        if not isinstance(job_id, str) or re.fullmatch("[0-9a-fA-F]{24}", job_id) is None:
+            print(f"The server did not answer with a job id: {printable(repr(job_id))}")
+            return
         print(f"Started job: {job_id}, waiting for result...")
         compact_result_dict = self.client.awaitResult(job_id, sleep_time=2, compact=True)
         if args.output is not None:
@@ -412,8 +450,9 @@ class McritConsole:
             "|" + "-" * 32 + "|" + "-" * 22 + "|" + "-" * 8 + "|" + "-" * 10 + "|" + "-" * 7 + "|" + "-" * 7 + "|" + "-" * 7 + "|" + "-" * 7 + "|" + "-" * 15 + "|" + "-" * 15 + "|"
         )
         for family_result in result.getBestSampleMatchesPerFamily(limit=20, malware_only=True):
-            result_line = f"| {family_result.family:>30} | "
-            result_line += f"{family_result.version:>20} | "
+            # escaped before padding to keep the columns aligned, the whole line again below
+            result_line = f"| {printable(family_result.family):>30} | "
+            result_line += f"{printable(family_result.version):>20} | "
             result_line += f"{family_result.sample_id:>6} | "
             result_line += f"{family_result.sha256[:8]} | "
             result_line += f"{family_result.num_functions:>5} | "
@@ -422,9 +461,15 @@ class McritConsole:
             result_line += f"{family_result.matched_functions_library:>5} | "
             result_line += f"{family_result.matched_percent_score_weighted:>6.2f} {family_result.matched_percent_nonlib_score_weighted:>6.2f} | "
             result_line += f"{family_result.matched_percent_frequency_weighted:>6.2f} {family_result.matched_percent_nonlib_frequency_weighted:>6.2f} | "
-            print(result_line)
+            # the sha256 and statistics of a submitted report or an import are as free as its family
+            print(printable(result_line))
 
     def _handle_submit(self, args):
+        # file paths need not be valid UTF-8 (a CP1251 archive member, say): under a locale whose stdout is strict
+        # (en_US.UTF-8, unlike C.UTF-8) printing one raised UnicodeEncodeError and ended the whole bulk run
+        for stream in (sys.stdout, sys.stderr):
+            if isinstance(stream, io.TextIOWrapper) and stream.errors == "strict":
+                stream.reconfigure(errors="backslashreplace")
         # run a number of sanity checks first
         if not os.path.exists(args.filepath):
             print("Your <filepath> does not exist.")
@@ -455,38 +500,59 @@ class McritConsole:
         if args.mode == "malpedia":
             self._handle_submit_malpedia(args)
 
-    def _update_sample_metadata(self, sample_entry, args):
+    def _update_sample_metadata(self, sample_entry, family, version, library):
+        # a family or version of None keeps MCRIT's
         sample_id = sample_entry.sample_id
         update_required = False
-        modified_family = args.family if args.family is not None else sample_entry.family
-        modified_version = args.version if args.version is not None else sample_entry.version
-        modified_is_library = True if args.library else sample_entry.is_library
-        if args.family is not None and args.family != sample_entry.family:
+        modified_family = family if family is not None else sample_entry.family
+        modified_version = version if version is not None else sample_entry.version
+        modified_is_library = True if library else sample_entry.is_library
+        if family is not None and family != sample_entry.family:
             update_required = True
-        if args.version is not None and args.version != sample_entry.version:
+        if version is not None and version != sample_entry.version:
             update_required = True
-        if args.library and not sample_entry.is_library:
+        if library and not sample_entry.is_library:
             update_required = True
         if update_required:
             print(f"UPDATING: Sample ID {sample_entry.sample_id} with SHA256: {sample_entry.sha256} - updating family/version/library.")
             self.client.modifySample(sample_id, family_name=modified_family, version=modified_version, is_library=modified_is_library)
 
+    def _addReport(self, smda_report, filepath):
+        # a report without functions would only add an empty sample, which dir mode already skipped
+        if not smda_report.xcfg:
+            print(f"SKIPPING: {filepath} - SMDA found no functions.")
+            return
+        print(smda_report)
+        self.client.addReport(smda_report)
+
     def _handle_submit_file(self, args):
-        sample_sha256 = sha256(readFileContent(args.filepath))
+        smda_report = None
+        if args.smda:
+            # MCRIT knows the sample by the sha256 its report names, as in dir mode, not by the report's own
+            smda_report = getSmdaReportFromFilepath(args, args.filepath)
+            if not smda_report:
+                return
+            sample_sha256 = smda_report.sha256
+        else:
+            sample_sha256 = sha256(readFileContent(args.filepath))
         sample_entry = self.client.getSampleBySha256(sample_sha256)
         if sample_entry:
-            if args.force_update:
-                self._update_sample_metadata(sample_entry, args)
+            if args.force_update and smda_report:
+                # as in dir mode, a report updates its sample to what it would have been submitted as, and
+                # getSmdaReportFromFilepath has already put --family and --version in it; empty keeps MCRIT's
+                self._update_sample_metadata(sample_entry, smda_report.family or None, smda_report.version or None, args.library)
+            elif args.force_update:
+                self._update_sample_metadata(sample_entry, args.family, args.version, args.library)
             else:
                 print(f"SKIPPING: {args.filepath} - already in MCRIT.")
             return
-        smda_report = getSmdaReportFromFilepath(args, args.filepath)
+        if smda_report is None:
+            smda_report = getSmdaReportFromFilepath(args, args.filepath)
         if smda_report:
-            print(smda_report)
-            self.client.addReport(smda_report)
+            self._addReport(smda_report, args.filepath)
 
     def _handle_submit_dir(self, args):
-        mcrit_sample_entries = self.client.getSamples()
+        mcrit_sample_entries = self.client.getSamples() or {}
         mcrit_samples_by_sha256 = {}
         for sample_id, sample_entry in mcrit_sample_entries.items():
             mcrit_samples_by_sha256[sample_entry.sha256] = sample_entry
@@ -506,6 +572,13 @@ class McritConsole:
                             print(f"Skipping a file that where SMDA meta data extraction failed: {filepath}")
                             continue
                         if primary_meta["sha256"] in mcrit_samples_by_sha256:
+                            if args.force_update:
+                                # a report updates its sample to what it would have been submitted as: its own family
+                                # and version unless --family or --version is given, where empty keeps MCRIT's
+                                family = args.family if args.family is not None else primary_meta["family"]
+                                version = args.version if args.version is not None else primary_meta["version"]
+                                self._update_sample_metadata(mcrit_samples_by_sha256[primary_meta["sha256"]], family or None, version or None, args.library)
+                                continue
                             if (
                                 primary_meta["family"] is not None
                                 and primary_meta["family"] == mcrit_samples_by_sha256[primary_meta["sha256"]].family
@@ -513,28 +586,31 @@ class McritConsole:
                                 and primary_meta["version"] == mcrit_samples_by_sha256[primary_meta["sha256"]].version
                             ):
                                 print(
-                                    f"SKIPPING: {os.path.basename(filepath)} - with SHA256: {primary_meta['sha256']} - already in MCRIT as ({primary_meta['family']}|{primary_meta['version']})."
+                                    printable(
+                                        f"SKIPPING: {os.path.basename(filepath)} - with SHA256: {primary_meta['sha256']} - already in MCRIT as ({primary_meta['family']}|{primary_meta['version']})."
+                                    )
                                 )
                                 continue
                             else:
                                 print(
-                                    f"WARNING/SKIPPING: SHA256: {primary_meta['sha256']} - already in MCRIT but different family/version (FILE: ({primary_meta['family']}|{primary_meta['version']}) - MCRIT: ({mcrit_samples_by_sha256[primary_meta['sha256']].family}|{mcrit_samples_by_sha256[primary_meta['sha256']].version})."
+                                    printable(
+                                        f"WARNING/SKIPPING: SHA256: {primary_meta['sha256']} - already in MCRIT but different family/version (FILE: ({primary_meta['family']}|{primary_meta['version']}) - MCRIT: ({mcrit_samples_by_sha256[primary_meta['sha256']].family}|{mcrit_samples_by_sha256[primary_meta['sha256']].version})."
+                                    )
                                 )
                                 continue
                     elif sample_sha256 in mcrit_samples_by_sha256:
                         sample_entry = mcrit_samples_by_sha256[sample_sha256]
                         if args.force_update:
-                            self._update_sample_metadata(sample_entry, args)
+                            self._update_sample_metadata(sample_entry, args.family, args.version, args.library)
                         else:
-                            print(f"SKIPPING: {args.filepath} - already in MCRIT.")
+                            print(f"SKIPPING: {filepath} - already in MCRIT.")
                         continue
                     smda_report = getSmdaReportFromFilepath(args, filepath)
-                    if smda_report and smda_report.xcfg:
-                        print(smda_report)
-                        self.client.addReport(smda_report)
+                    if smda_report:
+                        self._addReport(smda_report, filepath)
 
     def _handle_submit_recursive(self, args):
-        mcrit_samples = self.client.getSamples()
+        mcrit_samples = self.client.getSamples() or {}
         mcrit_samples_by_sha256 = {}
         for sample_id, sample in mcrit_samples.items():
             mcrit_samples_by_sha256[sample.sha256] = sample
@@ -543,25 +619,31 @@ class McritConsole:
             for filename in files:
                 filepath = os.sep.join([root, filename])
                 if os.path.isfile(filepath):
-                    if sha256(readFileContent(filepath)) in mcrit_samples_by_sha256:
-                        print(f"SKIPPING: {filepath} - already in MCRIT.")
-                        continue
-                    family_name = getFamilyName(folder_relative_path)
+                    # a file in the root itself has no family folder, and getFamilyName("") would
+                    # answer the first folder of the working directory
+                    family_name = getFamilyName(folder_relative_path) if folder_relative_path else ""
                     version = getSampleVersion(folder_relative_path, family_name)
+                    sample_entry = mcrit_samples_by_sha256.get(sha256(readFileContent(filepath)))
+                    if sample_entry:
+                        if args.force_update:
+                            # the folders name family and version, and what none names, MCRIT keeps:
+                            # both for a file in the root, the version for one in a family folder
+                            self._update_sample_metadata(sample_entry, family_name or None, version or None, args.library)
+                        else:
+                            print(f"SKIPPING: {filepath} - already in MCRIT.")
+                        continue
                     print("Processing file: ", filepath, " as ", family_name, "|", version)
-                    continue
                     if args.worker:
-                        args.family = getFamilyName(folder_relative_path)
-                        args.version = getSampleVersion(folder_relative_path, args.family)
+                        args.family = family_name
+                        args.version = version
                         submitViaSubprocess(args, filepath)
                     else:
                         smda_report = getSmdaReportFromFilepath(args, filepath)
                         if smda_report:
-                            smda_report.family = getFamilyName(folder_relative_path)
-                            smda_report.version = getSampleVersion(folder_relative_path, smda_report.family)
+                            smda_report.family = family_name
+                            smda_report.version = version
                             print(filepath)
-                            print(smda_report)
-                            self.client.addReport(smda_report)
+                            self._addReport(smda_report, filepath)
 
     def _handle_submit_malpedia(self, args):
         # verify that we have a malpedia root
@@ -574,12 +656,12 @@ class McritConsole:
             print("Error: 'malpedia.bib' is missing in that folder, are you sure you are poniting to a Malpedia repository?")
             return
         # get current status of all samples in MCRIT
-        mcrit_samples = self.client.getSamples()
+        mcrit_samples = self.client.getSamples() or {}
         mcrit_samples_by_filename = {}
         for sample_id, sample in mcrit_samples.items():
             # verify that filename has malpedia format (starts with sha256 and _unpacked/_dump)
             if sample.filename in mcrit_samples_by_filename:
-                print(f"WARNING: filename {sample.filename} appears to exist more than once in your MCRIT instance, now using SHA256 {sample.sha256[:8]}.")
+                print(printable(f"WARNING: filename {sample.filename} appears to exist more than once in your MCRIT instance, now using SHA256 {sample.sha256[:8]}."))
             mcrit_samples_by_filename[sample.filename] = sample
         # get all unpacked/dumped files and their family/version by crawling given Malpedia location
         malpedia_samples_by_filename = self._getMalpediaSamplesByFilename(malpedia_root)
@@ -593,9 +675,9 @@ class McritConsole:
                 mcrit_version = mcrit_samples_by_filename[filename].version
                 # warn about files were family/version mismatches.
                 if malpedia_family != mcrit_family or malpedia_version != mcrit_version:
-                    print(f"WARNING: Sample {mcrit_samples_by_filename[filename].sample_id} with filename {filename} has different family/version information: ")
+                    print(printable(f"WARNING: Sample {mcrit_samples_by_filename[filename].sample_id} with filename {filename} has different family/version information: "))
                     print(f"* Malpedia: {malpedia_family}|{malpedia_version}")
-                    print(f"* MCRIT: {mcrit_family}|{mcrit_version}")
+                    print(printable(f"* MCRIT: {mcrit_family}|{mcrit_version}"))
             # directly add all files in Malpedia but missing in MCRIT
             else:
                 if args.worker:
@@ -608,12 +690,15 @@ class McritConsole:
                         smda_report.family = malpedia_family
                         smda_report.version = malpedia_version
                         print(malpedia_filepath)
-                        print(smda_report)
-                        self.client.addReport(smda_report)
+                        self._addReport(smda_report, malpedia_filepath)
         # warn about files that appear deleted because not present in Malpedia but in MCRIT (based on name schema)
         for filename, mcrit_sample in mcrit_samples_by_filename.items():
             if self._isMalpediaFilename(filename) and filename not in malpedia_samples_by_filename:
-                print(f"WARNING: Sample {mcrit_sample.sample_id} with filename {filename} ({mcrit_sample.family}|{mcrit_sample.version}) present in MCRIT but not in Malpedia?")
+                print(
+                    printable(
+                        f"WARNING: Sample {mcrit_sample.sample_id} with filename {filename} ({mcrit_sample.family}|{mcrit_sample.version}) present in MCRIT but not in Malpedia?"
+                    )
+                )
 
     def _getMalpediaSamplesByFilename(self, malpedia_root):
         malpedia_samples_by_filename = {}
@@ -634,5 +719,6 @@ class McritConsole:
         return malpedia_samples_by_filename
 
     def _isMalpediaFilename(self, filename):
-        malpedia_file_pattern = re.compile("^[0-9a-f]{64}(_unpacked|dump7?_0x[0-9a-fA-F]{8,16})")
+        # <sha256>_unpacked, or a dump: _dump_0x..., _dump7_0x..., _dump10_0x..., maybe labelled (#280)
+        malpedia_file_pattern = re.compile(r"^[0-9a-f]{64}_(unpacked|dump\d*_0x[0-9a-fA-F]{8,16}(?![0-9a-fA-F]))")
         return re.search(malpedia_file_pattern, filename)

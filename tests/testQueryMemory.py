@@ -3,6 +3,7 @@ import platform
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from copy import deepcopy
@@ -263,7 +264,22 @@ class ChildMemoryLimitTest(unittest.TestCase):
 
     def test_job_processes_run_on_this_interpreter(self):
         command = self._worker(0)._jobCommand(self.JOB)
-        self.assertEqual([sys.executable, "-m", "mcrit", "singlejobworker", "--job_id", self.JOB.job_id], command)
+        self.assertEqual([sys.executable, "-P", "-m", "mcrit", "singlejobworker", "--job_id", self.JOB.job_id], command)
+
+    def test_job_processes_do_not_run_modules_from_the_working_directory(self):
+        command = self._worker(0)._jobCommand(SimpleNamespace(job_id="not-a-job-id"))
+        mcrit_root = os.path.dirname(os.path.dirname(os.path.abspath(SpawningWorker_module.__file__)))
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [mcrit_root, os.environ.get("PYTHONPATH")]))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            os.makedirs(os.path.join(tmp_dir, "mcrit"))
+            open(os.path.join(tmp_dir, "mcrit", "__init__.py"), "w").close()
+            with open(os.path.join(tmp_dir, "mcrit", "__main__.py"), "w") as fout:
+                fout.write("print('planted')\n")
+            # the job id is refused before any database is touched
+            result = subprocess.run(command, cwd=tmp_dir, env=env, capture_output=True, timeout=120)
+        self.assertNotIn(b"planted", result.stdout)
+        self.assertIn(b"recognize a job_id", result.stdout)
 
 
 class ReturnFreedMemoryTest(unittest.TestCase):

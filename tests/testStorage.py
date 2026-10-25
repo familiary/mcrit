@@ -2,11 +2,19 @@ import hashlib
 import json
 import logging
 import os
+import re
+import threading
+import time
+import types
+from collections import OrderedDict
+from copy import deepcopy
 from unittest import TestCase, main
 from unittest.mock import patch
 
 import pytest
 from bson import encode as bson_encode
+from pymongo.collection import Collection
+from pymongo.errors import BulkWriteError, ExecutionTimeout, OperationFailure, WriteError
 from smda.common.SmdaReport import SmdaReport
 
 from mcrit.config.McritConfig import McritConfig
@@ -18,9 +26,10 @@ from mcrit.index.MinHashIndex import MinHashIndex
 from mcrit.index.SearchCursor import FullSearchCursor
 from mcrit.index.SearchQueryParser import SearchQueryParser
 from mcrit.minhash.MinHash import MinHash
-from mcrit.storage.FunctionEntry import FunctionEntry
-from mcrit.storage.MongoDbStorage import MongoDbStorage
-from mcrit.storage.SampleEntry import SampleEntry
+from mcrit.storage import MongoDbStorage as mongo_db_storage_module
+from mcrit.storage.FunctionEntry import OTHER_LABELS_FIELD, FunctionEntry
+from mcrit.storage.MongoDbStorage import MongoDbStorage, MongoSearchTranspiler
+from mcrit.storage.SampleEntry import TIMESTAMP_FORMAT, SampleEntry
 from mcrit.storage.StorageFactory import StorageFactory
 
 from .context import getTestMongoServerAndPort
@@ -41,7 +50,7 @@ def buildMongoStorageConfig(dbname):
     )
 
 
-class MemoryStorageTest(TestCase):
+class _MemoryStorageFixture:
     def setUp(self):
         self._storage_config = StorageConfig(
             STORAGE_METHOD=StorageFactory.STORAGE_METHOD_MEMORY,
@@ -63,6 +72,18 @@ class MemoryStorageTest(TestCase):
     def tearDown(self):
         self.storage.clearStorage()
 
+    def _twoReports(self, family="family_1"):
+        with open(self.example_file_path) as fjson:
+            smda_json = json.load(fjson)
+        report_a = SmdaReport.fromDict(smda_json)
+        report_b = SmdaReport.fromDict(smda_json)
+        assert report_a is not None and report_b is not None
+        report_a.family = report_b.family = family
+        report_b.sha256 = 64 * "b"
+        return report_a, report_b
+
+
+class MemoryStorageTest(_MemoryStorageFixture, TestCase):
     def testBasicStorageUsage(self):
         self.storage.clearStorage()
         smda_report = SmdaReport.fromFile(self.example_file_path)
@@ -77,6 +98,104 @@ class MemoryStorageTest(TestCase):
         self.assertEqual(1, stats_without_pichash["num_samples"])
         self.assertEqual(10, stats_without_pichash["num_functions"])
         self.assertIsNone(stats_without_pichash["num_pichashes"])
+
+    def testDeletingSamplesDropsPicHashesOnlyWithTheirLastFunction(self):
+        report_a, report_b = self._twoReports()
+        # one function of the second sample differs, so the first holds a PicHash the second does not
+        next(iter(report_b.xcfg.values())).pic_hash = 12345
+        sample_a = self.storage.addSmdaReport(report_a)
+        sample_b = self.storage.addSmdaReport(report_b)
+        assert sample_a is not None and sample_b is not None
+        hashes_a = {entry.pichash for entry in self.storage.getFunctionsBySampleId(sample_a.sample_id) or []}
+        hashes_b = {entry.pichash for entry in self.storage.getFunctionsBySampleId(sample_b.sample_id) or []}
+        self.assertEqual(1, len(hashes_a - hashes_b))
+        self.assertIn(12345, hashes_b - hashes_a)
+        self.assertTrue(self.storage.deleteSample(sample_a.sample_id))
+        for pichash in hashes_b:
+            self.assertTrue(self.storage.isPicHash(pichash))
+            self.assertEqual(1, len(self.storage.getMatchesForPicHash(pichash)))
+        for pichash in hashes_a - hashes_b:
+            self.assertFalse(self.storage.isPicHash(pichash))
+        self.assertEqual(len(hashes_b), self.storage.getStats()["num_pichashes"])
+        self.assertTrue(self.storage.deleteSample(sample_b.sample_id))
+        self.assertFalse(self.storage.isPicHash(12345))
+        self.assertEqual(0, self.storage.getStats()["num_pichashes"])
+
+    def testDiscardingAnImportedSampleRemovesItsLastPicHashReferences(self):
+        report_a, report_b = self._twoReports()
+        sample_a = self.storage.addSmdaReport(report_a)
+        sample_b = self.storage.addSmdaReport(report_b)
+        assert sample_a is not None and sample_b is not None
+        self.storage.discardImportedSample(sample_a)
+        self.assertEqual(10, self.storage.getStats()["num_pichashes"])
+        self.storage.discardImportedSample(sample_b)
+        self.assertEqual(0, self.storage.getStats()["num_pichashes"])
+
+    def _storeASampleAndAnotherFamily(self):
+        report_a, _ = self._twoReports()
+        source = self.storage.addSmdaReport(report_a)
+        assert source is not None
+        return source, self.storage.addFamily("family_2")
+
+    def _importTwoSampleEntries(self, source, other_family_id):
+        """The stored sample imported twice under new sha256s, once in its own family and once in the
+        other, with its functions ready for importFunctionEntries - as addImportData has them at that
+        point. Returns the imported entries and the function entries."""
+        imported, function_entries = [], []
+        for sha256, family_id in (("c" * 64, source.family_id), ("d" * 64, other_family_id)):
+            sample_entry = deepcopy(self.storage.getSampleById(source.sample_id))
+            sample_entry.sha256, sample_entry.family_id = sha256, family_id
+            imported_entry = self.storage.importSampleEntry(sample_entry)
+            assert imported_entry is not None
+            imported.append(imported_entry)
+            for function_entry in deepcopy(self.storage.getFunctionsBySampleId(source.sample_id)):
+                function_entry.sample_id, function_entry.family_id = imported_entry.sample_id, family_id
+                function_entries.append(function_entry)
+        return imported, function_entries
+
+    def _failingForFamily(self, failing_family_id):
+        update_family_stats = self.storage._updateFamilyStats
+
+        def updateFamilyStats(family_id, num_samples_inc, num_functions_inc, num_library_samples_inc):
+            if family_id == failing_family_id and num_functions_inc > 0:
+                raise RuntimeError("connection lost")
+            update_family_stats(family_id, num_samples_inc, num_functions_inc, num_library_samples_inc)
+
+        return patch.object(self.storage, "_updateFamilyStats", side_effect=updateFamilyStats)
+
+    def _familyCounters(self):
+        counters = {}
+        for family_id in self.storage.getFamilyIds():
+            family_entry = self.storage.getFamily(family_id)
+            counters[family_id] = (family_entry.num_samples, family_entry.num_functions, family_entry.num_library_samples)
+        return counters
+
+    def _picHashCountDocuments(self):
+        # only MongoDB storage keeps a pichash count index
+        if not isinstance(self.storage, MongoDbStorage):
+            return None
+        collection = self.storage._getDb()[self.storage._PICHASH_COUNT_COLLECTION]
+        return sorted((document["_pichash"], document["df"]) for document in collection.find({}, {"_id": 0}))
+
+    def testAFailedFamilyCountLeavesEveryFamilyAsItWasAfterTheDiscard(self):
+        # an import of two samples in two families, whose second family's function counter fails
+        # after the first one's was raised: the import is rolled back sample by sample, and each
+        # discard takes off the functions it finds stored, so those must be exactly the ones counted
+        self.storage.clearStorage()
+        source, other_family_id = self._storeASampleAndAnotherFamily()
+        families_before, counts_before, stats_before = self._familyCounters(), self._picHashCountDocuments(), self.storage.getStats()
+        imported, function_entries = self._importTwoSampleEntries(source, other_family_id)
+
+        with self._failingForFamily(other_family_id):
+            with self.assertRaises(RuntimeError):
+                self.storage.importFunctionEntries(function_entries)
+        for imported_entry in imported:
+            self.storage.discardImportedSample(imported_entry)
+
+        self.assertEqual(families_before, self._familyCounters())
+        self.assertEqual(counts_before, self._picHashCountDocuments())
+        stats_after = self.storage.getStats()
+        self.assertEqual((stats_before["num_samples"], stats_before["num_functions"]), (stats_after["num_samples"], stats_after["num_functions"]))
 
     def testModifyFunction(self):
         # fkie-cad/mcritweb#72: a function's name can be set; the name is recorded as a label
@@ -290,15 +409,40 @@ class MemoryStorageTest(TestCase):
         self.storage.clearStorage()
         self.assertIsNone(self.storage.getSmdaExtras(entry_c.sample_id))
 
-    def _twoReports(self, family="family_1"):
-        with open(self.example_file_path) as fjson:
-            smda_json = json.load(fjson)
-        report_a = SmdaReport.fromDict(smda_json)
-        report_b = SmdaReport.fromDict(smda_json)
-        assert report_a is not None and report_b is not None
-        report_a.family = report_b.family = family
-        report_b.sha256 = 64 * "b"
-        return report_a, report_b
+    def testSha256VerifiedIsRecordedPerSample(self):
+        # #270: only a sample MCRIT disassembled from the bytes itself is verified; a submitted
+        # report is not, and a query sample is left unknown
+        self.storage.clearStorage()
+        report_a, report_b = self._twoReports()
+        from_report = self.storage.addSmdaReport(report_a)
+        from_binary = self.storage.addSmdaReport(report_b, sha256_verified=True)
+        assert from_report is not None and from_binary is not None
+        self.assertIs(False, from_report.sha256_verified)
+        self.assertIs(True, from_binary.sha256_verified)
+        for sample_entry, expected in ((from_report, False), (from_binary, True)):
+            stored = self.storage.getSampleById(sample_entry.sample_id)
+            by_sha256 = self.storage.getSampleBySha256(sample_entry.sha256)
+            assert stored is not None and by_sha256 is not None
+            self.assertIs(expected, stored.sha256_verified)
+            self.assertIs(expected, by_sha256.sha256_verified)
+            self.assertIs(expected, stored.toDict()["sha256_verified"])
+        self.assertEqual({False, True}, {sample_entry.sha256_verified for sample_entry in self.storage.getSamples(0, 0)})
+        query_report, _ = self._twoReports()
+        query_report.sha256 = 64 * "c"
+        query_entry = self.storage.addSmdaReport(query_report, isQuery=True, sha256_verified=True)
+        assert query_entry is not None
+        self.assertIsNone(query_entry.sha256_verified)
+
+    def testAnImportedSampleIsUnverifiedWhateverTheExportSays(self):
+        self.storage.clearStorage()
+        report_a, _ = self._twoReports()
+        exported = SampleEntry.fromDict(SampleEntry(report_a, sample_id=3, family_id=0, sha256_verified=True).toDict())
+        imported = self.storage.importSampleEntry(exported)
+        assert imported is not None
+        self.assertIs(False, imported.sha256_verified)
+        stored = self.storage.getSampleBySha256(report_a.sha256)
+        assert stored is not None
+        self.assertIs(False, stored.sha256_verified)
 
     def _actualFamilyCounts(self, family_id):
         samples = [s for s in self.storage.getSamples(0, 1000) if s.family_id == family_id]
@@ -336,7 +480,8 @@ class MemoryStorageTest(TestCase):
         self.assertIsNone(self.storage.getFamily(family_2))
         self.assertEqual({"num_samples": 1, "num_functions": 10, "num_library_samples": 0}, self._storedFamilyCounts(family_1))
         self.assertEqual(
-            {"num_families": 0, "num_families_corrected": 0, "num_families_created": 0, "corrections": {}} | {"num_families": len(self.storage.getFamilyIds())},
+            {"num_families": 0, "num_families_corrected": 0, "num_families_created": 0, "num_families_merged": 0, "corrections": {}}
+            | {"num_families": len(self.storage.getFamilyIds())},
             self.storage.recomputeFamilyStats(),
         )
 
@@ -425,9 +570,34 @@ class MemoryStorageTest(TestCase):
         self.assertEqual(10, stats["num_functions"])
 
     def _nameFamilyInStorage(self, family_id, family_name):
-        # bypasses modifyFamily, the way recomputeFamilyStats re-creates a missing family document
-        # under the name its samples carry, whatever other family has it
+        # bypasses modifyFamily: a name held by two families, as a MongoDB database from before family
+        # names were unique (#299) can hold one. recomputeFamilyStats no longer makes one, it files the
+        # samples of a missing family under the family of their name
         self.storage._families[family_id].family_name = family_name
+
+    def _removeFamilyEntry(self, family_id):
+        del self.storage._families[family_id]
+
+    def testRecomputeFilesTheSamplesOfAMissingFamilyUnderTheFamilyOfItsName(self):
+        # a name is one family (#299): the family's entry is gone, and its name another family's by now
+        self.storage.clearStorage()
+        report_a, _ = self._twoReports()
+        sample_a = self.storage.addSmdaReport(report_a)
+        assert sample_a is not None
+        missing_family_id = sample_a.family_id
+        self._removeFamilyEntry(missing_family_id)
+        family_id = self.storage.addFamily("family_1")
+        self.assertNotEqual(missing_family_id, family_id)
+        report = self.storage.recomputeFamilyStats()
+        self.assertEqual((0, 1), (report["num_families_created"], report["num_families_merged"]))
+        self.assertIsNone(self.storage.getFamily(missing_family_id))
+        self.assertEqual(family_id, self.storage.getSampleById(sample_a.sample_id).family_id)
+        function_entries = self.storage.getFunctionsBySampleId(sample_a.sample_id) or []
+        self.assertEqual({family_id}, {function_entry.family_id for function_entry in function_entries})
+        function_entry = function_entries[0]
+        self.assertIn((family_id, sample_a.sample_id, function_entry.function_id), self.storage.getMatchesForPicHash(function_entry.pichash))
+        self.assertEqual({"num_samples": 1, "num_functions": 10, "num_library_samples": 0}, self._storedFamilyCounts(family_id))
+        self.assertEqual(self._actualFamilyCounts(family_id), self._storedFamilyCounts(family_id))
 
     def _driftFamilyCounters(self, family_id, num_samples, num_functions):
         family = self.storage._families[family_id]
@@ -444,7 +614,10 @@ class MemoryStorageTest(TestCase):
         assert sample_entry is not None
         sample_id = sample_entry.sample_id
         minhashes = [MinHash(function_id=function_id, minhash_signature=[0x30 + function_id + index for index in range(10)], minhash_bits=8) for function_id in [0, 2, 3, 5, 7, 8]]
+        for minhash in minhashes:
+            minhash.shingler_composition = {"EscapedBlockShingler": 1}
         self.storage.addMinHashes(minhashes)
+        self.assertEqual(6, sum(1 for f in self.storage.getFunctionsBySampleId(sample_id) if f.minhash_shingle_composition == {"EscapedBlockShingler": 1}))
         # nothing recorded yet: stale; recorded below the threshold: stale; at or above: current
         self.assertEqual([sample_id], self.storage.getSamplesWithStaleMinHashes("4.4.5"))
         self.assertEqual(1, self.storage.countSamplesWithStaleMinHashes("4.4.5"))
@@ -458,6 +631,7 @@ class MemoryStorageTest(TestCase):
         # dropping the sample's minhashes empties its functions and the band index, and forgets the version
         self.assertEqual(6, self.storage.deleteMinHashesForSample(sample_id))
         self.assertTrue(all(not f.minhash for f in self.storage.getFunctionsBySampleId(sample_id)))
+        self.assertTrue(all(not f.minhash_shingle_composition for f in self.storage.getFunctionsBySampleId(sample_id)))
         self.assertEqual(0, self._numBandEntries())
         self.assertEqual([sample_id], self.storage.getSamplesWithStaleMinHashes("4.4.5"))
         self.assertEqual(0, self.storage.deleteMinHashesForSample(sample_id))
@@ -564,7 +738,7 @@ class MemoryStorageTest(TestCase):
 
     def testSampleHandling(self):
         self.storage.clearStorage()
-        # TODO: different samples required, because addSmdaReport wont accept identical hashes
+        # addSmdaReport rejects duplicate SHA256 values, so each fixture report gets a distinct hash.
         with open(self.example_file_path) as fjson:
             smda_json = json.load(fjson)
         smda_report_a = SmdaReport.fromDict(smda_json)
@@ -670,16 +844,28 @@ class MemoryStorageTest(TestCase):
         self.assertEqual(sample_entry.sample_id, self.storage.getSampleBySha256(smda_report.sha256).sample_id)
         self.assertEqual(None, self.storage.getSampleBySha256(64 * "0"))
 
+    def testGetPresentSha256s(self):
+        self.storage.clearStorage()
+        self.assertEqual(set(), self.storage.getPresentSha256s([]))
+        smda_report = SmdaReport.fromFile(self.example_file_path)
+        self.storage.addSmdaReport(smda_report)
+        absent = [f"{index:064x}" for index in range(25)]
+        self.assertEqual({smda_report.sha256}, self.storage.getPresentSha256s(absent + [smda_report.sha256, smda_report.sha256, 7]))
+        # only what can be a sha256 is looked up: keys this long took one $in query beyond 16 MB
+        self.assertEqual(set(), self.storage.getPresentSha256s(["x" * (9 * 1024 * 1024), "y" * (9 * 1024 * 1024), "zz" * 32]))
+        if isinstance(self.storage, MongoDbStorage):
+            # one query per chunk: 26 values in chunks of 10 take three
+            with patch.object(MongoDbStorage, "_PRESENT_SHA256S_CHUNK", 10), patch.object(Collection, "find", autospec=True, side_effect=Collection.find) as find:
+                self.assertEqual({smda_report.sha256}, self.storage.getPresentSha256s(absent + [smda_report.sha256]))
+            self.assertEqual(3, len([call for call in find.call_args_list if call.args[0].name == "samples"]))
+
     def testFunctionHandling(self):
         self.storage.clearStorage()
-        # TODO use SmdaReport.fromFile
-        with open(self.example_file_path) as fjson:
-            smda_json = json.load(fjson)
-        smda_report_a = SmdaReport.fromDict(smda_json)
+        smda_report_a = SmdaReport.fromFile(self.example_file_path)
         assert smda_report_a is not None
         smda_report_a.sha256 = 64 * "a"
         smda_report_a.family = "family_1"
-        smda_report_b = SmdaReport.fromDict(smda_json)
+        smda_report_b = SmdaReport.fromFile(self.example_file_path)
         assert smda_report_b is not None
         smda_report_b.family = "family_1"
         smda_report_b.sha256 = 64 * "b"
@@ -757,7 +943,6 @@ class MemoryStorageTest(TestCase):
         self.assertEqual(pichashes, self.storage.getPicHashMatchesByFunctionIds([1, 1, 1000]))
 
         # minhash tests
-        # TODO check if MinHash initialization works
         minhash_a = MinHash(function_id=1, minhash_signature=[0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39], minhash_bits=8)
         minhash_b = MinHash(function_id=3, minhash_signature=[0x30, 0x31, 0x30, 0x33, 0x30, 0x30, 0x30, 0x37, 0x38, 0x39], minhash_bits=8)
         function_entry = self.storage.getFunctionById(1)
@@ -788,6 +973,33 @@ class MemoryStorageTest(TestCase):
         minhash_c = MinHash(function_id=1000, minhash_signature=[0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39], minhash_bits=8)
         candidates_after = self.storage.getCandidatesForMinHashes({1000: minhash_c})
         self.assertEqual(candidates, candidates_after)
+
+    def testRebuildMinhashBandIndexLeavesOutMinHashesOfAnotherLength(self):
+        """The rebuild empties every band first, so a stored minhash it cannot band - imports stored
+        them at any length - must not end it there, leaving the index empty on every run."""
+        self.storage.clearStorage()
+        smda_report = SmdaReport.fromFile(self.example_file_path)
+        assert smda_report is not None
+        self.storage.addSmdaReport(smda_report)
+        minhashes = [MinHash(function_id=function_id, minhash_signature=[0x30 + function_id + index for index in range(10)], minhash_bits=8) for function_id in [0, 2, 3, 5]]
+        self.storage.addMinHashes(minhashes)
+        # stored as an import does, without banding: one too short for the projection, one too long
+        odd_entries = []
+        for minhash_bytes in (bytes(3), bytes(range(11))):
+            function_entry = self.storage.getFunctionById(1)
+            assert function_entry is not None
+            function_entry.minhash = minhash_bytes
+            odd_entries.append(function_entry)
+        odd_entries = self.storage.importFunctionEntries(odd_entries)
+        assert odd_entries is not None
+
+        self.storage.rebuildMinhashBandIndex()
+
+        for minhash in minhashes:
+            self.assertIn(minhash.function_id, self.storage.getCandidatesForMinHash(minhash))
+        # the long one shares its first ten entries with this signature, and is not a candidate of it
+        candidates = self.storage.getCandidatesForMinHash(MinHash(function_id=1000, minhash_signature=list(range(10)), minhash_bits=8))
+        self.assertNotIn(odd_entries[1].function_id, candidates)
 
     def testMatchingCache(self):
         cache = self.storage.createMatchingCache([])
@@ -1022,6 +1234,333 @@ class MemoryStorageTest(TestCase):
         self.assertIsNone(self.storage.getSmdaExtras(query_entry.sample_id))
         self.assertTrue(all(sample_id >= 0 for sample_id in self.storage._smda_extras))
 
+    def testSubstringSearchOnNonStringFieldsAgreesWithMongoDb(self):
+        self.storage.clearStorage()
+        with open(self.example_file_path) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        self.storage.addSmdaReport(report)
+
+        def search(term):
+            cursor = FullSearchCursor(None, [("function_id", True)])
+            return sorted(self.storage.findFunctionByString(SearchQueryParser().parse(term), cursor=cursor, max_num_results=1000))
+
+        all_ids = search("function_id:>=0")
+        self.assertTrue(all_ids)
+        # a number is not text: "?" never finds it, "!?" always does
+        self.assertEqual([], search("sample_id:?0"))
+        self.assertEqual(all_ids, search("sample_id:!?0"))
+        self.assertEqual(all_ids, search("offset:!?zz"))
+        # a pichash is searched as the hex digits it is stored as
+        function_entry = self.storage.getFunctionById(all_ids[0])
+        assert function_entry is not None
+        digits = hex(function_entry.pichash)[2:10]
+        with_digits = search(f"pichash:?{digits}")
+        self.assertIn(function_entry.function_id, with_digits)
+        self.assertEqual(sorted(set(all_ids) - set(with_digits)), search(f"pichash:!?{digits}"))
+        self.assertEqual([], search("pichash:?zz"))
+        self.assertEqual(all_ids, search("pichash:!?zz"))
+        # a timestamp is searched as the text it is stored as
+        sample_entry = self.storage.getSampleById(function_entry.sample_id)
+        assert sample_entry is not None and sample_entry.timestamp is not None
+        sample_cursor = FullSearchCursor(None, [("sample_id", True)])
+        stamp = sample_entry.timestamp.strftime(TIMESTAMP_FORMAT)[:13]
+        self.assertEqual([sample_entry.sample_id], list(self.storage.findSampleByString(SearchQueryParser().parse(f"timestamp:?{stamp}"), cursor=sample_cursor)))
+        self.assertEqual([], list(self.storage.findSampleByString(SearchQueryParser().parse(f"timestamp:!?{stamp}"), cursor=sample_cursor)))
+        # a list matches when one of its elements does
+        self.storage.modifyFamily(sample_entry.family_id, {"actors": ["apt-zz", "other"]})
+        family_cursor = FullSearchCursor(None, [("family_id", True)])
+        self.assertEqual([sample_entry.family_id], list(self.storage.findFamilyByString(SearchQueryParser().parse("actors:?apt-z"), cursor=family_cursor)))
+        self.assertNotIn(sample_entry.family_id, self.storage.findFamilyByString(SearchQueryParser().parse("actors:!?apt-z"), cursor=family_cursor))
+
+    # --- function labels, searched with the qualified field ----
+
+    LABEL = "function_labels.function_label"
+
+    def _storageWithLabelledFunctions(self):
+        self.storage.clearStorage()
+        with open(self.example_file_path) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        self.storage.addSmdaReport(report)
+        function_ids = sorted(entry.function_id for entry in self.storage.getFunctionsBySampleId(0) or [])
+        # renamed after being labelled: the term is left in a label only
+        self.storage.modifyFunction(function_ids[0], {"function_name": "qz_label_only"}, username="alice")
+        self.storage.modifyFunction(function_ids[0], {"function_name": "plain_renamed"}, username="bob")
+        # in the name and in the label it was given with it
+        self.storage.modifyFunction(function_ids[1], {"function_name": "qz_both"}, username="alice")
+        return function_ids
+
+    def _searchFunctionIds(self, term, sort_by="function_id", max_num_results=1000):
+        sort_list = [(sort_by, True), ("function_id", True)] if sort_by != "function_id" else [("function_id", True)]
+        cursor = FullSearchCursor(None, sort_list)
+        return list(self.storage.findFunctionByString(SearchQueryParser().parse(term), cursor=cursor, max_num_results=max_num_results))
+
+    def _otherLabelsOf(self, function_id):
+        """The labels other than its name that a plain term finds the function by (#301): derived on
+        the fly in memory, stored in the function document on MongoDB."""
+        return sorted(self.storage._functions[function_id].getOtherLabels())
+
+    def testPlainFunctionSearchMatchesNameAndOtherLabels(self):
+        # a plain term finds a function by its name and by a label its name no longer holds (#301)
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        self.assertEqual([labelled], self._searchFunctionIds("qz_label_only"))
+        self.assertEqual([labelled], self._searchFunctionIds("QZ_LABEL"))
+        self.assertEqual([labelled], self._searchFunctionIds("plain_renamed"))
+        self.assertEqual([labelled, named], self._searchFunctionIds("qz_"))
+        self.assertEqual([labelled, named], self._searchFunctionIds("qz_", sort_by="function_name"))
+        self.assertEqual([labelled], self._searchFunctionIds("qz_label_only sample_id:0"))
+        self.assertEqual([], self._searchFunctionIds("qz_label_only sample_id:1"))
+        self.assertEqual([labelled, named], self._searchFunctionIds("qz_label_only OR qz_both"))
+        self.assertEqual([], self._searchFunctionIds("zzzzq"))
+        # a qualified name is the name alone
+        self.assertEqual([named], self._searchFunctionIds("function_name:?qz_"))
+        self.assertEqual(["qz_label_only"], self._otherLabelsOf(labelled))
+
+    def testNegatedPlainTermMatchesNeitherNameNorOtherLabel(self):
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        all_ids = self._searchFunctionIds("function_id:>=0")
+        self.assertEqual([i for i in all_ids if i not in (labelled, named)], self._searchFunctionIds("NOT qz_"))
+        # by the other label alone, and by the name alone
+        self.assertEqual([i for i in all_ids if i != labelled], self._searchFunctionIds("NOT qz_label_only"))
+        self.assertEqual([i for i in all_ids if i != labelled], self._searchFunctionIds("NOT plain_renamed"))
+        self.assertEqual(all_ids, self._searchFunctionIds("NOT zzzzq"))
+        self.assertEqual([named], self._searchFunctionIds("qz_ NOT label_only"))
+        self.assertEqual([named], self._searchFunctionIds("qz_ NOT plain", sort_by="function_name"))
+
+    def testALabelEqualToTheNameIsNoOtherLabel(self):
+        function_ids = self._storageWithLabelledFunctions()
+        named = function_ids[1]
+        # the same name as a label by two users: still the name, not another label
+        self.storage.modifyFunction(named, {"function_name": "qz_both"}, username="bob")
+        self.assertEqual([], self._otherLabelsOf(named))
+        self.assertEqual([named], self._searchFunctionIds("qz_both"))
+        # a label given twice is one other label
+        self.storage.modifyFunction(function_ids[2], {"function_name": "qz_twice"}, username="alice")
+        self.storage.modifyFunction(function_ids[2], {"function_name": "qz_twice"}, username="bob")
+        self.storage.modifyFunction(function_ids[2], {"function_name": "qz_now"}, username="alice")
+        self.assertEqual(["qz_twice"], self._otherLabelsOf(function_ids[2]))
+        self.assertEqual([function_ids[2]], self._searchFunctionIds("qz_twice"))
+
+    def testOtherLabelsFollowRenamesBothWays(self):
+        # no write removes a label; renaming to one of its labels takes it out of the other labels
+        function_ids = self._storageWithLabelledFunctions()
+        function_id = function_ids[2]
+        self.storage.modifyFunction(function_id, {"function_name": "qz_first"}, username="alice")
+        self.assertEqual([], self._otherLabelsOf(function_id))
+        self.storage.modifyFunction(function_id, {"function_name": "qz_second"}, username="alice")
+        self.assertEqual(["qz_first"], self._otherLabelsOf(function_id))
+        # back to the first name, which carries its label already: the second is the other one now
+        self.storage.modifyFunction(function_id, {"function_name": "qz_first"}, username="alice")
+        self.assertEqual(["qz_second"], self._otherLabelsOf(function_id))
+        self.assertEqual([function_id], self._searchFunctionIds("qz_second"))
+        self.assertNotIn(function_id, self._searchFunctionIds("NOT qz_second"))
+        # an empty name leaves every label another one
+        self.storage.modifyFunction(function_id, {"function_name": ""}, username="alice")
+        self.assertEqual(["qz_first", "qz_second"], self._otherLabelsOf(function_id))
+        self.assertEqual([function_id], self._searchFunctionIds("qz_first"))
+        # a name starting with "$" is a name, not a field path
+        self.storage.modifyFunction(function_id, {"function_name": "$function_id"}, username="alice")
+        self.assertEqual("$function_id", self.storage.getFunctionById(function_id).function_name)
+        self.assertEqual(["qz_first", "qz_second"], self._otherLabelsOf(function_id))
+
+    def testReportLabelsAreFoundByAPlainTerm(self):
+        function_ids = self._storageWithLabelledFunctions()
+        with open(self.example_file_path) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        # a resubmitted report labels each function with its own name: no other label
+        self.storage.updateFunctionLabels(report, "carol")
+        by_offset = {entry.offset: entry.function_id for entry in self.storage.getFunctionsBySampleId(0) or []}
+        untouched = [function_id for function_id in function_ids[2:] if function_id in by_offset.values()]
+        self.assertEqual([[] for _ in untouched], [self._otherLabelsOf(function_id) for function_id in untouched])
+        # a report naming a function otherwise gives it another label
+        smda_function = next(function for function in report.getFunctions() if by_offset.get(function.offset) == function_ids[3])
+        smda_function.function_name = "qz_from_report"
+        self.storage.updateFunctionLabels(report, "carol", checked=True)
+        self.assertEqual(["qz_from_report"], self._otherLabelsOf(function_ids[3]))
+        self.assertEqual([function_ids[3]], self._searchFunctionIds("qz_from_rep"))
+
+    def testImportedLabelledFunctionsAreFoundByAPlainTerm(self):
+        function_ids = self._storageWithLabelledFunctions()
+        sample_entry = self.storage.getSampleById(0)
+        function_entries = {entry.function_id: entry for entry in self.storage.getFunctionsBySampleId(0) or []}
+        exported = [FunctionEntry.fromDict(function_entries[function_id].toDict()) for function_id in function_ids]
+        unnamed = exported[2]
+        unnamed.function_labels = []
+        self.storage.clearStorage()
+        imported_sample = self.storage.importSampleEntry(sample_entry)
+        for entry in exported:
+            entry.sample_id = imported_sample.sample_id
+        # one at a time and in bulk, the two ways an import stores functions
+        self.storage.importFunctionEntry(exported[0])
+        self.storage.importFunctionEntries(exported[1:])
+        self.assertEqual(["qz_label_only"], self._otherLabelsOf(exported[0].function_id))
+        self.assertEqual([exported[0].function_id], self._searchFunctionIds("qz_label_only"))
+        # the label an import gives a function by its name is no other label
+        self.assertEqual("mcrit-import", unnamed.function_labels[0].username)
+        self.assertEqual([], self._otherLabelsOf(unnamed.function_id))
+        self.assertEqual([], self._otherLabelsOf(exported[1].function_id))
+
+    def testPlainTermPagesInTheSortOrder(self):
+        # functions found by a name and by another label interleave in every sort order
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        self.storage.modifyFunction(function_ids[2], {"function_name": "qz_a"}, username="alice")
+        self.storage.modifyFunction(function_ids[2], {"function_name": "zz_name"}, username="alice")
+        self.storage.modifyFunction(function_ids[3], {"function_name": "qz_c"}, username="alice")
+        index = MinHashIndex.__new__(MinHashIndex)
+        setattr(index, "getStorage", lambda: self.storage)
+        index.search_query_parser = SearchQueryParser()
+        # by name: plain_renamed (label qz_label_only), qz_both, qz_c, zz_name (label qz_a)
+        by_name = [labelled, named, function_ids[3], function_ids[2]]
+        for sort_by, is_ascending, expected in (
+            ("function_id", True, sorted(by_name)),
+            ("function_id", False, sorted(by_name, reverse=True)),
+            ("function_name", True, by_name),
+            ("function_name", False, by_name[::-1]),
+        ):
+            with self.subTest(sort_by=sort_by, is_ascending=is_ascending):
+                whole = index.getFunctionSearchResults("qz_", sort_by=sort_by, is_ascending=is_ascending)
+                self.assertEqual(expected, [int(key) for key in whole["search_results"]])
+                pages, cursor = [], None
+                while True:
+                    page = index.getFunctionSearchResults("qz_", sort_by=sort_by, is_ascending=is_ascending, cursor=cursor, limit=1)
+                    pages.extend(int(key) for key in page["search_results"])
+                    cursor = page["cursor"]["forward"]
+                    if cursor is None:
+                        break
+                self.assertEqual(expected, pages)
+                back = index.getFunctionSearchResults("qz_", sort_by=sort_by, is_ascending=is_ascending, cursor=page["cursor"]["backward"], limit=2)
+                self.assertEqual(expected[-3:-1], [int(key) for key in back["search_results"]])
+
+    def _labelSearchPaths(self, term):
+        """What each way of answering a label search finds: in memory there is one."""
+        return [self._searchFunctionIds(term)]
+
+    def testNegatedAndPlainLabelTermsTogether(self):
+        function_ids = self._storageWithLabelledFunctions()
+        self.storage.modifyFunction(function_ids[2], {"function_name": "abc_X"}, username="alice")
+        self.storage.modifyFunction(function_ids[3], {"function_name": "abc_plain"}, username="alice")
+        field = "function_labels.function_label"
+        for term, expected in (
+            (f"{field}:?abc {field}:!?x", [function_ids[3]]),
+            (f"{field}:?ABC NOT {field}:?plain", [function_ids[2]]),
+            (f"{field}:?abc {field}:!?zz", function_ids[2:4]),
+        ):
+            for found in self._labelSearchPaths(term):
+                with self.subTest(term=term):
+                    self.assertEqual(expected, found)
+
+    def testLabelsAreSearchedByTheFieldsMongoDBStores(self):
+        # a label carries its function_id in memory (one read through FunctionEntry.fromDict, as an
+        # import gives them), but MongoDB stores none in a label document
+        function_ids = self._storageWithLabelledFunctions()
+        in_memory = getattr(self.storage, "_functions", {}).get(function_ids[0])
+        for label in in_memory.function_labels if in_memory is not None else []:
+            label.setFunctionId(function_ids[0])
+        self.assertEqual([], self._searchFunctionIds(f"function_labels.function_id:{function_ids[0]}"))
+        self.assertEqual([function_ids[0]], self._searchFunctionIds("function_labels.username:bob"))
+
+    def testQualifiedFunctionLabelSearch(self):
+        # the labels are addressed by their stored path, as every other field is
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        all_ids = self._searchFunctionIds("function_id:>=0")
+        label = self.LABEL
+        # found by a label its name no longer holds, case-insensitively; a function matched by
+        # two of its labels is listed once
+        self.assertEqual([labelled], self._searchFunctionIds(f"{label}:?LABEL_ONLY"))
+        self.assertEqual([labelled, named], self._searchFunctionIds(f"{label}:?qz_"))
+        self.assertEqual([named], self._searchFunctionIds(f"{label}:?qz_ function_name:?qz_"))
+        self.assertEqual([labelled, named], self._searchFunctionIds(f"{label}:?qz_label OR plain_renamed OR qz_both"))
+        self.assertEqual([], self._searchFunctionIds(f"{label}:?zzzzq"))
+        self.assertEqual([], self._searchFunctionIds(f"sample_id:1 {label}:?qz_"))
+        # "!?" holds where no label holds the term - MongoDB's $not on a list - and so for a
+        # function without labels; NOT negates the same way
+        self.assertEqual([i for i in all_ids if i not in (labelled, named)], self._searchFunctionIds(f"{label}:!?qz_"))
+        self.assertEqual([i for i in all_ids if i != labelled], self._searchFunctionIds(f"NOT {label}:?qz_label"))
+        self.assertEqual(all_ids, self._searchFunctionIds(f"{label}:!?zzzzq"))
+        # equality and "!=" hold for a list when one element is equal, and when none is
+        self.assertEqual([labelled], self._searchFunctionIds(f"{label}:qz_label_only"))
+        self.assertEqual([], self._searchFunctionIds(f"{label}:qz_label"))
+        self.assertEqual([i for i in all_ids if i != labelled], self._searchFunctionIds(f"{label}:!=qz_label_only"))
+        # and any other field of the labels
+        self.assertEqual([labelled, named], self._searchFunctionIds("function_labels.username:alice"))
+        self.assertEqual([labelled], self._searchFunctionIds("function_labels.username:?BO"))
+
+    def testQualifiedLabelSearchPagesAndSorts(self):
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        term = f"{self.LABEL}:?qz_"
+        # a page of one: the cursor of the first page leads to the second
+        index = MinHashIndex.__new__(MinHashIndex)
+        setattr(index, "getStorage", lambda: self.storage)
+        index.search_query_parser = SearchQueryParser()
+        first = index.getFunctionSearchResults(term, limit=1)
+        self.assertEqual([labelled], [int(key) for key in first["search_results"]])
+        second = index.getFunctionSearchResults(term, cursor=first["cursor"]["forward"], limit=1)
+        self.assertEqual([named], [int(key) for key in second["search_results"]])
+        self.assertIsNone(second["cursor"]["forward"])
+        back = index.getFunctionSearchResults(term, cursor=second["cursor"]["backward"], limit=1)
+        self.assertEqual([labelled], [int(key) for key in back["search_results"]])
+        # sorted by name: "plain_renamed" before "qz_both", and the other way round descending
+        self.assertEqual([labelled, named], self._searchFunctionIds(term, sort_by="function_name"))
+        by_name_descending = index.getFunctionSearchResults(term, sort_by="function_name", is_ascending=False)
+        self.assertEqual([named, labelled], [int(key) for key in by_name_descending["search_results"]])
+        by_name_first = index.getFunctionSearchResults(term, sort_by="function_name", is_ascending=False, limit=1)
+        by_name_second = index.getFunctionSearchResults(term, sort_by="function_name", is_ascending=False, cursor=by_name_first["cursor"]["forward"], limit=1)
+        self.assertEqual([named, labelled], [int(key) for page in (by_name_first, by_name_second) for key in page["search_results"]])
+
+
+class MemoryStorageInternalsTest(_MemoryStorageFixture, TestCase):
+    """Implementation-specific checks that MongoDbStorageTest must not inherit."""
+
+    def testDeletingSamplesLeavesNoEmptyPicHashBuckets(self):
+        report_a, report_b = self._twoReports()
+        # zero means no PicHash and must never become a bucket, even after deletion
+        next(iter(report_b.xcfg.values())).pic_hash = 0
+        sample_a = self.storage.addSmdaReport(report_a)
+        sample_b = self.storage.addSmdaReport(report_b)
+        assert sample_a is not None and sample_b is not None
+        self.assertNotIn(0, self.storage._pichashes)
+        self.assertTrue(self.storage.deleteSample(sample_a.sample_id))
+        self.assertTrue(all(self.storage._pichashes.values()))
+        self.assertNotIn(0, self.storage._pichashes)
+        self.assertTrue(self.storage.deleteSample(sample_b.sample_id))
+        self.assertEqual({}, self.storage._pichashes)
+        self.assertFalse(self.storage.isPicHash(0))
+
+    def testRebuildMinhashBandIndexDecodesOneBatchAtATime(self):
+        report = SmdaReport.fromFile(self.example_file_path)
+        assert report is not None
+        self.storage.addSmdaReport(report)
+        minhashes = [MinHash(function_id=function_id, minhash_signature=[0x30 + function_id + index for index in range(10)], minhash_bits=8) for function_id in [0, 2, 3, 5, 7]]
+        self.storage.addMinHashes(minhashes)
+        self.storage._minhash_config.MINHASH_BAND_REBUILD_WORK_PACKAGE_SIZE = 2
+        events = []
+        original_decode = FunctionEntry.getMinHash
+        original_insert = self.storage._addMinHashToBands
+
+        def decode(entry, bits):
+            events.append("decode")
+            return original_decode(entry, bits)
+
+        def insert(minhash):
+            events.append("insert")
+            return original_insert(minhash)
+
+        with patch.object(FunctionEntry, "getMinHash", decode), patch.object(self.storage, "_addMinHashToBands", insert):
+            self.assertEqual(5, self.storage.rebuildMinhashBandIndex())
+        # The first insert must happen before a third signature is decoded.
+        self.assertEqual(["decode", "decode", "insert"], events[:3])
+        self.assertEqual(5, events.count("decode"))
+        self.assertEqual(5, events.count("insert"))
+        for minhash in minhashes:
+            self.assertIn(minhash.function_id, self.storage.getCandidatesForMinHash(minhash))
+
 
 @pytest.mark.mongo
 class MongoDbStorageTest(MemoryStorageTest):
@@ -1040,6 +1579,77 @@ class MongoDbStorageTest(MemoryStorageTest):
         THIS_FILE_PATH = str(os.path.abspath(__file__))
         PROJECT_ROOT = str(os.path.abspath(os.sep.join([THIS_FILE_PATH, "..", ".."])))
         self.example_file_path = os.sep.join([PROJECT_ROOT, "tests", "example_report.smda"])
+
+    def testAFailedFamilyCountWhoseFunctionsCannotBeRemovedKeepsTheCountedFamiliesRaised(self):
+        # the second family's counter fails, and so does removing the functions: they stay stored, so
+        # the first family stays raised for the discard to take its functions off once - taken back
+        # here as well, the discard took them off a second time. The second family never counted
+        # its functions, which the discard cannot tell, so only the first is checked. The pichash
+        # counts were taken back from functions that stay stored, which only a rebuild sets right
+        self.storage.clearStorage()
+        source, other_family_id = self._storeASampleAndAnotherFamily()
+        family_before = self._familyCounters()[source.family_id]
+        imported, function_entries = self._importTwoSampleEntries(source, other_family_id)
+
+        with self._failingForFamily(other_family_id), patch.object(self.storage, "_discardFunctions", side_effect=RuntimeError("connection lost")):
+            with self.assertRaisesRegex(RuntimeError, "connection lost"):
+                self.storage.importFunctionEntries(function_entries)
+        self.assertFalse(self.storage.isPicHashCountIndexComplete())
+        for imported_entry in imported:
+            self.storage.discardImportedSample(imported_entry)
+
+        self.assertEqual(family_before, self._familyCounters()[source.family_id])
+        self.assertEqual([source.sample_id], self.storage.getSampleIds())
+        self.storage.rebuildPicHashCountIndex()
+        self.assertEqual(10, len(self._picHashCountDocuments()))
+
+    def testAFailedPicHashCountLeavesEveryFamilyAsItWasAfterTheDiscard(self):
+        # the counting fails after the insert, before any family counter is raised: functions left
+        # stored would be taken off their families by the discard, which never counted them. Memory
+        # storage has no such step, it counts each family before storing the function
+        self.storage.clearStorage()
+        source, other_family_id = self._storeASampleAndAnotherFamily()
+        families_before = self._familyCounters()
+        imported, function_entries = self._importTwoSampleEntries(source, other_family_id)
+
+        with patch.object(self.storage, "_addToPicHashCounts", side_effect=RuntimeError("counting failed")):
+            with self.assertRaisesRegex(RuntimeError, "counting failed"):
+                self.storage.importFunctionEntries(function_entries)
+        self.assertFalse(self.storage.isPicHashCountIndexComplete())
+        for imported_entry in imported:
+            self.assertEqual([], self.storage.getFunctionIdsBySampleId(imported_entry.sample_id))
+            self.storage.discardImportedSample(imported_entry)
+
+        self.assertEqual(families_before, self._familyCounters())
+        self.assertEqual([source.sample_id], self.storage.getSampleIds())
+        self.storage.rebuildPicHashCountIndex()
+        self.assertEqual(10, len(self._picHashCountDocuments()))
+
+    def testAFailedPicHashCountWhoseFunctionsCannotBeRemovedRaisesTheCountError(self):
+        # removing the functions fails as well: logged, and the error that failed the import is the
+        # one raised
+        self.storage.clearStorage()
+        source, other_family_id = self._storeASampleAndAnotherFamily()
+        _, function_entries = self._importTwoSampleEntries(source, other_family_id)
+
+        with (
+            patch.object(self.storage, "_addToPicHashCounts", side_effect=RuntimeError("counting failed")),
+            patch.object(self.storage, "_discardFunctions", side_effect=RuntimeError("removing failed")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "counting failed"):
+                self.storage.importFunctionEntries(function_entries)
+        self.assertFalse(self.storage.isPicHashCountIndexComplete())
+
+    def testASampleStoredBeforeSha256VerifiedReadsAsUnknown(self):
+        self.storage.clearStorage()
+        report_a, _ = self._twoReports()
+        sample_entry = self.storage.addSmdaReport(report_a)
+        assert sample_entry is not None
+        self.storage._getDb().samples.update_one({"sample_id": sample_entry.sample_id}, {"$unset": {"sha256_verified": ""}})
+        stored = self.storage.getSampleById(sample_entry.sample_id)
+        assert stored is not None
+        self.assertIsNone(stored.sha256_verified)
+        self.assertIsNone(stored.toDict()["sha256_verified"])
 
     def testAStrayExtrasChunkDoesNotBlockStoringTheExtras(self):
         # a chunk an interrupted store left behind under the same id must not cause a duplicate key
@@ -1242,7 +1852,15 @@ class MongoDbStorageTest(MemoryStorageTest):
         self.storage._getDb().families.update_one({"family_id": family_id}, {"$set": {"num_samples": num_samples, "num_functions": num_functions}})
 
     def _nameFamilyInStorage(self, family_id, family_name):
-        self.storage._getDb().families.update_one({"family_id": family_id}, {"$set": {"family_name": family_name}})
+        # a name held twice, as a database from before family names were unique (#299) can hold one:
+        # it cannot get the unique index
+        families = self.storage._getDb().families
+        families.drop_index("family_name_1")
+        families.create_index("family_name")
+        families.update_one({"family_id": family_id}, {"$set": {"family_name": family_name}})
+
+    def _removeFamilyEntry(self, family_id):
+        self.storage._getDb().families.delete_one({"family_id": family_id})
 
     def testRecomputeCreatesTheFamilyDocumentSamplesReferenceWithoutOne(self):
         # the family_id 1908 case of #151: samples carry an id that no family document describes
@@ -1292,7 +1910,8 @@ class MongoDbStorageTest(MemoryStorageTest):
         assert family is not None
         self.assertEqual("family_1", family.family_name)
         self.assertEqual(1, family.num_samples)
-        self.assertEqual(10, family.num_functions)
+        # its functions count once they are imported, not by what its statistics state
+        self.assertEqual(0, family.num_functions)
 
     def testAStatsUpdateAgainstAMissingFamilyIsLogged(self):
         self.storage.clearStorage()
@@ -1485,7 +2104,804 @@ class MongoDbStorageTest(MemoryStorageTest):
             self.assertEqual(0, listing.call_count)
             self.storage.findFunctionByString(SearchQueryParser().parse("function_name:qz_alpha"))
             self.assertEqual(0, listing.call_count)
+            self.storage.findFunctionByString(SearchQueryParser().parse("function_labels.function_label:qz_alpha"))
+            self.assertEqual(0, listing.call_count)
+            # a negated label condition is answered by the regex: a $nin examines every document as well
+            self.storage.findFunctionByString(SearchQueryParser().parse("function_labels.function_label:!?qz_alph"))
+            self.storage.findFunctionByString(SearchQueryParser().parse("NOT function_labels.function_label:?qz_alph"))
+            self.assertEqual(0, listing.call_count)
+            # a plain term lists the names and the labels that differ from them (#301), never all labels
+            plain_term = [("functions", "function_name"), ("functions", OTHER_LABELS_FIELD)]
             self.storage.findFunctionByString(SearchQueryParser().parse("qz_alph"))
+            self.assertEqual(plain_term, [call.args[:2] for call in listing.call_args_list])
+            # a label term is listed for only when the probe of the sort order finds no page
+            cursor = FullSearchCursor(None, [("function_id", True)])
+            with patch.object(self.storage, "_probeFunctionSearch", return_value=[]) as probing:
+                self.storage.findFunctionByString(SearchQueryParser().parse("function_labels.function_label:?qz_alph"), cursor=cursor)
+                self.assertEqual(1, probing.call_count)
+                self.assertEqual(2, listing.call_count)
+                # with a condition on another field the search is the query it always was: no probe, no listing
+                self.storage.findFunctionByString(SearchQueryParser().parse("sample_id:0 function_labels.function_label:?qz_alph"), cursor=cursor)
+                self.storage.findFunctionByString(SearchQueryParser().parse("qz_alph function_labels.function_label:?qz_alph"), cursor=cursor)
+                self.assertEqual(1, probing.call_count)
+                self.assertEqual(plain_term * 2, [call.args[:2] for call in listing.call_args_list])
+            with patch.object(self.storage, "_probeFunctionSearch", return_value=None):
+                self.storage.findFunctionByString(SearchQueryParser().parse("function_labels.function_label:?qz_alph"), cursor=cursor)
+            self.assertEqual(("functions", "function_labels.function_label"), listing.call_args_list[-1].args[:2])
+            self.assertEqual(5, listing.call_count)
+
+    def _labelQuery(self, term):
+        field = "function_labels.function_label"
+        return self.storage._get_search_query(["function_name"], SearchQueryParser().parse(term), None, distinct_fields={"function_name": "functions", field: "functions"})
+
+    def testPlainTermIsTheNameAndTheOtherLabels(self):
+        self._storageWithLabelledFunctions()
+        with (
+            patch.object(self.storage, "_resolve_search_tree", wraps=self.storage._resolve_search_tree) as resolving,
+            patch.object(self.storage, "_list_known_values", wraps=self.storage._list_known_values) as listing,
+            patch.object(self.storage, "_probeFunctionSearch", wraps=self.storage._probeFunctionSearch) as probing,
+        ):
+            self.storage.findFunctionByString(SearchQueryParser().parse("qz_"), cursor=FullSearchCursor(None, [("function_id", True)]))
+        self.assertEqual([["function_name", OTHER_LABELS_FIELD]], list({tuple(call.args[0]): call.args[0] for call in resolving.call_args_list}.values()))
+        # both fields are listed once for the two queries, and the labels never are
+        self.assertEqual([{"function_name": "functions", OTHER_LABELS_FIELD: "functions"}], [call.args[1] for call in listing.call_args_list])
+        self.assertEqual(0, probing.call_count)
+        self.assertEqual({"function_name": {"$in": ["qz_both"]}}, self._labelQuery("qz_"))
+
+    def testLabelSearchIsAnsweredFromTheIndex(self):
+        function_ids = self._storageWithLabelledFunctions()
+        functions = self.storage._getDb().functions
+        label_index = [info for info in functions.index_information().values() if info["key"] == [("function_labels.function_label", 1)]]
+        self.assertEqual(1, len(label_index))
+        self.assertTrue(label_index[0].get("sparse"))
+        substring = self._labelQuery("function_labels.function_label:?qz_")
+        self.assertEqual(["function_labels.function_label"], list(substring))
+        self.assertEqual(["qz_both", "qz_label_only"], sorted(substring["function_labels.function_label"]["$in"]))
+        self.assertEqual("qz_", substring["function_labels.function_label"]["$regex"].pattern)
+        exact = self._labelQuery("function_labels.function_label:qz_both")
+        self.assertEqual({"function_labels.function_label": "qz_both"}, exact)
+        for query in (substring, exact):
+            for sort_list in ([("function_id", 1)], [("function_name", -1), ("function_id", -1)]):
+                plan = str(functions.find(query, sort=sort_list, limit=101).explain()["queryPlanner"]["winningPlan"])
+                self.assertNotIn("COLLSCAN", plan)
+                self.assertIn("function_labels.function_label_1", plan)
+        self.assertEqual(function_ids[:2], self._searchFunctionIds("function_labels.function_label:?qz_"))
+
+    def testLabelProbeAndListingAnswerTheSamePages(self):
+        # a "?" on the labels is answered by the probe (the regex) or, when that runs out of time, through
+        # the listed labels; either way the pages are the same, in the same order
+        self._storageWithLabelledFunctions()
+        index = MinHashIndex.__new__(MinHashIndex)
+        setattr(index, "getStorage", lambda: self.storage)
+        index.search_query_parser = SearchQueryParser()
+
+        def pages(term, sort_by, is_ascending):
+            answered, cursor = [], None
+            while True:
+                page = index.getFunctionSearchResults(term, sort_by=sort_by, is_ascending=is_ascending, cursor=cursor, limit=1)
+                answered.append(list(page["search_results"]))
+                cursor = page["cursor"]["forward"]
+                if cursor is None:
+                    return answered
+
+        for term in (
+            "function_labels.function_label:?qz_",
+            "function_labels.function_label:?LABEL_ON",
+            "function_labels.function_label:?qz_b OR function_labels.function_label:plain_renamed",
+        ):
+            for sort_by, is_ascending in (("function_id", True), ("function_id", False), ("function_name", False), ("offset", True)):
+                with self.subTest(term=term, sort_by=sort_by, is_ascending=is_ascending):
+                    with patch.object(self.storage, "_list_known_values", wraps=self.storage._list_known_values) as listing:
+                        probed = pages(term, sort_by, is_ascending)
+                        self.assertNotIn({"function_labels.function_label": "functions"}, [call.args[1] for call in listing.call_args_list])
+                    with patch.object(self.storage, "_probeFunctionSearch", return_value=None):
+                        listed = pages(term, sort_by, is_ascending)
+                    self.assertTrue(probed[0])
+                    self.assertEqual(probed, listed)
+
+    def _otherLabelsOf(self, function_id):
+        document = self.storage._getDb().functions.find_one({"function_id": function_id})
+        assert document is not None
+        return sorted(document.get(OTHER_LABELS_FIELD, []))
+
+    def _undoOtherLabels(self):
+        """The database as it was before #301: no function carries the field, nothing vouches for it."""
+        self.storage._getDb().functions.update_many({}, {"$unset": {OTHER_LABELS_FIELD: ""}})
+        self.storage._setOtherLabelsComplete(False)
+        # written past the storage, so what it does itself after such a write
+        self.storage._bumpOtherLabelsVersion()
+        # and no start has found it due yet, in this run or an earlier one on the same database
+        self.storage._getDb().settings.update_one({}, {"$unset": {MongoDbStorage._OTHER_LABELS_DUE_SETTING: ""}})
+        MongoDbStorage._other_labels_due_since.clear()
+        self.addCleanup(MongoDbStorage._other_labels_due_since.clear)
+
+    def testOtherLabelsAreStoredButNeverReturned(self):
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        functions = self.storage._getDb().functions
+        self.assertEqual(["qz_label_only"], functions.find_one({"function_id": labelled})[OTHER_LABELS_FIELD])
+        # absent rather than empty, so that the sparse index holds only the functions that have some
+        self.assertNotIn(OTHER_LABELS_FIELD, functions.find_one({"function_id": named}))
+        self.assertEqual([labelled], [document["function_id"] for document in functions.find({}, {"function_id": 1}).hint([(OTHER_LABELS_FIELD, 1)])])
+        index = MinHashIndex.__new__(MinHashIndex)
+        setattr(index, "getStorage", lambda: self.storage)
+        index.search_query_parser = SearchQueryParser()
+        found = index.getFunctionSearchResults("qz_")
+        self.assertIn(labelled, found["search_results"])
+        outputs = [
+            found,
+            self.storage.getFunctionById(labelled).toDict(),
+            [entry.toDict() for entry in self.storage.getFunctionsBySampleId(0) or []],
+            [entry.toDict() for entry in self.storage.getFunctions(0, 100)],
+            index.getFunctionSearchResults("qz_", sort_by="function_name"),
+            index.getFunctionSearchResults("function_labels.function_label:?qz_"),
+        ]
+        for output in outputs:
+            self.assertNotIn(OTHER_LABELS_FIELD, json.dumps(output, default=str))
+
+    def testPlainTermSearchesTheFunctionsWithOtherLabelsApart(self):
+        # the functions whose other labels the term cannot match are searched by the name query as
+        # before, so a sort by name keeps its walk of the (function_name, function_id) index; those
+        # with a matching other label are read through the sparse index, their sort keys first
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        self.storage.modifyFunction(function_ids[2], {"function_name": "zz_first"}, username="alice")
+        self.storage.modifyFunction(function_ids[2], {"function_name": "zz_second"}, username="alice")
+        cursor = FullSearchCursor(None, [("function_name", False), ("function_id", False)])
+        functions = self.storage._getDb().functions
+
+        def as_lists(value):
+            # the transpiler builds $and / $or of tuples, which pymongo sends as arrays
+            if isinstance(value, dict):
+                return {key: as_lists(item) for key, item in value.items()}
+            return [as_lists(item) for item in value] if isinstance(value, (list, tuple)) else value
+
+        def search(term):
+            with patch.object(functions.__class__, "find", autospec=True, side_effect=functions.__class__.find) as finding:
+                found = list(self.storage.findFunctionByString(SearchQueryParser().parse(term), cursor=cursor))
+            calls = [call for call in finding.call_args_list if call.args[0].name == "functions"]
+            return found, [(as_lists(call.args[1]), as_lists(call.args[2]), as_lists(call.kwargs.get("hint"))) for call in calls]
+
+        found, queries = search("qz_")
+        self.assertEqual([named, labelled], found)
+        projection = MongoDbStorage._FUNCTION_SEARCH_PROJECTION
+        keys = {"_id": 0, "function_id": 1, "function_name": 1}
+        regex = re.compile("qz_", re.IGNORECASE)
+        self.assertEqual(
+            [
+                ({"$and": [{"function_name": {"$in": ["qz_both"]}}, {OTHER_LABELS_FIELD: {"$nin": ["qz_label_only"]}}]}, projection, None),
+                (
+                    {
+                        "$and": [
+                            {"$or": [{"function_name": regex}, {OTHER_LABELS_FIELD: {"$in": ["qz_label_only"], "$regex": regex}}]},
+                            {OTHER_LABELS_FIELD: {"$in": ["qz_label_only"]}},
+                        ]
+                    },
+                    keys,
+                    [[OTHER_LABELS_FIELD, 1]],
+                ),
+                ({"function_id": {"$in": [labelled]}}, projection, None),
+            ],
+            queries,
+        )
+        plan = str(functions.find(queries[0][0], sort=[("function_name", -1), ("function_id", -1)], limit=101).explain()["queryPlanner"]["winningPlan"])
+        self.assertIn("function_name_1_function_id_1", plan)
+        self.assertNotIn("SORT'", plan)
+        # a negated term takes out what its other labels match the same way
+        found, queries = search("NOT qz_ sample_id:0")
+        self.assertNotIn(labelled, found)
+        self.assertIn(function_ids[2], found)
+        self.assertEqual({OTHER_LABELS_FIELD: {"$nin": ["qz_label_only"]}}, queries[0][0]["$and"][-1])
+        # a term no other label matches is the name query alone
+        found, queries = search("zz_second")
+        self.assertEqual([function_ids[2]], found)
+        self.assertEqual([({"function_name": {"$in": ["zz_second"]}}, projection, None)], queries)
+        # and so is every term without any other labels in the database
+        self._undoOtherLabels()
+        found, queries = search("qz_")
+        self.assertEqual([named], found)
+        self.assertEqual([({"function_name": {"$in": ["qz_both"]}}, projection, None)], queries)
+        # a condition on the field that is no substring one reads every function with other labels
+        # (the label carol gives derives the field anew), and nothing else where it cannot hold
+        self.storage.modifyFunction(labelled, {"function_name": "plain_renamed"}, username="carol")
+        found, queries = search(f"{OTHER_LABELS_FIELD}:qz_label_only")
+        self.assertEqual([labelled], found)
+        self.assertEqual({OTHER_LABELS_FIELD: {"$exists": True}}, queries[0][0]["$and"][-1])
+        found, queries = search(f"{OTHER_LABELS_FIELD}:!=qz_label_only qz_")
+        self.assertEqual([named], found)
+        self.assertEqual({OTHER_LABELS_FIELD: {"$exists": False}}, queries[0][0]["$and"][-1])
+        self.assertEqual({OTHER_LABELS_FIELD: {"$exists": True}}, queries[1][0]["$and"][-1])
+
+    def _otherLabelListings(self, storage, *terms):
+        """How often searching the terms lists the other labels on the server."""
+        with patch.object(storage, "_scanDistinctValues", wraps=storage._scanDistinctValues) as listing:
+            for term in terms:
+                storage.findFunctionByString(SearchQueryParser().parse(term), cursor=FullSearchCursor(None, [("function_id", True)]))
+        return [call.args[1] for call in listing.call_args_list].count(OTHER_LABELS_FIELD)
+
+    def testOtherLabelsAreListedOncePerChange(self):
+        function_ids = self._storageWithLabelledFunctions()
+        labelled = function_ids[0]
+        self._otherLabelListings(self.storage, "qz_")
+        # without a write in between, a search reads the version alone, plain or negated
+        self.assertEqual(0, self._otherLabelListings(self.storage, "qz_", "NOT qz_", "zzzzq"))
+        # every write that can change the other labels has the next search list them, once
+        exported = FunctionEntry.fromDict(self.storage.getFunctionById(labelled).toDict())
+        with open(self.example_file_path) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        renamed_in_report = next(function for function in report.getFunctions() if function.offset == self.storage.getFunctionById(function_ids[3]).offset)
+        renamed_in_report.function_name = "qz_from_report"
+        for write in (
+            lambda: self.storage.modifyFunction(function_ids[2], {"function_name": "qz_renamed"}, username="alice"),
+            lambda: self.storage.updateFunctionLabels(report, "carol", checked=True),
+            lambda: self.storage.importFunctionEntries([exported]),
+        ):
+            write()
+            self.assertEqual(1, self._otherLabelListings(self.storage, "qz_", "qz_label", "NOT qz_"))
+        self.assertEqual([labelled, exported.function_id], self._searchFunctionIds("qz_label_only"))
+        self.storage.deleteSample(0)
+        self.assertEqual(1, self._otherLabelListings(self.storage, "qz_", "qz_label", "NOT qz_"))
+        self.assertEqual([], self._searchFunctionIds("qz_label_only"))
+        # an insert of functions without other labels leaves them as they were
+        self.storage.addSmdaReport(report)
+        self.assertEqual(0, self._otherLabelListings(self.storage, "qz_"))
+
+    def testAnotherProcessSeesTheOtherLabelsChange(self):
+        function_ids = self._storageWithLabelledFunctions()
+        other = self._createSecondStorage()
+        self._otherLabelListings(other, "qz_")
+        self.assertEqual(0, self._otherLabelListings(other, "qz_"))
+        self.storage.modifyFunction(function_ids[2], {"function_name": "qz_elsewhere"}, username="alice")
+        self.storage.modifyFunction(function_ids[2], {"function_name": "zz_now"}, username="alice")
+        self.assertEqual(1, self._otherLabelListings(other, "qz_else"))
+        found = other.findFunctionByString(SearchQueryParser().parse("qz_elsewhere"), cursor=FullSearchCursor(None, [("function_id", True)]))
+        self.assertEqual([function_ids[2]], list(found))
+
+    def testOtherLabelsNotListedAreListedAgainAfterAWhile(self):
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        self.storage.modifyFunction(function_ids[2], {"function_name": "qz_x"}, username="alice")
+        scan = self.storage._scanDistinctValues
+
+        def too_slow(collection, field, max_time_ms):
+            if field == OTHER_LABELS_FIELD:
+                raise ExecutionTimeout("operation exceeded time limit")
+            return scan(collection, field, max_time_ms)
+
+        with patch.object(self.storage, "_scanDistinctValues", side_effect=too_slow):
+            self.assertEqual([labelled, named, function_ids[2]], self._searchFunctionIds("qz_"))
+        self.assertIsNotNone(self.storage._other_labels_unlisted_since)
+        # the search goes on without them, and does not list them again, nor read the version, even
+        # after a write: each try may cost the whole time limit
+        self.storage.modifyFunction(function_ids[4], {"function_name": "qz_w"}, username="alice")
+        with patch.object(self.storage, "_otherLabelsVersion", wraps=self.storage._otherLabelsVersion) as version_reads:
+            self.assertEqual(0, self._otherLabelListings(self.storage, "qz_"))
+        self.assertEqual(0, version_reads.call_count)
+        self.assertEqual([labelled], self._searchFunctionIds("qz_label_only"))
+        # more of them than a search may test are not kept either
+        with patch.object(MongoSearchTranspiler, "_MAX_VALUE_TESTS", 0), patch.object(MongoDbStorage, "_OVER_CAP_TTL", 0):
+            self.assertEqual(1, self._otherLabelListings(self.storage, "qz_"))
+        self.assertIsNone(self.storage._other_labels_listing)
+        # until a while has passed
+        with patch.object(MongoDbStorage, "_OVER_CAP_TTL", 0):
+            self.assertEqual(1, self._otherLabelListings(self.storage, "qz_"))
+        self.assertEqual(["qz_label_only"], self.storage._other_labels_listing[1])
+        # their size alone is no reason not to list them: the matches of a search are capped
+        with patch.object(MongoDbStorage, "_DISTINCT_VALUES_MAX_BYTES", 5):
+            self.storage.modifyFunction(function_ids[3], {"function_name": "qz_y"}, username="alice")
+            self.assertEqual(1, self._otherLabelListings(self.storage, "qz_"))
+            self.assertIsNotNone(self.storage._other_labels_listing[1])
+            self.assertEqual([labelled, named, function_ids[2], function_ids[3], function_ids[4]], self._searchFunctionIds("qz_"))
+            self.assertEqual([labelled], self._searchFunctionIds("qz_label_only"))
+
+    def _otherLabelMatchings(self, *terms):
+        """The terms whose other labels searching the terms tested anew, and the pages found."""
+        scan = MongoDbStorage._scanOtherLabelsMatchingTerm
+        with patch.object(MongoDbStorage, "_scanOtherLabelsMatchingTerm", wraps=scan) as matching:
+            pages = [self._searchFunctionIds(term) for term in terms]
+        return [call.args[0] for call in matching.call_args_list], pages
+
+    def testRepeatedTermsAreNotMatchedAgainstTheOtherLabels(self):
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        self.assertEqual((["qz_"], [[labelled, named]]), self._otherLabelMatchings("qz_"))
+        # the same term in any case, negated or beside a new one: only the new one is tested
+        self.assertEqual(([], [[labelled, named], [labelled, named]]), self._otherLabelMatchings("qz_", "QZ_"))
+        scanned, pages = self._otherLabelMatchings("NOT qz_", "qz_ OR zzzzq", "zzzzq")
+        self.assertEqual(["zzzzq"], scanned)
+        self.assertEqual([[labelled, named], []], pages[1:])
+        self.assertNotIn(labelled, pages[0])
+
+    def testOtherLabelsChangedAreMatchedAgain(self):
+        function_ids = self._storageWithLabelledFunctions()
+        labelled, named = function_ids[0], function_ids[1]
+        self._otherLabelMatchings("qz_", "qz_label")
+        self.storage.modifyFunction(function_ids[2], {"function_name": "qz_moved"}, username="alice")
+        self.storage.modifyFunction(function_ids[2], {"function_name": "zz_now"}, username="alice")
+        # every term held is tested again, against the new listing
+        self.assertEqual((["qz_", "qz_label"], [[labelled, named, function_ids[2]], [labelled]]), self._otherLabelMatchings("qz_", "qz_label"))
+        self.assertEqual(([], [[labelled, named, function_ids[2]]]), self._otherLabelMatchings("qz_"))
+        # a change made by another process as well
+        self._createSecondStorage().modifyFunction(function_ids[3], {"function_name": "qz_elsewhere"}, username="bob")
+        self.assertEqual(["qz_"], self._otherLabelMatchings("qz_")[0])
+
+    def testTermMatchesAreSharedSafelyAcrossThreads(self):
+        self._storageWithLabelledFunctions()
+        expected = {term: self._searchFunctionIds(term) for term in ("qz_", "qz_label")}
+        found, errors = {}, []
+
+        def search(term):
+            try:
+                found[term] = self._searchFunctionIds(term)
+            except Exception as error:
+                errors.append(error)
+
+        threads = []
+        # set once the other thread has evicted this one's entry, or waits for the lock to do so
+        progressed = threading.Event()
+
+        def search_aside(term):
+            search(term)
+            progressed.set()
+
+        class SignallingLock:
+            def __init__(self, lock):
+                self._lock = lock
+
+            def __enter__(self):
+                if threads and threading.current_thread() is threads[0]:
+                    progressed.set()
+                return self._lock.__enter__()
+
+            def __exit__(self, *exc_info):
+                return self._lock.__exit__(*exc_info)
+
+        class Interleaved(OrderedDict):
+            def get(self, key, default=None):
+                kept = OrderedDict.get(self, key, default)
+                if key == "qz_" and kept is not None and not threads:
+                    # another request thread searches between this one's lookup and its use of it:
+                    # with the lock it waits for this one to be done, without it it evicts the entry
+                    threads.append(threading.Thread(target=search_aside, args=("qz_label",)))
+                    threads[0].start()
+                    progressed.wait(timeout=30)
+                return kept
+
+        with patch.object(MongoDbStorage, "_OTHER_LABEL_MATCHES_MAX", 1):
+            # the one term kept is the one this thread finds, which the other one's evicts
+            self.storage._other_label_matches = Interleaved()
+            self.storage._other_label_matches_lock = SignallingLock(getattr(self.storage, "_other_label_matches_lock", threading.Lock()))
+            self._searchFunctionIds("qz_")
+            search("qz_")
+            threads[0].join()
+        self.assertEqual([], errors)
+        self.assertEqual(expected, found)
+
+    def testMatchesOfAReplacedListingAreNotKept(self):
+        function_ids = self._storageWithLabelledFunctions()
+        scan = MongoDbStorage._scanOtherLabelsMatchingTerm
+
+        def renamed_meanwhile(term, values):
+            if term == "qz_":
+                # another thread's write and search replace the listing while this one tests it
+                self.storage.modifyFunction(function_ids[2], {"function_name": "qz_meanwhile"}, username="alice")
+                self.storage.modifyFunction(function_ids[2], {"function_name": "zz_now"}, username="alice")
+                self._searchFunctionIds("zzzzq")
+            return scan(term, values)
+
+        with patch.object(MongoDbStorage, "_scanOtherLabelsMatchingTerm", side_effect=renamed_meanwhile):
+            self._searchFunctionIds("qz_")
+        self.assertNotIn("qz_", self.storage._other_label_matches)
+        self.assertIn(function_ids[2], self._searchFunctionIds("qz_"))
+
+    def testTheMatchesOfAtMostSoManyTermsAreKept(self):
+        self._storageWithLabelledFunctions()
+        with patch.object(MongoDbStorage, "_OTHER_LABEL_MATCHES_MAX", 2):
+            self.assertEqual(["qa", "qb", "qc"], self._otherLabelMatchings("qa", "qb", "qc")[0])
+            self.assertEqual(2, len(self.storage._other_label_matches))
+            # the least recently used goes first: qa returning drops qb, which drops qa as qc was used
+            # since, and qd drops qc
+            self.assertEqual(["qa", "qb", "qd"], self._otherLabelMatchings("qa", "qc", "qb", "qd", "qb")[0])
+            self.assertEqual(["qd", "qb"], list(self.storage._other_label_matches))
+
+    def testStartupDerivesOtherLabelsOfAnUpgradedDatabase(self):
+        function_ids = self._storageWithLabelledFunctions()
+        self._undoOtherLabels()
+        # until then, a plain term finds a function by its name alone
+        self.assertEqual([], self._searchFunctionIds("qz_label_only"))
+        with patch.object(MongoDbStorage, "_OTHER_LABELS_STARTUP_MAX", 1):
+            self._createSecondStorage()._getDb()
+        # too many labelled functions for a startup: left to the migration
+        self.assertFalse(self.storage.isOtherLabelsComplete())
+        self.assertEqual([], self._otherLabelsOf(function_ids[0]))
+        # that verdict stands for a while; once it is over, the next start fills the field
+        with patch.object(MongoDbStorage, "_OVER_CAP_TTL", 0):
+            self._createSecondStorage()._getDb()
+        self.assertTrue(self.storage.isOtherLabelsComplete())
+        self.assertEqual(["qz_label_only"], self._otherLabelsOf(function_ids[0]))
+        self.assertEqual([function_ids[0]], self._searchFunctionIds("qz_label_only"))
+        # a database without functions is complete from the start
+        self.storage.clearStorage()
+        self.assertTrue(self.storage.isOtherLabelsComplete())
+
+    def testAFailedStartupFillLeavesTheRestOfTheSetup(self):
+        self._storageWithLabelledFunctions()
+        self._undoOtherLabels()
+        db = self.storage._getDb()
+        # an index the setup creates after the place the fill had
+        db.logs.drop_index("username_1")
+        update_many = Collection.update_many
+        fills = []
+
+        def failing(collection, filter, update, *args, **kwargs):
+            if isinstance(update, list):
+                fills.append(filter)
+                raise WriteError("BSONObj size: 16793600 is invalid", 10334)
+            return update_many(collection, filter, update, *args, **kwargs)
+
+        # the logger patched rather than assertLogs, as this module disables logging
+        with patch.object(Collection, "update_many", failing), patch.object(mongo_db_storage_module, "LOGGER") as logger:
+            other = self._createSecondStorage()
+            other._getDb()
+            # nor does a job SpawningWorker starts, a process of its own, try again for a while
+            MongoDbStorage._other_labels_due_since.clear()
+            self._createSecondStorage()._getDb()
+        self.assertEqual(1, len(fills))
+        self.assertEqual(1, logger.error.call_count)
+        self.assertIn("migrate_other_labels --mode apply", logger.error.call_args.args[0])
+        self.assertIsNotNone(other.getFamily(0))
+        self.assertIn("username_1", db.logs.index_information())
+        self.assertFalse(self.storage.isOtherLabelsComplete())
+        # left for a later start
+        with patch.object(MongoDbStorage, "_OVER_CAP_TTL", 0):
+            self._createSecondStorage()._getDb()
+        self.assertTrue(self.storage.isOtherLabelsComplete())
+
+    def testAMigrationDueIsCountedAndSaidOnceAWhile(self):
+        self._storageWithLabelledFunctions()
+        self._undoOtherLabels()
+        labelled = {"function_labels.function_label": {"$exists": True}}
+        with patch.object(MongoDbStorage, "_OTHER_LABELS_STARTUP_MAX", 1), patch.dict(MongoDbStorage._other_labels_due_since, clear=True):
+            with patch.object(Collection, "count_documents", autospec=True, side_effect=Collection.count_documents) as counts:
+                with patch.object(mongo_db_storage_module, "LOGGER") as logger:
+                    for _ in range(3):
+                        self._createSecondStorage()._getDb()
+                    # a job SpawningWorker starts: a process of its own, which the settings tell
+                    MongoDbStorage._other_labels_due_since.clear()
+                    self._createSecondStorage()._getDb()
+            self.assertEqual(1, [call.args[1] for call in counts.call_args_list].count(labelled))
+            self.assertEqual(1, sum("migrate_other_labels" in call.args[0] for call in logger.warning.call_args_list))
+        self.assertFalse(self.storage.isOtherLabelsComplete())
+
+    def testMigrationPassesOverAFunctionItCannotUpdate(self):
+        from mcrit.migrations import migrate_other_labels
+
+        function_ids = self._storageWithLabelledFunctions()
+        for function_id, names in ((function_ids[2], ("qz_two_a", "qz_two_b")), (function_ids[3], ("qz_three_a", "qz_three_b"))):
+            for name in names:
+                self.storage.modifyFunction(function_id, {"function_name": name}, username="alice")
+        db = self.storage._getDb()
+        self._undoOtherLabels()
+        bulk_write = Collection.bulk_write
+
+        def too_large(collection, requests, *args, **kwargs):
+            # the write MongoDB refuses for a document that would grow past 16 MiB
+            ids = [request._filter["function_id"] for request in requests]
+            if function_ids[2] not in ids:
+                return bulk_write(collection, requests, *args, **kwargs)
+            index = ids.index(function_ids[2])
+            if len(requests) > 1:
+                bulk_write(collection, requests[:index] + requests[index + 1 :], *args, **kwargs)
+            raise BulkWriteError({"writeErrors": [{"index": index, "code": 10334, "errmsg": "BSONObj size: 16793600 is invalid"}]})
+
+        server, port = getTestMongoServerAndPort()
+        arguments = ["--mode", "apply", "--host", server, "--port", str(port), "--db", db.name]
+        with patch.object(Collection, "bulk_write", too_large):
+            first = migrate_other_labels.migrate(db, "apply", batch_size=2)
+            self.assertEqual((4, 2, False, 1, [function_ids[2]]), (first["examined"], first["changed"], first["complete"], first["failed"], first["failed_function_ids"]))
+            self.assertEqual(["qz_three_a"], self._otherLabelsOf(function_ids[3]))
+            self.assertFalse(self.storage.isOtherLabelsComplete())
+            # a re-run gets past it as well, and exits 1
+            self.assertNotIn(migrate_other_labels.STATE_COLLECTION, db.list_collection_names())
+            self.assertEqual(1, migrate_other_labels.main(arguments))
+        self.assertEqual(0, migrate_other_labels.main(arguments))
+        self.assertTrue(self.storage.isOtherLabelsComplete())
+        self.assertEqual(["qz_two_a"], self._otherLabelsOf(function_ids[2]))
+
+    def testMigrationMeetingWriteConcernErrorsIsNotComplete(self):
+        from mcrit.migrations import migrate_other_labels
+
+        self._storageWithLabelledFunctions()
+        db = self.storage._getDb()
+        self._undoOtherLabels()
+        bulk_write = Collection.bulk_write
+
+        def not_replicated(collection, requests, *args, **kwargs):
+            bulk_write(collection, requests, *args, **kwargs)
+            raise BulkWriteError({"writeErrors": [], "writeConcernErrors": [{"code": 64, "errmsg": "waiting for replication timed out"}]})
+
+        with patch.object(Collection, "bulk_write", not_replicated):
+            result = migrate_other_labels.migrate(db, "apply")
+        self.assertEqual((False, 0, 1), (result["complete"], result["failed"], result["write_concern_errors"]))
+        self.assertFalse(self.storage.isOtherLabelsComplete())
+
+    def testMigrateOtherLabels(self):
+        from mcrit.migrations import migrate_other_labels
+
+        function_ids = self._storageWithLabelledFunctions()
+        for function_id, names in ((function_ids[2], ("qz_two_a", "qz_two_b")), (function_ids[3], ("qz_three_a", "qz_three_b"))):
+            for name in names:
+                self.storage.modifyFunction(function_id, {"function_name": name}, username="alice")
+        expected = {function_ids[0]: ["qz_label_only"], function_ids[2]: ["qz_two_a"], function_ids[3]: ["qz_three_a"]}
+        db = self.storage._getDb()
+        self._undoOtherLabels()
+        # a stray field on a function without labels is reported, and left alone
+        db.functions.update_one({"function_id": function_ids[4]}, {"$set": {OTHER_LABELS_FIELD: ["stray"]}})
+        verified = migrate_other_labels.verify(db, batch_size=2)
+        self.assertEqual((4, 3, 1, False), (verified["examined"], verified["differing"], verified["stray"], verified["complete"]))
+        self.assertEqual(4, len(verified["problems"]))
+        db.functions.update_one({"function_id": function_ids[4]}, {"$unset": {OTHER_LABELS_FIELD: ""}})
+        # a dry run counts and writes nothing
+        dry_run = migrate_other_labels.migrate(db, "dry-run", batch_size=2)
+        self.assertEqual((4, 3, False), (dry_run["examined"], dry_run["changed"], dry_run["complete"]))
+        self.assertEqual(0, db.functions.count_documents({OTHER_LABELS_FIELD: {"$exists": True}}))
+        self.assertNotIn(migrate_other_labels.STATE_COLLECTION, db.list_collection_names())
+        # stopped after the first batch, it resumes where it stopped
+        partial = migrate_other_labels.migrate(db, "apply", batch_size=2, limit=1)
+        # (the labelled functions in id order: the renamed one, the one labelled by its name only, ...)
+        self.assertEqual((2, 1, False), (partial["examined"], partial["changed"], partial["complete"]))
+        self.assertEqual({function_ids[0]: ["qz_label_only"]}, {i: self._otherLabelsOf(i) for i in expected if self._otherLabelsOf(i)})
+        self.assertFalse(self.storage.isOtherLabelsComplete())
+        self.assertEqual(function_ids[1], db[migrate_other_labels.STATE_COLLECTION].find_one({})["last_function_id"])
+        version = self.storage._otherLabelsVersion()
+        resumed = migrate_other_labels.migrate(db, "apply", batch_size=2)
+        self.assertGreater(self.storage._otherLabelsVersion(), version)
+        self.assertEqual((2, 2, True), (resumed["examined"], resumed["changed"], resumed["complete"]))
+        self.assertEqual(expected, {i: self._otherLabelsOf(i) for i in expected})
+        self.assertTrue(self.storage.isOtherLabelsComplete())
+        self.assertNotIn(migrate_other_labels.STATE_COLLECTION, db.list_collection_names())
+        self.assertEqual([function_ids[3]], self._searchFunctionIds("qz_three_a"))
+        # verified clean, through the command line as well
+        self.assertEqual([], migrate_other_labels.verify(db)["problems"])
+        server, port = getTestMongoServerAndPort()
+        arguments = ["--host", server, "--port", str(port), "--db", db.name]
+        self.assertEqual(0, migrate_other_labels.main(["--mode", "verify", *arguments]))
+        # a re-run repairs what a write that did not keep the field (an older MCRIT's) left behind
+        db.functions.update_one({"function_id": function_ids[0]}, {"$unset": {OTHER_LABELS_FIELD: ""}})
+        self.assertEqual(1, migrate_other_labels.main(["--mode", "verify", *arguments]))
+        rerun = migrate_other_labels.migrate(db, "apply")
+        self.assertEqual((4, 1, True), (rerun["examined"], rerun["changed"], rerun["complete"]))
+        self.assertEqual(["qz_label_only"], self._otherLabelsOf(function_ids[0]))
+        # progress left behind by a run stopped early goes with the functions it was for
+        migrate_other_labels.migrate(db, "apply", batch_size=1, limit=1)
+        self.assertIn(migrate_other_labels.STATE_COLLECTION, db.list_collection_names())
+        self.storage.clearStorage()
+        self.assertNotIn(migrate_other_labels.STATE_COLLECTION, db.list_collection_names())
+
+    def _labelSearchPaths(self, term):
+        # the regex alone, as the probe asks it, and the search through the listed labels
+        with patch.object(self.storage, "_list_known_values", return_value={}):
+            as_regex = self._searchFunctionIds(term)
+        with patch.object(self.storage, "_probeFunctionSearch", return_value=None):
+            listed = self._searchFunctionIds(term)
+        return [as_regex, listed]
+
+    def testNegatedLabelTermKeepsMongoDBsCaseFolding(self):
+        # Python's re finds "i" in "abc_İ", MongoDB's regex does not: a negated label term stays the
+        # regex, so the listing excludes what the probe excludes
+        function_ids = self._storageWithLabelledFunctions()
+        self.storage.modifyFunction(function_ids[2], {"function_name": "abc_İ"}, username="alice")
+        self.storage.modifyFunction(function_ids[3], {"function_name": "abc_plain"}, username="alice")
+        field = "function_labels.function_label"
+        functions = self.storage._getDb().functions
+        in_mongodb = sorted(
+            document["function_id"] for document in functions.find({"$and": [{field: re.compile("abc", re.IGNORECASE)}, {field: {"$not": re.compile("i", re.IGNORECASE)}}]})
+        )
+        self.assertEqual([function_ids[2]], in_mongodb)
+        for term in (f"{field}:?abc {field}:!?i", f"{field}:?abc NOT {field}:?i"):
+            for found in self._labelSearchPaths(term):
+                with self.subTest(term=term):
+                    self.assertEqual(in_mongodb, found)
+
+    def testTooManyTermsForTheLabelsSkipTheListing(self):
+        # testing every term against every label would cost more than the regex: the search is the
+        # regex, and the next one does not list the labels again just to find that out
+        function_ids = self._storageWithLabelledFunctions()
+        field = "function_labels.function_label"
+        functions = self.storage._getDb().functions
+        labels = functions.distinct(field)
+        two_terms = f"{field}:?qz_ OR {field}:?renamed"
+        for fillers, term, listings in ((300_000, two_terms, 1), (500_001, f"{field}:?qz_", 1), (300_000, f"{field}:?qz_", 2)):
+            with self.subTest(fillers=fillers, term=term):
+                self.storage._distinct_count_since.clear()
+                many = labels + ["filler_%06d" % i for i in range(fillers)]
+                with (
+                    patch.object(type(functions), "distinct", autospec=True, return_value=many) as listing,
+                    patch.object(self.storage, "_probeFunctionSearch", return_value=None),
+                ):
+                    for _ in range(2):
+                        self.assertEqual(function_ids[:2], self._searchFunctionIds(term))
+                self.assertEqual(listings, listing.call_count)
+        self.storage._distinct_count_since.clear()
+
+    def testAListingTooSlowForTheLimitLeavesTheQueryHalfOfIt(self):
+        # On a simulated clock: a 300 ms limit, a probe that runs out after its 50 ms and a distinct
+        # that takes as long as MongoDB lets it. The listing gets half of the 250 ms left, the regex
+        # the other half, and the next search does not list the labels again.
+        function_ids = self._storageWithLabelledFunctions()
+        field = "function_labels.function_label"
+        functions = self.storage._getDb().functions
+        self.storage._over_cap_since.clear()
+        clock = [1000.0]
+
+        def probe_runs_out(*args, **kwargs):
+            clock[0] += MongoDbStorage._LABEL_PROBE_TIME_MS / 1000
+            return None
+
+        def waits_out_its_limit(collection, *args, **kwargs):
+            clock[0] += kwargs["maxTimeMS"] / 1000
+            raise ExecutionTimeout("operation exceeded time limit")
+
+        real_find = type(functions).find
+        query_ms = []
+
+        def find(collection, *args, **kwargs):
+            query_ms.append(kwargs["max_time_ms"])
+            return real_find(collection, *args, **kwargs)
+
+        with (
+            patch.object(self.storage._storage_config, "STORAGE_MONGODB_SEARCH_MAX_TIME_MS", 300),
+            patch.object(mongo_db_storage_module, "time", types.SimpleNamespace(monotonic=lambda: clock[0])),
+            patch.object(self.storage, "_probeFunctionSearch", side_effect=probe_runs_out),
+            patch.object(type(functions), "distinct", autospec=True, side_effect=waits_out_its_limit) as listing,
+            patch.object(type(functions), "find", autospec=True, side_effect=find),
+        ):
+            self.assertEqual(function_ids[:2], self._searchFunctionIds(f"{field}:?qz_"))
+            self.assertEqual([125], [call.kwargs["maxTimeMS"] for call in listing.call_args_list])
+            self.assertEqual([125], query_ms)
+            self.assertEqual(function_ids[:2], self._searchFunctionIds(f"{field}:?qz_"))
+            self.assertEqual(1, listing.call_count)
+        self.storage._over_cap_since.clear()
+
+    def testLabelProbeHasAFixedLimit(self):
+        self._storageWithLabelledFunctions()
+        functions = self.storage._getDb().functions
+        query = self._labelQuery("function_labels.function_label:?qz_")
+        sort_list = [("function_id", 1)]
+        self.storage._over_cap_since.clear()
+        with patch.object(type(functions), "find", autospec=True, side_effect=type(functions).find) as finding:
+            self.assertIsNotNone(self.storage._probeFunctionSearch(query, sort_list, 10, 30000))
+            self.assertEqual(MongoDbStorage._LABEL_PROBE_TIME_MS, finding.call_args.kwargs["max_time_ms"])
+            self.assertEqual([("function_id", 1)], finding.call_args.kwargs["hint"])
+            # no room under the search's own limit
+            self.assertIsNone(self.storage._probeFunctionSearch(query, sort_list, 10, MongoDbStorage._LABEL_PROBE_TIME_MS))
+            # over the cap the search is the regex anyway: nothing to probe for
+            self.storage._over_cap_since[("functions", "function_labels.function_label")] = time.monotonic()
+            self.assertIsNone(self.storage._probeFunctionSearch(query, sort_list, 10, 30000))
+            self.assertEqual(1, finding.call_count)
+        self.storage._over_cap_since.clear()
+
+    def testLabelsAreListedOncePerSearch(self):
+        function_ids = self._storageWithLabelledFunctions()
+        functions = self.storage._getDb().functions
+        term = " OR ".join(["function_labels.function_label:?qz_", "function_labels.function_label:?renamed", "function_labels.function_label:?qz_"])
+        with (
+            patch.object(type(functions), "distinct", autospec=True, side_effect=type(functions).distinct) as listing,
+            patch.object(self.storage, "_probeFunctionSearch", return_value=None),
+        ):
+            self.assertEqual(function_ids[:2], self._searchFunctionIds(term))
+        self.assertEqual(1, listing.call_count)
+
+    def testTheValueListsOfOneQueryShareItsByteBudget(self):
+        # hundreds of terms that each fit an $in would add up past MongoDB's 16 MiB: what one query
+        # lists stays within _DISTINCT_VALUES_MAX_BYTES, and a repeated condition is transpiled once
+        function_ids = self._storageWithLabelledFunctions()
+        field = "function_labels.function_label"
+        original_cap = MongoDbStorage._DISTINCT_VALUES_MAX_BYTES
+        try:
+            # "qz_both" and "qz_label_only" fill it
+            MongoDbStorage._DISTINCT_VALUES_MAX_BYTES = 20
+            term = " OR ".join([f"{field}:?qz_", f"{field}:?qz_", f"{field}:?both"])
+            query = self._labelQuery(term)
+            self.assertEqual(2, len(query["$or"]))
+            self.assertEqual(["qz_both", "qz_label_only"], sorted(query["$or"][0][field]["$in"]))
+            self.assertTrue(hasattr(query["$or"][1][field], "search"))
+            # a search does not mix them: an $or of listed and unlisted terms would scan the label
+            # index once per regex, so it is the regex throughout
+            functions = self.storage._getDb().functions
+            with (
+                patch.object(type(functions), "find", autospec=True, side_effect=type(functions).find) as finding,
+                patch.object(self.storage, "_probeFunctionSearch", return_value=None),
+            ):
+                self.assertEqual(function_ids[:2], self._searchFunctionIds(term))
+            self.assertNotIn("$in", str(finding.call_args.args[1]))
+            # the names as well
+            MongoDbStorage._DISTINCT_VALUES_MAX_BYTES = len("qz_both")
+            tree = self.storage._resolve_search_tree(["function_name"], SearchQueryParser().parse("qz_b OR qz_bo"), None)
+            names = MongoSearchTranspiler({"function_name": ["qz_both", "other"]}).visit(tree)
+            self.assertEqual(["qz_both"], names["$or"][0]["function_name"]["$in"])
+            self.assertTrue(hasattr(names["$or"][1]["function_name"], "search"))
+        finally:
+            MongoDbStorage._DISTINCT_VALUES_MAX_BYTES = original_cap
+
+    def testLabelListingKeepsMongoDBsCaseFolding(self):
+        # Python's re folds the dotted capital I to "i", MongoDB's regex does not; the listed labels
+        # are a superset the $regex beside them narrows to exactly what the probe finds
+        function_ids = self._storageWithLabelledFunctions()
+        for function_id, label in zip(function_ids[2:], ["İstanbul", "Kelvin", "ıtem", "straße"]):
+            self.storage.modifyFunction(function_id, {"function_name": label}, username="alice")
+        functions = self.storage._getDb().functions
+        field = "function_labels.function_label"
+        for term in ("i", "I", "İ", "ı", "k", "K", "ss", "ß", "stanbul"):
+            with self.subTest(term=term):
+                in_mongodb = sorted(document["function_id"] for document in functions.find({field: re.compile(re.escape(term), re.IGNORECASE)}))
+                self.assertEqual(in_mongodb, self._searchFunctionIds(f"{field}:?{term}"))
+                with patch.object(self.storage, "_probeFunctionSearch", return_value=None):
+                    self.assertEqual(in_mongodb, self._searchFunctionIds(f"{field}:?{term}"))
+        query = self._labelQuery(f"{field}:?i")
+        self.assertIn("İstanbul", query[field]["$in"])
+        plan = str(functions.find(query, sort=[("function_id", 1)], limit=101).explain()["queryPlanner"]["winningPlan"])
+        self.assertIn("IXSCAN", plan)
+        self.assertIn("function_labels.function_label_1", plan)
+
+    def testFunctionSearchLeavesAnInlineXcfgOnTheServer(self):
+        # a corpus migrate_xcfg_split has not run on still carries the disassembly in the function
+        # document; a search answers as on a migrated one, without it
+        function_ids = self._storageWithLabelledFunctions()
+        functions = self.storage._getDb().functions
+        functions.update_one({"function_id": function_ids[0]}, {"$set": {"_xcfg": json.dumps({"blocks": {"0": [[0, 1, "nop", ""]] * 1000}})}})
+        found = self.storage.findFunctionByString(SearchQueryParser().parse("plain_renamed"), cursor=FullSearchCursor(None, [("function_id", True)]))
+        self.assertEqual([function_ids[0]], list(found))
+        self.assertIsNone(found[function_ids[0]].xcfg)
+        migrated = self.storage.findFunctionByString(SearchQueryParser().parse("qz_both"), cursor=FullSearchCursor(None, [("function_id", True)]))
+        self.assertIsNone(migrated[function_ids[1]].xcfg)
+
+    def testLabelsAreListedPastTheCountCap(self):
+        # a regex on the multikey label index fetches every labelled function, so the labels are listed
+        # however many there are; only the matching ones have to fit the $in
+        function_ids = self._storageWithLabelledFunctions()
+        original_cap = MongoDbStorage._DISTINCT_VALUES_CAP
+        try:
+            MongoDbStorage._DISTINCT_VALUES_CAP = 1
+            self.assertIsNone(self.storage._getDistinctValues("functions", "function_name"))
+            labels = self.storage._getDistinctValues("functions", "function_labels.function_label")
+            assert labels is not None
+            self.assertEqual(["plain_renamed", "qz_both", "qz_label_only"], sorted(label for label in labels if isinstance(label, str)))
+            self.assertEqual(function_ids[:2], self._searchFunctionIds("function_labels.function_label:?qz_"))
+        finally:
+            MongoDbStorage._DISTINCT_VALUES_CAP = original_cap
+
+    def testMatchingLabelsPastTheByteCapFallBackToTheRegex(self):
+        function_ids = self._storageWithLabelledFunctions()
+        original_cap = MongoDbStorage._DISTINCT_VALUES_MAX_BYTES
+        try:
+            # "qz_both" fits, "qz_both" and "qz_label_only" together do not
+            MongoDbStorage._DISTINCT_VALUES_MAX_BYTES = 10
+            query = self._labelQuery("function_labels.function_label:?qz_")
+            self.assertTrue(hasattr(query["function_labels.function_label"], "search"))
+            query = self._labelQuery("function_labels.function_label:?qz_b")
+            self.assertEqual(["qz_both"], query["function_labels.function_label"]["$in"])
+            # same answers either way
+            self.assertEqual(function_ids[:2], self._searchFunctionIds("function_labels.function_label:?qz_"))
+            self.assertEqual([function_ids[1]], self._searchFunctionIds("function_labels.function_label:?qz_b"))
+            self.assertNotIn(function_ids[0], self._searchFunctionIds("function_labels.function_label:!?qz_"))
+        finally:
+            MongoDbStorage._DISTINCT_VALUES_MAX_BYTES = original_cap
+
+    def testLabelsPastWhatDistinctAnswersFallBackToTheRegex(self):
+        function_ids = self._storageWithLabelledFunctions()
+        functions = self.storage._getDb().functions
+
+        def too_big(*args, **kwargs):
+            raise OperationFailure("Executor error during distinct command :: caused by :: distinct too big, 16mb cap", code=17217)
+
+        with patch.object(type(functions), "distinct", autospec=True, side_effect=too_big) as listing:
+            query = self._labelQuery("function_labels.function_label:?qz_")
+            self.assertTrue(hasattr(query["function_labels.function_label"], "search"))
+            self.assertEqual(function_ids[:2], self._searchFunctionIds("function_labels.function_label:?qz_"))
+            self.assertEqual([function_ids[0]], self._searchFunctionIds("function_labels.function_label:?label_only"))
+            # remembered like any other verdict over the cap
             self.assertEqual(1, listing.call_count)
 
     def testCounterInitIsIdempotent(self):
@@ -1668,6 +3084,57 @@ class MongoDbStorageTest(MemoryStorageTest):
         rebuild_result = self.storage.rebuildMinhashBandIndex()
         self.assertEqual(len(minhashes), rebuild_result["minhash_functions_indexed"])
         self.assertEqual(bands_before, dumpBands())
+
+    def testAddingMinHashesLooksUpTheirFunctionsInSlices(self):
+        # one $in over every function id of a large import exceeds MongoDB's 16 MB document limit
+        self.storage.addSmdaReport(SmdaReport.fromFile(self.example_file_path))
+        stored_ids = [0, 2, 3, 5, 7]
+        # one id no function carries, between slices, is skipped as before
+        minhashes = [MinHash(function_id=function_id, minhash_signature=[function_id] * 10, minhash_bits=8) for function_id in stored_ids[:3] + [10**6] + stored_ids[3:]]
+        distinct = Collection.distinct
+        looked_up = []
+
+        def recording(collection, key, query, *args, **kwargs):
+            if collection.name == "functions" and key == "function_id":
+                looked_up.append(list(query["function_id"]["$in"]))
+            return distinct(collection, key, query, *args, **kwargs)
+
+        with patch.object(MongoDbStorage, "_MINHASH_UPDATE_BATCH", 2), patch.object(Collection, "distinct", autospec=True, side_effect=recording):
+            self.storage.addMinHashes(minhashes)
+        self.assertEqual([[0, 2], [3, 10**6], [5, 7]], looked_up)
+        database = self.storage._getDb()
+        with_minhash = sorted(document["function_id"] for document in database.functions.find({"minhash": {"$type": "binData"}}, {"_id": 0, "function_id": 1}))
+        self.assertEqual(stored_ids, with_minhash)
+
+    def testAddingMinHashesInSlicesWritesWhatOneBatchWrites(self):
+        # addMinHashes bands one band at a time and writes its updates in slices, so that banding an
+        # import does not hold every band's postings at once; posting order and df come out the same
+        def addAndDump(batch_size):
+            self.storage.clearStorage()
+            self.storage.addSmdaReport(SmdaReport.fromFile(self.example_file_path))
+            # functions 2 and 3 share their signature, and with it every band hash
+            signatures = {0: [1] * 10, 2: [7] * 10, 3: [7] * 10, 5: list(range(10)), 7: [7] * 9 + [8], 8: [0x30] * 10}
+            minhashes = [MinHash(function_id=function_id, minhash_signature=signature, minhash_bits=8) for function_id, signature in signatures.items()]
+            with patch.object(MongoDbStorage, "_MINHASH_UPDATE_BATCH", batch_size):
+                self.storage.addMinHashes(minhashes)
+            database = self.storage._getDb()
+            bands = {
+                band_id: sorted((document["band_hash"], document["function_ids"], document["df"]) for document in database["band_%d" % band_id].find({}, {"_id": 0}))
+                for band_id in range(self._storage_config.STORAGE_NUM_BANDS)
+            }
+            functions = sorted((document["function_id"], document["minhash"]) for document in database.functions.find({}, {"_id": 0, "function_id": 1, "minhash": 1}))
+            return bands, functions
+
+        whole = addAndDump(10000)
+        self.assertTrue(all(any(function_ids[:2] == [2, 3] for _, function_ids, _ in band) for band in whole[0].values()))
+        self.assertEqual(whole, addAndDump(1))
+
+    def testRebuildMinhashBandIndexLeavesOutAFunctionWithoutMinhashField(self):
+        """a function document without the field (an upsert racing a deletion) has nothing to band"""
+        self._storageWithBandedSample()
+        self.storage._getDb().functions.update_one({"function_id": 1}, {"$unset": {"minhash": ""}})
+        rebuild_result = self.storage.rebuildMinhashBandIndex()
+        self.assertEqual(6, rebuild_result["minhash_functions_indexed"])
 
     def _storageWithBandedSample(self):
         self.storage.clearStorage()

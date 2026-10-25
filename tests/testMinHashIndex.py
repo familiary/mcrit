@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from smda.common.SmdaReport import SmdaReport
 
-from mcrit.index.MinHashIndex import MinHashIndex
+from mcrit.index.MinHashIndex import ImportRejected, MinHashIndex
 from mcrit.index.SearchQueryParser import SearchQueryParser
 from mcrit.libs.utility import generate_unique_pairs
 from mcrit.minhash.EscaperFingerprint import getEscaperFingerprint, getEscaperFingerprints
@@ -264,6 +264,78 @@ class UniqueBlocksCoverTestSuite(unittest.TestCase):
         self.assertEqual(0, result["statistics"]["yara_covers"])
         self.assertFalse(result["statistics"]["has_yara_rule"])
 
+    def testUnreachableCoverLooksAtEveryBlockOnlyOnce(self):
+        # a covers_required beyond what the blocks reach selects every block, and the cover used to
+        # rescan and resort all of them for each one it selected - cubic in their number, so one GET
+        # with covers_required=1000000000 held a worker for about an hour on a sample of 10,000 blocks
+        index = MinHashIndex(config)
+        worker = index.queue._worker
+        report = SmdaReport.fromFile(EXAMPLE_REPORT)
+        assert report is not None
+        sample_entry = index._storage.addSmdaReport(report)
+        assert sample_entry is not None
+        reads = []
+
+        class CountingEntry(dict):
+            def __getitem__(self, key):
+                if key == "samples":
+                    reads.append(key)
+                return super().__getitem__(key)
+
+        find_blocks = index._storage.getUniqueBlocks
+
+        def counted_blocks(*args, **kwargs):
+            blocks_result = find_blocks(*args, **kwargs)
+            blocks_result["unique_blocks"] = {block_hash: CountingEntry(entry) for block_hash, entry in blocks_result["unique_blocks"].items()}
+            return blocks_result
+
+        with patch.object(index._storage, "getUniqueBlocks", side_effect=counted_blocks):
+            result = worker.getUniqueBlocks([sample_entry.sample_id], covers_required=1000000000)
+        num_blocks = len(result["unique_blocks"])
+        self.assertGreater(num_blocks, 100)
+        self.assertEqual(sorted(result["unique_blocks"]), sorted(result["yara_rule"]))
+        self.assertEqual(num_blocks, len(set(result["yara_rule"])))
+        statistics = result["statistics"]
+        self.assertTrue(statistics["has_yara_rule"])
+        self.assertFalse(statistics["has_complete_yara_rule"])
+        self.assertEqual(0, statistics["num_samples_covered"])
+        self.assertEqual(num_blocks, statistics["yara_covers"])
+        # a block's samples are read when it joins the candidates and when it is taken - not once per round
+        self.assertLessEqual(len(reads), 2 * num_blocks)
+
+    def testCoverPrefersReachThenScoreThenTheLowerBlockHash(self):
+        index = MinHashIndex(config)
+        worker = index.queue._worker
+        report = SmdaReport.fromFile(EXAMPLE_REPORT)
+        assert report is not None
+        sample_entry = index._storage.addSmdaReport(report)
+        assert sample_entry is not None
+
+        def block(samples, score):
+            instructions = [[sample_entry.base_addr, "90", "nop", ""]]
+            return {"samples": samples, "score": score, "length": 1, "instructions": instructions, "sample_id": samples[0]}
+
+        def cover(covers_required):
+            # "0xb" and "0xc" reach two samples each at the same score and with as many fixed hex digits,
+            # so the lower picblockhash, "0xb", goes first (#283; the later block before that)
+            blocks = {"0xa": block([1], 90.0), "0xb": block([1, 2], 10.0), "0xc": block([2, 3], 10.0), "0xd": block([3], 50.0)}
+            found = {"statistics": {}, "unique_blocks": blocks}
+            with patch.object(index._storage, "getUniqueBlocks", return_value=found), patch.object(index._storage, "getSampleById", return_value=sample_entry):
+                return worker.getUniqueBlocks([1, 2, 3], covers_required=covers_required)
+
+        once = cover(1)
+        # "0xb" leaves sample 3 uncovered, which "0xc" and "0xd" both reach - "0xd" with the higher score
+        self.assertEqual(["0xb", "0xd"], once["yara_rule"])
+        self.assertTrue(once["statistics"]["has_complete_yara_rule"])
+        twice = cover(2)
+        self.assertEqual(["0xb", "0xc", "0xa", "0xd"], twice["yara_rule"])
+        self.assertTrue(twice["statistics"]["has_complete_yara_rule"])
+        self.assertEqual(2, twice["statistics"]["yara_covers"])
+        thrice = cover(3)
+        self.assertEqual(["0xb", "0xc", "0xa", "0xd"], thrice["yara_rule"])
+        self.assertFalse(thrice["statistics"]["has_complete_yara_rule"])
+        self.assertTrue(thrice["statistics"]["has_yara_rule"])
+
 
 class EscaperProvenanceTestSuite(unittest.TestCase):
     """MinHashes are derived from smda's escaped instructions, so an export has to say which
@@ -330,6 +402,25 @@ class EscaperProvenanceTestSuite(unittest.TestCase):
         index = MinHashIndex(config)
         report = index.addImportData(self._minimalExport(index))
         self.assertFalse(report["escaper_mismatch"])
+
+    def testImportVersionIsComparedByPep440Ordering(self):
+        index = MinHashIndex(config)
+        # the floor is 0.0.0: a prerelease of it is older, and 0.0.10 is newer although "0.0.10" < "0.0.9" as strings
+        for version in ("0.0.0rc1", "0.0.0"):
+            with self.assertRaises(ImportRejected):
+                index.addImportData(self._minimalExport(index, version=version))
+        for version in ("0.0.10", "0.0.9"):
+            self.assertIsNotNone(index.addImportData(self._minimalExport(index, version=version)))
+
+    def testImportWithoutParsableVersionIsRefused(self):
+        index = MinHashIndex(config)
+        for version in ("invalid", "", None, 1):
+            with self.assertRaises(ValueError):
+                index.addImportData(self._minimalExport(index, version=version))
+        export_data = self._minimalExport(index)
+        del export_data["config"]["version"]
+        with self.assertRaises(ValueError):
+            index.addImportData(export_data)
 
     def testImportOfDifferingEscaperIsFlaggedButAccepted(self):
         index = MinHashIndex(config)

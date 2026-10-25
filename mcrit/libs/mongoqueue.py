@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import gridfs
 import pymongo
+import pymongo.errors
 from bson.errors import InvalidId
 from bson.objectid import ObjectId
 from bson.regex import Regex
@@ -68,6 +69,9 @@ def _heartbeatFields(consumer_id: str) -> Dict[str, datetime]:
 class MongoQueue:
     """A queue class"""
 
+    # most jobs one clean() deletes, at one round trip each
+    CLEAN_MAX_JOBS = 1000
+
     def __init__(self, queue_config, consumer_id, timeout=300, max_attempts=3):
         """ """
         self.queue_config = queue_config
@@ -81,9 +85,11 @@ class MongoQueue:
         self._default_insert["attempts_left"] = max_attempts
         self.fs = None
         self.fs_files = None
-        # how old a finished job has to be before clean() deletes it; effectively never, as clean()
-        # would otherwise also drop matching results people still look at (see the TODO there)
-        self.cache_time: float = 10**9
+        # age in seconds after which clean() deletes a finished job of a transient method; 0 deletes
+        # nothing. Both are set by QueueFactory (QUEUE_TRANSIENT_JOB_RETENTION_SECONDS and
+        # mcrit.queue.retention), so that this module stays free of mcrit imports.
+        self.retention_seconds: float = 0
+        self.transient_methods: frozenset = frozenset()
         # overridden by QueueFactory from QUEUE_CLEAN_INTERVAL
         self.clean_interval: float = queue_config.QUEUE_CLEAN_INTERVAL
         # worker liveness (#150): a worker refreshes its heartbeat while polling, and a
@@ -160,6 +166,8 @@ class MongoQueue:
                 ("created_at", pymongo.ASCENDING),
             ]
         )
+        # serves the method filter and the oldest-first range scan of clean()
+        collection.create_index([("payload.method", pymongo.ASCENDING), ("finished_at", pymongo.ASCENDING)])
         self._getFsFiles().create_index("metadata.sha256")
 
     def _identifyJobState(self, doc):
@@ -762,39 +770,38 @@ class MongoQueue:
         self._getFsFiles().find_one_and_update({"_id": file_id}, {"$inc": {"metadata.tmp_lock": -1}, "$addToSet": {"metadata.jobs": job_id}})
 
     def clean(self):
-        # TODO consider a good way to implement this
-        # we probably do not want to drop matches and their results automatically, which would be the case right now
-        time_threshold = datetime.now() - timedelta(seconds=self.cache_time)
-        job_query = {"finished_at": {"$lt": time_threshold}}
-        to_delete = self._getCollection().find(job_query)
-        to_delete = list(to_delete)
-        results = [data["result"] for data in to_delete]
-        file_params = {data["_id"]: list(json.loads(data["payload"]["file_params"]).values()) for data in to_delete}
+        """Delete finished jobs of the transient methods older than retention_seconds, oldest first.
 
-        # delete results
-        for r in results:
-            self._delete_grid(r)
-
-        # remove job from params
-        for job, params in file_params.items():
-            self._getFsFiles().update_many({"_id": {"$in": [ObjectId(p) for p in params]}}, {"$pull": {"metadata.jobs": str(job)}})
-
-        # delete params
-        all_params = [ObjectId(j) for i in file_params.values() for j in i]
-        # for all of the params that can be deleted (with no jobs, and no lock), remove the sha256
-        # In this way the file cannot be utilized as a cached file again
-        self._getFsFiles().update_many(
-            {"_id": {"$in": all_params}, "metadata.jobs": [], "metadata.tmp_lock": 0},
-            {"$set": {"metadata.sha256": None}},
-        )
-        # now get the list of files to be deleted
-        params_to_delete = self._getFsFiles().find({"_id": {"$in": all_params}, "metadata.jobs": [], "metadata.tmp_lock": 0, "metadata.sha256": None})
-        # delete them
-        for p in params_to_delete:
-            self._getFs().delete(ObjectId(p["_id"]))
-
-        # delete jobs
-        self._getCollection().delete_many(job_query)
+        At most CLEAN_MAX_JOBS per call, so that switching retention on for a large backlog does not
+        hold a worker for long; the rest follows on the next interval. Failed jobs never finish and
+        terminated jobs are kept for diagnosis, even where they reached finished_at.
+        """
+        # The worker calls clean() on startup. Reaching the collection here, even where expiry is
+        # off, runs _getCollection()'s lazy setup (client, counters, indices) once, before the
+        # worker's polling thread and the submitting caller can both trigger it: that setup is not
+        # thread-safe.
+        collection = self._getCollection()
+        if self.retention_seconds <= 0:
+            return
+        try:
+            threshold = datetime.now() - timedelta(seconds=self.retention_seconds)
+        except OverflowError:
+            # a retention beyond what a datetime can reach is "never expire"
+            return
+        query = {
+            "finished_at": {"$lt": threshold},
+            "payload.method": {"$in": list(self.transient_methods)},
+            "terminated": {"$ne": True},
+        }
+        try:
+            for data in collection.find(query, {"_id": 1}).sort("finished_at", 1).limit(self.CLEAN_MAX_JOBS):
+                # delete_job removes the document first, then its GridFS result and file parameters.
+                # If interrupted, deleteOrphanedQueueFiles can reclaim files without serving a broken cache hit.
+                self.delete_job(data["_id"])
+        except pymongo.errors.PyMongoError:
+            # only the expiry pass is spared, so that it cannot keep a worker from starting; a setup
+            # that fails in _getCollection() above still does. The next pass picks up what is left.
+            LOGGER.error("Expiring finished jobs failed, deferring to the next cleanup.", exc_info=True)
 
     # a chunk group without its fs.files document can be a file GridFS is still writing: put()
     # stores the chunks first, so only ids older than this are taken as leftovers
@@ -891,10 +898,37 @@ class MongoQueue:
 
     def release_all_jobs(self, consumer_id=None):
         # release all jobs associated with our consumer id if they are started, locked, but not finished.
-        self._getCollection().update_many(
-            filter={"locked_by": consumer_id if consumer_id else self.consumer_id, "started_at": {"$ne": None}, "finished_at": {"$eq": None}},
-            update={"$set": {"locked_by": None, "locked_at": None}, "$inc": {"attempts_left": -1}},
-        )
+        holder = consumer_id if consumer_id else self.consumer_id
+        self._release_stranded_jobs({"locked_by": holder, "started_at": {"$ne": None}, "finished_at": None})
+
+    def _release_stranded_jobs(self, stranded) -> int:
+        """Release the jobs matching the filter and return how many were released.
+
+        Per job, like Job.error(): the attempt that was lost counts, and a job out of
+        attempts fails and releases whatever waits on it instead of being requeued. The
+        queue counters follow the job.
+        """
+        counter_updates = []
+        released = 0
+        for job_id in [job["_id"] for job in self._getCollection().find(stranded, {"_id": 1})]:
+            job = self._getCollection().find_one_and_update(
+                {"_id": job_id, **stranded},
+                {"$set": {"locked_by": None, "locked_at": None}, "$inc": {"attempts_left": -1}},
+                return_document=ReturnDocument.AFTER,
+            )
+            if job is None:
+                continue
+            released += 1
+            method = job["payload"]["method"]
+            counter_updates.append((method, "in_progress", -1))
+            if job["attempts_left"] <= 0:
+                self._notify_dependent_jobs(str(job["_id"]))
+                counter_updates.append((method, "failed", 1))
+            else:
+                counter_updates.append((method, "queued", 1))
+        if released:
+            self.updateQueueCounters(counter_updates)
+        return released
 
     def release_orphaned_jobs(self):
         """Return the jobs held by workers that are not alive to the queue.
@@ -919,29 +953,9 @@ class MongoQueue:
         if not orphan_ids:
             return
         stranded = {"locked_by": {"$in": orphan_ids}, "started_at": {"$ne": None}, "finished_at": None}
-        counter_updates = []
-        released = 0
-        for job_id in [job["_id"] for job in self._getCollection().find(stranded, {"_id": 1})]:
-            # per job, like Job.error(): the attempt that died counts, and a job out of
-            # attempts fails and releases whatever waits on it instead of being requeued
-            job = self._getCollection().find_one_and_update(
-                {"_id": job_id, **stranded},
-                {"$set": {"locked_by": None, "locked_at": None}, "$inc": {"attempts_left": -1}},
-                return_document=ReturnDocument.AFTER,
-            )
-            if job is None:
-                continue
-            released += 1
-            method = job["payload"]["method"]
-            counter_updates.append((method, "in_progress", -1))
-            if job["attempts_left"] <= 0:
-                self._notify_dependent_jobs(str(job["_id"]))
-                counter_updates.append((method, "failed", 1))
-            else:
-                counter_updates.append((method, "queued", 1))
+        released = self._release_stranded_jobs(stranded)
         if released:
             LOGGER.warning("Released %d job(s) held by dead worker(s) %s back to the queue.", released, ", ".join(orphan_ids))
-            self.updateQueueCounters(counter_updates)
 
     def terminate_all_jobs(self):
         pass

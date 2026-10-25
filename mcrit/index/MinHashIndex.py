@@ -5,6 +5,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import Dict, List, Optional
 
+from packaging.version import Version
 from smda.common.SmdaReport import SmdaReport
 from smda.SmdaConfig import SmdaConfig
 
@@ -16,7 +17,8 @@ from mcrit.config.StorageConfig import StorageConfig
 from mcrit.index.MatchingParameters import applyMatchingPreset, resolveMatchingParams
 from mcrit.index.SearchCursor import FullSearchCursor, MinimalSearchCursor, sortSpec
 from mcrit.index.SearchQueryParser import SearchQueryParser
-from mcrit.libs.utility import compress_encode, decompress_decode
+from mcrit.libs.tags import MAX_TAGS_PER_ENTITY, TagLimitError, normalizeTags
+from mcrit.libs.utility import MAX_DECOMPRESSION_RATIO, MIN_IMPORT_DECOMPRESSED_SIZE, compress_encode, compress_encode_fragments, decompress_decode
 from mcrit.matchers.MatcherQueryFunction import MatcherQueryFunction
 from mcrit.minhash.EscaperFingerprint import FINGERPRINT_UNAVAILABLE, getEscaperFingerprint, getEscaperFingerprints
 from mcrit.minhash.MinHash import MinHash
@@ -36,6 +38,14 @@ LOGGER = logging.getLogger(__name__)
 # the smda that this process will escape with; recorded alongside the escaper fingerprint so an
 # export or a status response says which smda produced the minhashes it describes
 SMDA_VERSION = SmdaConfig().VERSION
+# Exports newer than this floor (PEP 440 ordering) are eligible when their shingler and MinHash
+# configuration hashes match. Raise it only with a change that makes older objects incompatible.
+MINIMUM_IMPORT_VERSION = Version("0.0.0")
+
+# A cross compare of n samples makes n child jobs - with sample_group_only each of them reads the
+# n-1 other samples - and n*n matrices in its combine step, and its id list was bounded by nothing
+# but the length of a URL.
+MAX_CROSS_COMPARE_SAMPLES = 1000
 
 
 #### Helper methods for nested sort_by in search
@@ -69,6 +79,57 @@ def _get_field(object, field):
         return _get_field(_get_field_once(object, first_field), remaining_fields)
     else:
         return _get_field_once(object, field)
+
+
+class ImportRejected(ValueError):
+    """An export addImportData refuses before storing anything of it: one of another version or
+    configuration, or one it cannot read. POST /import answers it with 400, while any other error
+    of an import is the server's."""
+
+
+# MongoDB stores an integer as signed 64 bit and fails the insert of a larger one, or of a key that
+# holds a NUL, after part of an import is written, where memory storage keeps them; so an import
+# holds both to that (#300). Hashes and offsets are unsigned 64-bit values, which MongoDB storage
+# writes as hex text and in two's complement respectively.
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+_UINT64_LIMIT = 2**64
+
+
+def _holdsUnstorable(value) -> bool:
+    """Whether value is, or holds in its lists and mappings, an integer beyond signed 64 bit or a key
+    with a NUL in it"""
+    if isinstance(value, int):
+        return not _INT64_MIN <= value <= _INT64_MAX
+    if isinstance(value, dict):
+        return any("\x00" in key or _holdsUnstorable(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_holdsUnstorable(item) for item in value)
+    return False
+
+
+def _isUint64(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < _UINT64_LIMIT
+
+
+def _areStorableBlockHashes(picblockhashes) -> bool:
+    """Whether picblockhashes is a list of mappings that each hold an unsigned 64-bit hash and offset,
+    and nothing else _holdsUnstorable refuses; run per block, so the common case is checked inline"""
+    if not isinstance(picblockhashes, list):
+        return False
+    for block_entry in picblockhashes:
+        if not isinstance(block_entry, dict) or "hash" not in block_entry or "offset" not in block_entry:
+            return False
+        for key, value in block_entry.items():
+            is_unsigned = key == "hash" or key == "offset"
+            if "\x00" in key:
+                return False
+            if type(value) is int:
+                if not (0 <= value < _UINT64_LIMIT if is_unsigned else _INT64_MIN <= value <= _INT64_MAX):
+                    return False
+            elif is_unsigned or _holdsUnstorable(value):
+                return False
+    return True
 
 
 class MinHashIndex(QueueRemoteCaller(Worker)):
@@ -158,6 +219,54 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         storage.setContent(storage_data["storage"])
 
     def getExportData(self, sample_ids=None, compress_data=False):
+        return self._collectExportData(sample_ids, compress_data, serialize=False)
+
+    def getExportJson(self, sample_ids=None, compress_data=False) -> List[bytes]:
+        """json.dumps(getExportData()), in pieces that joined are that text (GET /export sends them as they are).
+
+        Function entries are read from storage one batch at a time and serialised one by one, and every entry's text -
+        sample and function entries, family names and actors - is counted against STORAGE_MAX_EXPORT_SIZE before
+        it is kept. Only that text is kept, so the export holds what the cap counts plus one batch; a compressed export
+        counts a sample's text while it holds it for compression. getExportData() keeps Python objects instead,
+        several times the size the cap counts."""
+        exported_data = self._collectExportData(sample_ids, compress_data, serialize=True)
+        fragments = [b"{"]
+        for position, (key, value) in enumerate(exported_data.items()):
+            fragments.append(b"%s%s: " % (b", " if position else b"", json.dumps(key).encode()))
+            if key not in ("family_actors", "sample_entries", "function_entries"):
+                fragments.append(json.dumps(value).encode())
+                continue
+            # these hold the entries' text fragments already
+            fragments.append(b"{")
+            for entry_position, (entry_key, entry_fragments) in enumerate(value.items()):
+                fragments.extend([b", " if entry_position else b"", json.dumps(str(entry_key)).encode(), b": ", *entry_fragments])
+            fragments.append(b"}")
+        fragments.append(b"}")
+        return fragments
+
+    @staticmethod
+    def _serializeExportFunctions(storage, sample_id, compress_data, count):
+        """A sample's function entries as JSON text fragments, read and serialised one batch at a time, each counted
+        (count) before it is kept. Compressed, the text is counted while it is held and then replaced by the compressed
+        text, which is what stays."""
+        fragments = [b"{"]
+        num_functions = 0
+        for batch in storage.getFunctionsBySampleIdInBatches(sample_id):
+            for function_entry in batch:
+                fragment = b"%s%s: %s" % (b", " if num_functions else b"", json.dumps(str(function_entry.function_id)).encode(), json.dumps(function_entry.toDict()).encode())
+                count(len(fragment))
+                fragments.append(fragment)
+                num_functions += 1
+        fragments.append(b"}")
+        count(2)
+        if compress_data:
+            compressed = json.dumps(compress_encode_fragments(fragments)).encode()
+            count(len(compressed))
+            count(-sum(len(fragment) for fragment in fragments))
+            fragments = [compressed]
+        return fragments, num_functions
+
+    def _collectExportData(self, sample_ids, compress_data, serialize):
         storage = self.getStorage()
         exported_data = {
             "content": {"is_compressed": compress_data, "num_families": 0, "num_samples": 0, "num_functions": 0},
@@ -184,39 +293,200 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         exported_sample_entries = {}
         exported_function_entries = {}
         export_size = 0
+
+        def count(num_bytes):
+            # the JSON text of every entry, checked before the entry is kept; serialize keeps only that text, and
+            # then the count is what the export holds
+            nonlocal export_size
+            export_size += num_bytes
+            if export_size > self._storage_config.STORAGE_MAX_EXPORT_SIZE:
+                raise MemoryError("Export running beyond the allocated maximum, aborting operation.")
+
         # iterate over sample_ids and transform respective data
         for sample_id in storage.getSampleIds():
             if sample_ids and sample_id not in sample_ids:
                 continue
             sample_entry = storage.getSampleById(sample_id)
+            if sample_entry.family_id not in family_mapping:
+                count(len(json.dumps(sample_entry.family)))
             family_mapping[sample_entry.family_id] = sample_entry.family
-            exported_sample_entries[sample_entry.sha256] = sample_entry.toDict()
-            function_entries = storage.getFunctionsBySampleId(sample_id)
-            functions_dict = {function_entry.function_id: function_entry.toDict() for function_entry in function_entries}
-            exported_function_entries[sample_entry.sha256] = functions_dict
-            if compress_data:
-                compressed_encoded = compress_encode(json.dumps(functions_dict))
-                exported_function_entries[sample_entry.sha256] = compressed_encoded
-                export_size += len(compressed_encoded)
+            sample_dict = sample_entry.toDict()
+            sample_json = json.dumps(sample_dict)
+            count(len(sample_json))
+            if serialize:
+                exported_sample_entries[sample_entry.sha256] = [sample_json.encode()]
+                exported_function_entries[sample_entry.sha256], num_functions = self._serializeExportFunctions(storage, sample_id, compress_data, count)
             else:
-                export_size += len(json.dumps(functions_dict))
+                function_entries = storage.getFunctionsBySampleId(sample_id) or []
+                functions_dict = {function_entry.function_id: function_entry.toDict() for function_entry in function_entries}
+                functions_value = compress_encode(json.dumps(functions_dict)) if compress_data else functions_dict
+                count(len(json.dumps(functions_value)))
+                exported_sample_entries[sample_entry.sha256] = sample_dict
+                exported_function_entries[sample_entry.sha256] = functions_value
+                num_functions = len(function_entries)
             exported_data["content"]["num_samples"] += 1
-            exported_data["content"]["num_functions"] += len(function_entries)
-            if export_size > self._storage_config.STORAGE_MAX_EXPORT_SIZE:
-                raise MemoryError("Export running beyond the allocated maximum, aborting operation.")
+            exported_data["content"]["num_functions"] += num_functions
         exported_data["content"]["num_families"] = len(family_mapping)
         exported_data["family_mapping"] = family_mapping
         # the family attributes beyond the name (#57); an importer without this key ignores it
         exported_data["family_actors"] = {}
+        # and so are their tags (#53); a sample's and a function's travel in its own entry
+        exported_data["family_tags"] = {}
         for family_id in family_mapping:
             family_entry = storage.getFamily(family_id)
             if family_entry is not None and family_entry.actors:
-                exported_data["family_actors"][family_id] = list(family_entry.actors)
+                actors_json = json.dumps(list(family_entry.actors))
+                count(len(actors_json))
+                exported_data["family_actors"][family_id] = [actors_json.encode()] if serialize else list(family_entry.actors)
+            if family_entry is not None and family_entry.tags:
+                count(len(json.dumps(list(family_entry.tags))))
+                exported_data["family_tags"][family_id] = list(family_entry.tags)
         exported_data["sample_entries"] = exported_sample_entries
         exported_data["function_entries"] = exported_function_entries
         return exported_data
 
-    def addImportData(self, export_data):
+    @staticmethod
+    def _statedNumFunctions(sample_entry_dict) -> int:
+        """The functions an exported sample entry states it has, if it does: a sample submitted without statistics holds none."""
+        statistics = sample_entry_dict.get("statistics")
+        num_functions = statistics.get("num_functions") if isinstance(statistics, dict) else None
+        return num_functions if isinstance(num_functions, int) and not isinstance(num_functions, bool) and num_functions >= 0 else 0
+
+    def _prepareImportedSamples(self, export_data, present_sha256s, signature_bytes, inflation_budget):
+        """Read and check every sample of an export - inflate and parse the content of those not in
+        present_sha256s, up to inflation_budget bytes in all, build their sample and function entries
+        and check that the storage can hold them - and the families they are filed under, without
+        touching the storage. The entries are checked and let go one sample at a time: the write pass
+        reads each sample again with _prepareImportedSample, so memory holds one sample's functions,
+        not the export's. Returns the family names and the family actors by family_id, a (sha256,
+        number of functions) per new sample, and the number of samples and of functions skipped as
+        present."""
+        # family ids parsed once here, so that the families are written from what was checked
+        family_names = {}
+        for family_id, family_name in export_data["family_mapping"].items():
+            # null is how an export carries the family of a sample reported without one: the default family
+            family_name = "" if family_name is None else family_name
+            if not isinstance(family_name, str):
+                raise ImportRejected(f"export names family {family_id!r} by something other than text")
+            # "7" and "07" are one family id, which cannot carry two names
+            if family_names.setdefault(int(family_id), family_name) != family_name:
+                raise ImportRejected(f"export names family {int(family_id)} twice, differently")
+        family_actors = {}
+        for family_id, actors in (export_data.get("family_actors") or {}).items():
+            if actors is not None and not isinstance(actors, list):
+                raise ImportRejected(f"export holds actors of family {family_id!r} as something other than a list")
+            # the actors of "7" and "07" are both family 7's, and merged as such
+            family_actors.setdefault(int(family_id), []).extend(actors or [])
+        num_minhashes_dropped = 0
+        num_samples_skipped = 0
+        num_functions_skipped = 0
+        samples_to_import = []
+        for sample_sha256, sample_entry_dict in export_data["sample_entries"].items():
+            # read for every sample, present or not: the import report counts the functions, and the
+            # escaper comparison collects and sorts the architectures. None, or none at all, is an
+            # architecture SMDA could not tell, as older versions stored it
+            # only reported back: the family statistics count the functions imported, not this claim (#265)
+            num_functions = self._statedNumFunctions(sample_entry_dict)
+            if sample_entry_dict.get("architecture") is not None and not isinstance(sample_entry_dict["architecture"], str):
+                raise ImportRejected(f"sample {sample_sha256} states its architecture as something other than text")
+            # skip samples that are present already
+            if sample_sha256 in present_sha256s:
+                LOGGER.info(f"Sample with SHA256 {sample_sha256} already present in database, skipping...")
+                num_samples_skipped += 1
+                num_functions_skipped += num_functions
+                continue
+            _, _, num_dropped, num_inflated = self._prepareImportedSample(export_data, sample_sha256, family_names, signature_bytes, inflation_budget)
+            inflation_budget -= num_inflated
+            num_minhashes_dropped += num_dropped
+            samples_to_import.append((sample_sha256, num_functions))
+        if num_minhashes_dropped:
+            LOGGER.warning("Dropped %d imported minhashes that are not %d bytes long, the next minhash repair recalculates them.", num_minhashes_dropped, signature_bytes)
+        return family_names, family_actors, samples_to_import, num_samples_skipped, num_functions_skipped
+
+    def _prepareImportedSample(self, export_data, sample_sha256, family_names, signature_bytes, inflation_budget):
+        """Inflate and parse the content of one sample of an export, up to inflation_budget bytes, build
+        its sample and function entries and check that the storage can hold them; the entries keep the
+        export's family_id. Returns the sample entry, the function entries, the number of minhashes
+        dropped for their length and the number of bytes the content inflated to."""
+        sample_entry_dict = export_data["sample_entries"][sample_sha256]
+        # exported as a bool; the family statistics count it as 0 or 1
+        if sample_entry_dict["is_library"] not in (True, False):
+            raise ImportRejected(f"sample {sample_sha256} states whether it is a library as something other than true or false")
+        function_entry_dicts = export_data["function_entries"].get(sample_sha256)
+        # decompress function_entries if necessary
+        num_inflated = 0
+        if function_entry_dicts is not None and export_data["content"]["is_compressed"]:
+            inflated = decompress_decode(function_entry_dicts, max_size=inflation_budget)
+            num_inflated = len(inflated)
+            function_entry_dicts = json.loads(inflated)
+            del inflated
+        sample_entry = SampleEntry.fromDict(sample_entry_dict)
+        # an export is data from elsewhere: a tag this instance would not accept is dropped (#53)
+        sample_entry.tags = normalizeTags(sample_entry.tags, drop_invalid=True)[:MAX_TAGS_PER_ENTITY]
+        if sample_entry.family_id not in family_names:
+            raise ImportRejected(f"sample {sample_sha256} names family {sample_entry.family_id}, which the export does not hold")
+        # the fields stored as they are read; family_id and sample_id are this instance's, and the
+        # base address is written in two's complement
+        if isinstance(sample_entry.base_addr, int) and not 0 <= sample_entry.base_addr < _UINT64_LIMIT:
+            raise ImportRejected(f"sample {sample_sha256} states a base address beyond 64 bit")
+        for value in (
+            sample_entry.architecture,
+            sample_entry.binary_size,
+            sample_entry.binweight,
+            sample_entry.bitness,
+            sample_entry.component,
+            sample_entry.family,
+            sample_entry.filename,
+            sample_entry.smda_version,
+            sample_entry.statistics,
+            sample_entry.version,
+        ):
+            if _holdsUnstorable(value):
+                raise ImportRejected(f"sample {sample_sha256} holds a number beyond 64 bit or a key with a NUL")
+        # a sample without a family is stored with "" as local ones are, not with null
+        if sample_entry.family is None:
+            sample_entry.family = family_names[sample_entry.family_id]
+        num_minhashes_dropped = 0
+        function_entries = []
+        for function_entry_dict in (function_entry_dicts or {}).values():
+            function_entry = FunctionEntry.fromDict(function_entry_dict)
+            function_entry.tags = normalizeTags(function_entry.tags, drop_invalid=True)[:MAX_TAGS_PER_ENTITY]
+            # the storage keys its pichash index by it
+            # null as FunctionEntry stores a function without one
+            if function_entry.pichash is None:
+                function_entry.pichash = 0
+            if not _isUint64(function_entry.pichash):
+                raise ImportRejected(f"sample {sample_sha256} holds a function whose pichash is no 64-bit number")
+            if not _areStorableBlockHashes(function_entry.picblockhashes):
+                raise ImportRejected(f"sample {sample_sha256} holds a function whose picblockhashes are no list of 64-bit hashes and offsets")
+            if isinstance(function_entry.offset, int) and not 0 <= function_entry.offset < _UINT64_LIMIT:
+                raise ImportRejected(f"sample {sample_sha256} holds a function whose offset is beyond 64 bit")
+            # the other fields stored as they are read; MongoDB storage writes the disassembly as JSON text
+            for value in (
+                function_entry.architecture,
+                function_entry.binweight,
+                function_entry.function_name,
+                function_entry.matches,
+                function_entry.minhash_shingle_composition,
+                function_entry.num_blocks,
+                function_entry.num_instructions,
+            ):
+                if _holdsUnstorable(value):
+                    raise ImportRejected(f"sample {sample_sha256} holds a function with a number beyond 64 bit or a key with a NUL")
+            for label in function_entry.function_labels:
+                if _holdsUnstorable(label.function_label) or _holdsUnstorable(label.username):
+                    raise ImportRejected(f"sample {sample_sha256} holds a function label with a number beyond 64 bit or a key with a NUL")
+            if function_entry.minhash and len(function_entry.minhash) != signature_bytes:
+                function_entry.minhash = b""
+                function_entry.minhash_shingle_composition = {}
+                num_minhashes_dropped += 1
+            function_entries.append(function_entry)
+        return sample_entry, function_entries, num_minhashes_dropped, num_inflated
+
+    def addImportData(self, export_data, import_size=None):
+        """Store an export, all of it or, should storing fail, nothing (#299). import_size is the size
+        of the export as it was sent, which bounds what its content may inflate to; without it, the
+        size of its compressed content stands in."""
         storage = self.getStorage()
         import_report = {
             "num_samples_imported": 0,
@@ -227,17 +497,48 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             "num_families_skipped": 0,
             "escaper_mismatch": False,
         }
-        # TODO adjust minimum required MCRIT version if we ever extend in a way that objects become incompatible
-        # TODO do not compare version as string
-        if export_data["config"]["version"] <= "0.0.0":
-            LOGGER.error("Cannot import data, version of export is incompatible / too old.")
-            return
-        if export_data["config"]["shingler"] != self._shingler_config.getConfigHash():
-            LOGGER.error("Cannot import data, shingler configuration hash is incompatible.")
-            return
-        if export_data["config"]["minhash"] != self._minhash_config.getConfigHash():
-            LOGGER.error("Cannot import data, MinHash configuration hash is incompatible.")
-            return
+        try:
+            export_version = Version(export_data["config"]["version"])
+        # InvalidVersion is a ValueError, and so is the error for a number of more than 4300 digits
+        except (ValueError, TypeError, KeyError) as error:
+            raise ImportRejected("export has no valid version") from error
+        if export_version <= MINIMUM_IMPORT_VERSION:
+            raise ImportRejected(f"export version {export_version} is older than this instance imports")
+        if export_data["config"].get("shingler") != self._shingler_config.getConfigHash():
+            raise ImportRejected("the export's shingler configuration differs from this instance's")
+        if export_data["config"].get("minhash") != self._minhash_config.getConfigHash():
+            raise ImportRejected("the export's MinHash configuration differs from this instance's")
+        for section in ("content", "family_mapping", "sample_entries", "function_entries"):
+            if not isinstance(export_data.get(section), dict):
+                raise ImportRejected(f"export has no {section} mapping")
+        # imported minhashes are stored and banded as they are, so each has to be one this instance
+        # could have computed: one of another length is banded beside the code it was copied from
+        # and then fails every matching job that draws it as a candidate, or does not fit the band
+        # projection at all. It is dropped rather than failing the import - imported samples record
+        # no minhash version, so the next minhash repair rehashes them from their disassembly
+        signature_bytes = self._minhash_config.MINHASH_SIGNATURE_LENGTH * (1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4)
+        if import_size is None:
+            import_size = sum(len(content) for content in export_data["function_entries"].values() if isinstance(content, str))
+        inflation_budget = max(MAX_DECOMPRESSION_RATIO * import_size, MIN_IMPORT_DECOMPRESSED_SIZE)
+        # looked up apart from reading the export, so that an error of the storage is not taken for one of the export
+        present_sha256s = storage.getPresentSha256s(export_data["sample_entries"])
+        # a first pass reads everything the export holds - inflates and parses each sample's content,
+        # builds its sample and function entries - before anything is stored, so that an import that
+        # is refused or malformed stores nothing, not the samples before the one that failed. It keeps
+        # none of the entries; the write pass below reads each sample once more
+        try:
+            family_names, family_actors, samples_to_import, num_samples_skipped, num_functions_skipped = self._prepareImportedSamples(
+                export_data, present_sha256s, signature_bytes, inflation_budget
+            )
+        except ImportRejected:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError, RecursionError) as error:
+            # nothing is stored yet: whatever the export lacks or holds in another shape is its fault,
+            # content nested too deeply to parse included. Catching this broadly holds only as long as
+            # the pass makes no storage calls - an error of the storage would be taken for the export's
+            raise ImportRejected(f"export is malformed ({type(error).__name__}: {error})") from error
+        import_report["num_samples_skipped"] += num_samples_skipped
+        import_report["num_functions_skipped"] += num_functions_skipped
         # An escaper mismatch does not make the data unusable - most functions are unaffected by a
         # given escaper change - so this warns instead of refusing. The imported minhashes were
         # computed from a different escaped representation than this instance produces, so matching
@@ -303,93 +604,146 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                         SMDA_VERSION,
                         "" if not unchanged else " (unchanged for %s)" % unchanged,
                     )
-        is_compressed = export_data["content"]["is_compressed"]
+        # families are added only now, so that a refused export does not leave its families behind
         # create a dictionary for pointing family_ids as contained in the export to family_ids as used in this instance
         family_id_remapping = {}
-        max_family_id_in_storage = max(storage.getFamilyIds())
-        for exported_family_id, exported_family in export_data["family_mapping"].items():
-            exported_family_id = int(exported_family_id)
-            remapped_family_id = storage.addFamily(exported_family)
-            if remapped_family_id > max_family_id_in_storage:
-                import_report["num_families_imported"] += 1
-                max_family_id_in_storage = remapped_family_id
-            else:
-                import_report["num_families_skipped"] += 1
-            family_id_remapping[exported_family_id] = remapped_family_id
-        # actors of imported families are merged into what this instance already knows (#57)
-        for exported_family_id, actors in (export_data.get("family_actors") or {}).items():
-            remapped_family_id = family_id_remapping.get(int(exported_family_id))
-            local_family = storage.getFamily(remapped_family_id) if remapped_family_id is not None else None
-            # held to what the API accepts: an export is data from elsewhere
-            valid_actors = [actor for actor in actors or [] if FamilyEntry.isValidActor(actor)]
-            if len(valid_actors) != len(actors or []):
-                LOGGER.warning("Dropping %d invalid actor name(s) of imported family %s.", len(actors or []) - len(valid_actors), exported_family_id)
-            actors = FamilyEntry.normalizeActors(valid_actors)
-            if local_family is not None and actors:
-                merged = list(local_family.actors) + [actor for actor in actors if actor not in local_family.actors]
-                if merged != local_family.actors:
-                    storage.modifyFamily(remapped_family_id, {"actors": merged})
-        LOGGER.info("Family remapping created: %d families, %d samples.", len(family_id_remapping), len(export_data["sample_entries"]))
-        # iterate samples
+        created_family_ids = []
         index = 0
-        function_entries_to_import = []
+        num_functions_added = 0
+        # the minhashes are banded once every function is stored, as before; until then only their
+        # function ids and bytes are kept, about 100 bytes per function, a small part of its entry
+        minhashes_to_import = []
         imported_sample_entries = []
-        # every sample is written before any function, so one that fails - a later entry that does not
-        # read, a function insert MongoDB refuses - would leave the samples before it without functions,
-        # and a corrected import would skip them as present already: they are removed again instead
+        # everything written from here on is removed again should a write fail - a function insert
+        # MongoDB refuses, say. Each sample is stored with its functions before the next is read, so a
+        # failure at any sample leaves the ones before it stored, counted and indexed, which a
+        # corrected import would skip as present, and families left without samples would stay behind
+        # empty: discardImportedSample and discardImportedFamily take all of them back
         try:
-            for sample_sha256, sample_entry_dict in export_data["sample_entries"].items():
+            for exported_family_id, family_name in family_names.items():
+                remapped_family_id, is_created = storage.ensureFamily(family_name)
+                if is_created:
+                    import_report["num_families_imported"] += 1
+                    created_family_ids.append(remapped_family_id)
+                else:
+                    import_report["num_families_skipped"] += 1
+                family_id_remapping[exported_family_id] = remapped_family_id
+            LOGGER.info("Family remapping created: %d families, %d samples.", len(family_id_remapping), len(export_data["sample_entries"]))
+            for sample_sha256, num_functions in samples_to_import:
                 index += 1
-                # check if sample is already present, and skip if yes
-                if storage.getSampleBySha256(sample_sha256):
-                    LOGGER.info(f"Sample with SHA256 {sample_sha256} already present in database, skipping...")
-                    import_report["num_samples_skipped"] += 1
-                    import_report["num_functions_skipped"] += sample_entry_dict["statistics"]["num_functions"]
-                    continue
-                sample_entry = SampleEntry.fromDict(sample_entry_dict)
-                # adjust family_id in sample_entry using our remapping
+                # read again, as the first pass did: it kept no more than the sha256 to bound memory. The
+                # same content inflates to the same size, so this pass draws on a budget of its own, as
+                # large as the first pass's, and cannot exceed it where the first did not
+                sample_entry, function_entries, _, num_inflated = self._prepareImportedSample(export_data, sample_sha256, family_names, signature_bytes, inflation_budget)
+                inflation_budget -= num_inflated
                 sample_entry.family_id = family_id_remapping[sample_entry.family_id]
-                # add sample_entry to storage and receive new sample_id
-                remapped_sample_entry = storage.importSampleEntry(sample_entry)
+                # add sample_entry to storage and receive new sample_id; None when its sha256 is known
+                # here after all - stated apart from its key, or added by another writer since the check
+                # above. Its functions must not follow: they would land on the sample_id the export
+                # carries, and as it is not this import's, it is not removed should the import fail later
+                remapped_sample_entry = storage.importSampleEntry(sample_entry) if sample_entry.sha256 == sample_sha256 else None
                 if remapped_sample_entry is None:
-                    # another writer stored the same sample since the check above: it is theirs, so this
-                    # import neither attaches functions to it nor removes it should it fail later
+                    LOGGER.warning("Sample with SHA256 %s was not added (entry states SHA256 %r), skipping it and its functions...", sample_sha256, sample_entry.sha256)
                     import_report["num_samples_skipped"] += 1
-                    import_report["num_functions_skipped"] += sample_entry_dict["statistics"]["num_functions"]
+                    import_report["num_functions_skipped"] += num_functions
+                    del sample_entry, function_entries
                     continue
                 import_report["num_samples_imported"] += 1
                 imported_sample_entries.append(remapped_sample_entry)
-                if sample_sha256 in export_data["function_entries"]:
-                    function_entries = export_data["function_entries"][sample_sha256]
-                    # decompress function_entries if necessary
-                    if is_compressed:
-                        function_entries = json.loads(decompress_decode(function_entries))
-                    # iterate functions and add them, adjusting family_id and sample_id
-                    for old_function_id, function_entry_dict in function_entries.items():
-                        function_entry = FunctionEntry.fromDict(function_entry_dict)
-                        function_entry.sample_id = remapped_sample_entry.sample_id
-                        function_entry.family_id = remapped_sample_entry.family_id
-                        function_entries_to_import.append(function_entry)
-                        import_report["num_functions_imported"] += 1
+                # adjusting family_id and sample_id of the functions
+                function_entry = None
+                for function_entry in function_entries:
+                    function_entry.sample_id = remapped_sample_entry.sample_id
+                    function_entry.family_id = remapped_sample_entry.family_id
+                import_report["num_functions_imported"] += len(function_entries)
+                adjusted_function_entries = storage.importFunctionEntries(function_entries) if function_entries else []
+                num_functions_added += len(adjusted_function_entries)
+                # we can only index once our imported function_entries had their function_id adjusted to our DB
+                hashed = [function_entry for function_entry in adjusted_function_entries if function_entry.minhash]
+                if hashed:
+                    minhashes_to_import.append(([function_entry.function_id for function_entry in hashed], [function_entry.minhash for function_entry in hashed]))
                 LOGGER.info("Sample %d with SHA256 %s added...", index, sample_sha256)
-
-            adjusted_function_entries = storage.importFunctionEntries(function_entries_to_import)
+                # let go of this sample's entries before the next is read, and the last one's before banding
+                del sample_entry, function_entries, function_entry, adjusted_function_entries, hashed
+            LOGGER.info(f"{num_functions_added} functions added")
+            # ensure that their minhashes / pichashes are added to the respective indices. Delaying minhash
+            # insertion speeds up the procedure dramatically, and so does doing it in one call: a band hash
+            # shared across samples is one update for all of them, where banding sample by sample took 2.5
+            # times as long. It is the one step that still grows with the export, by 1.1-1.4 kB a function.
+            # Should it fail, the samples are taken back with whatever band entries were written
+            minhashes = [
+                MinHash(function_id, minhash, minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
+                for function_ids, minhash_bytes in minhashes_to_import
+                for function_id, minhash in zip(function_ids, minhash_bytes)
+            ]
+            del minhashes_to_import
+            # rebuilt from their bytes, these carry no shingle composition: the one each function was
+            # stored with above stays, where writing theirs would empty it
+            storage.addMinHashes(minhashes, keep_composition=True)
+            LOGGER.info(f"{len(minhashes)} Minhashes added")
         except Exception:
-            LOGGER.error("Import failed, removing the %d samples it had added.", len(imported_sample_entries))
+            LOGGER.error("Import failed, removing the %d samples and %d families it had added.", len(imported_sample_entries), len(created_family_ids))
+            # one that cannot be removed must not hide why the import failed
             for imported_sample_entry in imported_sample_entries:
-                storage.discardImportedSample(imported_sample_entry)
+                try:
+                    storage.discardImportedSample(imported_sample_entry)
+                except Exception:
+                    LOGGER.exception("Could not remove sample %s of the failed import.", imported_sample_entry.sha256)
+            # only while no sample is filed under one, this import's or another writer's
+            for family_id in created_family_ids:
+                try:
+                    storage.discardImportedFamily(family_id)
+                except Exception:
+                    LOGGER.exception("Could not remove family %d of the failed import.", family_id)
             raise
-        LOGGER.info(f"{len(adjusted_function_entries)} functions added")
-        # we can only start indexing once our imported function_entries had their function_id adjusted to our DB
-        minhashes_to_import = []
-        for function_entry in adjusted_function_entries:
-            # delaying minhash insertion speeds up the procedure dramatically
-            if function_entry.minhash:
-                minhash = MinHash(function_entry.function_id, function_entry.minhash, minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
-                minhashes_to_import.append(minhash)
-        # ensure that their minhashes / pichashes are added to the respective indices
-        storage.addMinHashes(minhashes_to_import)
-        LOGGER.info(f"{len(minhashes_to_import)} Minhashes added")
+        # actors of imported families are merged into what this instance already knows (#57), once the
+        # import is complete: they are metadata on top of it, so one that cannot be stored is logged and
+        # the import still succeeds - a failure here neither undoes it nor leaves it half done
+        try:
+            for exported_family_id, actors in family_actors.items():
+                remapped_family_id = family_id_remapping.get(exported_family_id)
+                local_family = storage.getFamily(remapped_family_id) if remapped_family_id is not None else None
+                # held to what the API accepts: an export is data from elsewhere
+                valid_actors = [actor for actor in actors if FamilyEntry.isValidActor(actor)]
+                if len(valid_actors) != len(actors):
+                    LOGGER.warning("Dropping %d invalid actor name(s) of imported family %s.", len(actors) - len(valid_actors), exported_family_id)
+                actors = FamilyEntry.normalizeActors(valid_actors)
+                if local_family is not None and actors:
+                    # and to the API's cap, as tags are below: the first that fit are added
+                    merged, num_dropped = FamilyEntry.mergeActors(local_family.actors, actors)
+                    if num_dropped:
+                        LOGGER.warning(
+                            "Family %d would be attributed to more than %d actors, dropping %d imported actors.", remapped_family_id, FamilyEntry.MAX_ACTORS, num_dropped
+                        )
+                    if merged != local_family.actors:
+                        storage.modifyFamily(remapped_family_id, {"actors": merged})
+        except Exception:
+            LOGGER.exception("Could not merge the actors of the imported families, the import itself is complete.")
+        # tags of imported families likewise (#53). An export is data from elsewhere, so a tag
+        # this instance would not accept is dropped rather than failing the whole import, and so
+        # are those that would take a family past MAX_TAGS_PER_ENTITY: the first that fit are added
+        try:
+            family_tags = export_data.get("family_tags") or {}
+            for exported_family_id, tags in family_tags.items() if isinstance(family_tags, dict) else []:
+                remapped_family_id = family_id_remapping.get(int(exported_family_id))
+                local_family = storage.getFamily(remapped_family_id) if remapped_family_id is not None else None
+                tags = normalizeTags(tags, drop_invalid=True)
+                if local_family is None or not tags:
+                    continue
+                known_tags = set(local_family.tags)
+                new_tags = [tag for tag in tags if tag not in known_tags]
+                fitting_tags = new_tags[: max(0, MAX_TAGS_PER_ENTITY - len(local_family.tags))]
+                if len(fitting_tags) < len(new_tags):
+                    LOGGER.warning(
+                        "Family %d would carry more than %d tags, dropping %d imported tags.", remapped_family_id, MAX_TAGS_PER_ENTITY, len(new_tags) - len(fitting_tags)
+                    )
+                if fitting_tags:
+                    try:
+                        storage.addTags("family", remapped_family_id, fitting_tags)
+                    except TagLimitError:
+                        LOGGER.warning("Family %d was tagged meanwhile and reached %d tags, dropping its imported tags.", remapped_family_id, MAX_TAGS_PER_ENTITY)
+        except Exception:
+            LOGGER.exception("Could not merge the tags of the imported families, the import itself is complete.")
         return import_report
 
     def respawn(self):
@@ -400,7 +754,7 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
 
     #### REDIRECTED TO WORKER ####
     """
-    def updateMinHashes(self, function_ids):
+    def updateMinHashes(self, function_ids, finish_samples=False):
     def rebuildIndex(self):
     def recomputeFamilyStats(self):
     def deleteOrphanedQueueFiles(self, dry_run=False):
@@ -426,6 +780,14 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
 
     #### NOT REDIRECTED ####
     def addReport(self, smda_report, calculate_hashes=True, calculate_matches=False, username=None):
+        # checked before the lookup, where MongoDB would read an object as a query operator
+        if not SampleEntry.isValidSha256(smda_report.sha256):
+            raise ValueError("the report's sha256 is not 64 hex digits")
+        for smda_function in smda_report.getFunctions():
+            # None is a function without a PicHash (stored as 0); anything else is stored through hex()
+            pic_hash = smda_function.pic_hash
+            if pic_hash is not None and (not isinstance(pic_hash, int) or isinstance(pic_hash, bool) or not 0 <= pic_hash < 2**64):
+                raise ValueError(f"the pic_hash of function at {smda_function.offset} is not an unsigned 64-bit integer")
         storage = self.getStorage()
         sample_entry = storage.getSampleBySha256(smda_report.sha256)
         if sample_entry:
@@ -459,6 +821,17 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         # unlike modifySample/modifyFamily this touches one document and no statistics, so it
         # is answered synchronously instead of as a job (fkie-cad/mcritweb#72)
         return self.getStorage().modifyFunction(function_id, update_information, username=username)
+
+    # tags (#53) touch one document and no statistics, so like modifyFunction they are answered
+    # synchronously rather than as a job
+    def addTags(self, entity: str, entity_id: int, tags: List[str]) -> Optional[List[str]]:
+        return self.getStorage().addTags(entity, entity_id, tags)
+
+    def removeTags(self, entity: str, entity_id: int, tags: List[str]) -> Optional[List[str]]:
+        return self.getStorage().removeTags(entity, entity_id, tags)
+
+    def getTagCounts(self, entity: str) -> Dict[str, int]:
+        return self.getStorage().getTagCounts(entity)
 
     #### MATCHING JOBS ####
     # Each submits its job with every matching knob resolved to the value the job runs with, so
@@ -571,6 +944,11 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         params.pop("shortlist_unavailable", None)
         if not sample_group_only:
             params["shortlist_size"] = 0
+        # a sample named twice is compared once: each vs-group child loads every other sample named,
+        # so a repeated id made it load that sample's functions once per repetition
+        sample_ids = list(dict.fromkeys(sample_ids))
+        if len(sample_ids) > MAX_CROSS_COMPARE_SAMPLES:
+            raise ValueError(f"A cross compare takes at most {MAX_CROSS_COMPARE_SAMPLES} samples.")
         for id in sample_ids:
             if sample_group_only:
                 job_id = self.getMatchesForSampleVsGroup(id, [sid for sid in sample_ids if sid != id], force_recalculation=force_recalculation, username=username, **params)
@@ -630,6 +1008,9 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             return
         sample_entry_a = storage.getSampleById(function_entry_a.sample_id)
         sample_entry_b = storage.getSampleById(function_entry_b.sample_id)
+        if sample_entry_a is None or sample_entry_b is None:
+            # a function whose sample document is gone (#270) cannot be reported, as in matching
+            return
         minhash_a = function_entry_a.getMinHash(minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
         minhash_b = function_entry_b.getMinHash(minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
 
@@ -638,7 +1019,8 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             score = MinHash.calculateMinHashScore(minhash_a.minhash, minhash_b.minhash, minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
         match_flags = 0
         match_flags += MatcherFlags.IS_MINHASH_FLAG if score is not None and score >= self._minhash_config.MINHASH_MATCHING_THRESHOLD else 0
-        match_flags += MatcherFlags.IS_PICHASH_FLAG if function_entry_a.pichash == function_entry_b.pichash else 0
+        # a PicHash of 0 is a function without one, not a hash two functions can share
+        match_flags += MatcherFlags.IS_PICHASH_FLAG if function_entry_a.pichash and function_entry_a.pichash == function_entry_b.pichash else 0
         match_flags += MatcherFlags.IS_LIBRARY_FLAG if sample_entry_b.is_library else 0
         match_tuple = [function_entry_b.family_id, function_entry_b.sample_id, function_entry_b.function_id, score, match_flags]
         result = {
@@ -733,6 +1115,9 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 "num_families": storage_stats["num_families"],
                 "num_functions": storage_stats["num_functions"],
                 "num_pichashes": storage_stats["num_pichashes"],
+                # False on an instance created before pichashes were stored zero-padded and not yet
+                # migrated (migrate_pichash_padding); range conditions and sorting by pichash need True (#145)
+                "pichash_padded": storage_stats.get("pichash_padded", True),
                 # minhashes are only comparable across functions escaped by the same smda; see
                 # mcrit/minhash/EscaperFingerprint.py for why this is worth surfacing
                 "smda_version": SMDA_VERSION,

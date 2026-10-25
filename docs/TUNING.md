@@ -54,6 +54,15 @@ and keep it below the container limit so the job is the one stopped rather than 
 Measuring reads the parent of every process on the host from `/proc` once a second per running job,
 which costs little on a worker host but adds up where thousands of processes run beside it.
 
+A `spawningworker` kills a job process after `QUEUE_SPAWNINGWORKER_CHILDREN_TIMEOUT` seconds. A plain
+`mcrit worker` stops a job after `QUEUE_WORKER_JOB_TIMEOUT` seconds (default 3600; `0` turns the limit
+off), but only a job that reads the index and does not write it: matching (sample, vs, vs-group, cross, query)
+and unique blocks. Jobs that write - binary submission and the minhash updates, which store minhashes
+and then their band postings in separate steps that an interruption could split - and corpus
+maintenance (`rebuild*`, `recalculate*`, `repair*`, `doDbCleanup`, deletions and modifications) are
+not timed. A stopped job is retried like any failing job, up to `QUEUE_MAX_ATTEMPTS` (3) times, so one
+oversized request can hold a worker for about three times the limit before it is marked failed.
+
 A worker that runs jobs in its own process (`mcrit worker`, as opposed to `spawningworker`) keeps
 what a job allocated in glibc's arenas after the job ends, so its resident size stays at its
 largest job's peak. It hands the freed memory back to the operating system after every job
@@ -228,9 +237,8 @@ where the traversal stops scaling; below that there is little left to win.
 `STORAGE_BAND_DF_CUTOFF` is a fixed number, and the posting lists it is compared against are not.
 Vocabulary grows sublinearly with the corpus (Heaps' law, V(n) = 1412.8 · n^0.7247 as fitted by
 `benchmarks/measure_growth.py`) while postings grow with the number of functions, so posting lists
-lengthen and the same cutoff skips a growing share of the index. Nothing on the query path says so:
-counting skipped postings per lookup would roughly double the index work of every band lookup. The
-measurement is a job instead:
+lengthen and the same cutoff skips a growing share of the index. Every matching report counts what
+the cutoff skipped of its own query (below); what it skips of the whole index is a job:
 
     curl http://localhost:8000/band_df_cutoff_coverage                      # the configured cutoff
     curl 'http://localhost:8000/band_df_cutoff_coverage?band_df_cutoff=500' # any other one
@@ -263,6 +271,55 @@ as empty. The postings of a bucketed hash whose bucket 0 is missing carry no df:
 not count them, and with the cutoff on they are never served. `rebuild_band_df_index` repairs such
 a hash by recreating its bucket 0 from the buckets that remain.
 
+Per query, a matching report's `info.matching.candidate_generation` says what the cutoff and the
+shortlist left out of that job:
+
+| key | meaning |
+|---|---|
+| `band_lookups` | (query function, band) pairs looked up |
+| `band_lookups_skipped` | of those, the ones whose band hash was over the cutoff |
+| `postings_skipped` | band hits not fetched: the df of those hashes, summed per skipped lookup |
+| `query_functions_with_skipped_bands` | query functions that lost at least one band |
+| `query_functions_cut_off` | query functions the cutoff left with fewer unskipped bands than `band_matches_required`, where that is within the band count |
+| `shortlist_voted_samples`, `shortlist_dropped_samples` | samples stage 1 ranked, and those it did not keep |
+| `shortlist_dropped_candidates` | candidate functions outside the shortlist |
+| `degraded` | `query_functions_cut_off` is above 0: recall is at risk |
+
+A corpus function becomes a candidate by colliding with the query function on at least
+`band_matches_required` bands (2 by default), so a query function with fewer bands left than that
+cannot be found by the fuzzy path at all - only PicHash can still match it.
+`query_functions_cut_off` counts those: the functions the cutoff made unfindable. It is a necessary
+condition, not a sufficient one; a function left with enough bands may still not collide on them.
+The shortlist keys are `null` when no shortlist ran, and the whole entry is `null` when
+`band_matches_required` is 0. A shortlist dropping samples is what it is for, so it never sets
+`degraded`. A degraded job logs one INFO line, `Candidate generation degraded: ...`.
+
+Read the shares, and compare them for the same query over time: some code is common enough that
+skipping its bands is right, but a rising `band_lookups_skipped / band_lookups`, or more query
+functions cut off, is the cutoff starting to bite - re-measure recall then, as above. A repeated
+request is answered from the cached job, counts included, so comparing over time needs
+`force_recalculation`. A result whose counts went unmeasured because the df index was incomplete is
+never cached, so it is recounted once the index is rebuilt. Until `rebuild_band_df_index` completes,
+that means every repeated matching request with a cutoff is computed again rather than served from
+the cache - and on the slower `$size` lookup the band lookup falls back to without the df index.
+
+On MongoDB the cutoff is applied server-side and a skipped hash is never returned, so the lookup
+cannot tell it from one the corpus lacks. The band lookup's aggregation therefore asks for the
+skipped hashes as well, in a `$unionWith` answered from the `(band_hash, df)` index entries alone:
+no skipped posting list is read and there is no extra round trip, but the lookup's index seeks are
+repeated. Measured on a synthetic 20-band corpus (MongoDB 7.0, 1,000 query functions, 20,000
+lookups, 990 of them skipped), the band lookup took 0.137 s at best without the count and 0.172 s
+with it: about 35 ms per 1,000 query functions, under 2 µs per (function, band) pair, or a few
+percent of a whole query. MemoryStorage counts for free.
+
+`STORAGE_BAND_DF_COUNT_SKIPS` (default `True`) turns the count off: no `$unionWith`, the same
+lookup as before (0.141 s on that corpus), and reports say `band_df_skips_measured: false` with
+`band_df_skips_unmeasured_reason: "disabled"` and `null` skip counts. Without a trusted df (until
+`rebuild_band_df_index` has run) the reason is `band_df_index_incomplete`. A storage class whose
+candidate lookup does not take the count's argument (decided from its signature) is called without
+it; the reason is then `storage_unsupported`, and `band_lookups` is `null` as well. An unmeasured
+report is never `degraded`.
+
 There is no dynamic pruning (WAND/MaxScore) behind the cutoff: it would need posting lists sorted
 by function id, which the fill-order buckets of `STORAGE_BAND_BUCKET_SIZE` are not. Until that
 changes, this report is how to tell whether the fixed cutoff still fits the corpus.
@@ -274,12 +331,14 @@ Separate from latency, and a hard stop rather than a slowdown. A band posting li
 pushing ids into one document until the write is refused, a document holds about **1.35 million
 ids** while they fit in 32 bits and about **1.05 million** once they need BSON int64. On a
 7,244-sample real corpus the longest posting list across all 20 bands held 36,183 ids, so
-extrapolating it linearly puts the ceiling near **270,000 samples**.
+extrapolating it linearly puts the ceiling near **270,000 samples**. One function submitted over
+and over reaches it far sooner: every copy adds a posting to the same hash in each band.
 
-What happens there is not gradual: `$push` raises `BSONObj size ... is invalid` and the write
-fails, so indexing stops for any sample containing a function whose band hash is already at the
-cap. **Adding machines does not help** - a document cannot span shards, so this is not something
-sharding fixes.
+What happens there is not gradual: mongod refuses the `$push`, and the hash takes no further
+postings. They are left out - with an entry in the `error` collection and a warning naming the
+band and the hash - while the rest of the sample is indexed as before, so a function holding that
+hash is no longer found through that band. **Adding machines does not help** - a document cannot
+span shards, so this is not something sharding fixes.
 
     STORAGE_BAND_BUCKET_SIZE = 100000
 
@@ -379,6 +438,31 @@ machine; raising it buys nothing once the round trip has stopped mattering.
   a 4-core / 16 GiB host with mongod 7.0. The shape of the result - one-stage grows with the
   corpus, two-stage does not - is the finding; the absolute seconds are host-specific.
 
+## Expiring finished ingestion and maintenance jobs
+
+| setting | default | effect |
+|---|---|---|
+| `QUEUE_TRANSIENT_JOB_RETENTION_SECONDS` | `0` | delete finished ingestion and maintenance jobs, with their GridFS result and file parameters, this many seconds after they finished; `0` keeps them |
+| `QUEUE_CLEAN_INTERVAL` | `1200` | seconds each worker waits between queue cleanups, and so between expiry passes |
+
+`QUEUE_TRANSIENT_JOB_RETENTION_SECONDS` controls automatic removal of finished ingestion and
+maintenance jobs. It defaults to `0`, which disables job expiry; set it to `604800` to retain them
+for seven days. Only the known transient methods (sample submission (`addBinarySample`), updates,
+deletions, rebuilds, repairs and queue cleanup) expire. Matching, query, cross compare,
+unique-block, `getBandDfCutoffCoverage` and unknown future methods are not expired by queue cleanup.
+Query jobs may still be removed by `doDbCleanup` under `STORAGE_MONGODB_CLEANUP_TTL`. Failed and
+terminated jobs remain for diagnosis. Queue cleanup runs at `QUEUE_CLEAN_INTERVAL` and removes each
+expired job before its GridFS result and file parameters; `deleteOrphanedQueueFiles` can reclaim
+files if cleanup is interrupted. A pass deletes at most 1,000 jobs, oldest first, so enabling this
+on a large backlog drains it over several intervals instead of holding a worker. At the default
+interval that is up to 3,000 jobs an hour per worker; every submitted report adds one
+`updateMinHashesForSample` job, so an instance ingesting faster than that needs a shorter
+`QUEUE_CLEAN_INTERVAL` (or more workers) for the backlog to shrink. A long-running worker also
+cleans once when it starts; the single-job processes `spawningworker` launches do not. Jobs record
+`finished_at` in the local time of the host that ran them, without a zone, so keep the retention
+well above any clock or time zone offset between hosts. This setting does not limit the lifetime of
+cached analysis results.
+
 ## Reclaiming space after the query cleanup
 
 | setting | default | effect |
@@ -408,13 +492,19 @@ as by default - and left alone when it has a database of its own, which this can
 |---|---|---|
 | `STORAGE_MONGODB_SEARCH_MAX_TIME_MS` | `30000` | time limit in milliseconds for the MongoDB scans behind `GET /search/{families,samples,functions}`; `0` = no limit |
 
-A search that runs out of time is stopped on the MongoDB side and answered 400 with a message
-to narrow the search term, instead of holding the database busy for as long as it takes. The
-limit applies to each scan of one search separately: the lookup of the matching entries and,
-for function names, the scan of the distinct names (if that one runs out, the search falls back
-to matching the names in the database, as it does for a corpus with too many distinct names, and
-the scan is not repeated for an hour). The lookups of a single id or sha256 are not limited. The
-in-memory storage has no such limit.
+A search that runs out of time is stopped on the MongoDB side and answered 400 with a message to
+narrow the search term, instead of holding the database busy for as long as it takes. The limit
+applies to each scan of one search separately: the lookup of the matching entries and, for function
+names, the scan of the distinct names (if that one runs out, the search falls back to matching the
+names in the database, as it does for a corpus with too many distinct names, and the scan is not
+repeated for an hour). A plain term also lists the labels that differ from the function names
+(#301), once per process until a write changes them, and looks up the functions carrying a matching
+one apart from the others, each under the limit. A search of nothing but function labels
+(`function_labels.function_label:?term`) is first tried as the plain lookup for a fixed 50 ms, then
+through the distinct labels; probe, listing and lookup share the one limit (the listing gets at most
+half of what the probe left, the lookup the rest), so that search never takes longer than the limit
+in total. The lookups of a single id or sha256 are not limited. The in-memory storage has no such
+limit.
 Raise it (or set 0) if broad searches on a large corpus are cut off and you accept their cost.
 
 ## Keeping submitted binaries
