@@ -438,6 +438,13 @@ class JobRerunClientTest(unittest.TestCase):
                 with self.assertRaises(error):
                     McritClient("http://mcrit.test", raise_client_errors=True).requestJobRerun("0123456789abcdef01234567")
 
+    def test_raw_mode_answers_the_response(self):
+        # what MCRITweb's API pass-through hands on, a refusal as much as the new job id
+        for status, body in ((200, {"status": "successful", "data": "fedcba9876543210fedcba98"}), (409, {"status": "failed", "data": {"message": "no"}})):
+            with self.subTest(status=status):
+                post = self._post(status, body)
+                self.assertIs(post.return_value, McritClient("http://mcrit.test", raw_responses=True).requestJobRerun("0123456789abcdef01234567"))
+
 
 if __name__ == "__main__":
     unittest.main()

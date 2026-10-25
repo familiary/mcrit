@@ -35,7 +35,7 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   as they were resolved at submission ([#217]): a configuration changed since does not apply, and a
   job that ran with `shortlist_unavailable` runs with it again. A query's rerun stores its query
   sample anew, under a new id, and a binary query is disassembled again by the worker's smda.
-  `requestJobRerun` answers the job id in raw mode too.
+  In raw mode `requestJobRerun` answers the `requests.Response`, like `deleteJob`.
 
 ## [1.16.0] - 2026-10-16
 
