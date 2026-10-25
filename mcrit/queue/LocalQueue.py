@@ -105,8 +105,12 @@ class Job:
         if self.method in self.method_types["family_id"]:
             return int(self.arguments[0])
         if self.method == "getUniqueBlocks":
-            if len(self.arguments) > 1:
-                return int(self.arguments[1])
+            # by name: arguments lists the named ones after the positional ones, so the second
+            # entry is whichever option came first, e.g. covers_required or the negative set (#283)
+            payload = self._data.get("payload") or {}
+            params = json.loads(payload["params"]) if "params" in payload else {}
+            family_id = params.get("family_id", params.get("1"))
+            return int(family_id) if family_id is not None else None
 
     @property
     def has_family_id(self):

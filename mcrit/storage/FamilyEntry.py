@@ -1,5 +1,5 @@
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from mcrit.storage.SampleEntry import SampleEntry
 
@@ -26,6 +26,9 @@ class FamilyEntry:
 
     # what an actor name may be, for the API and for imports alike
     ACTOR_NAME_PATTERN = re.compile(r"^[\w .\-]{1,64}$")
+    # how many actors a family may be attributed to, through the API and imports alike: an
+    # attribution names a few, and the cap keeps the family document small, as for tags (#53)
+    MAX_ACTORS = 64
 
     @staticmethod
     def isValidActor(actor) -> bool:
@@ -34,12 +37,19 @@ class FamilyEntry:
     @staticmethod
     def normalizeActors(actors) -> List[str]:
         """Actor names as stored: stripped, non-empty, each once, in the order given."""
-        normalized: List[str] = []
-        for actor in actors or []:
-            name = str(actor).strip()
-            if name and name not in normalized:
-                normalized.append(name)
-        return normalized
+        names = [str(actor).strip() for actor in actors or []]
+        # a dict keeps the first of each in order, and deduplicates in linear time
+        return list(dict.fromkeys(name for name in names if name))
+
+    @staticmethod
+    def mergeActors(actors, added) -> Tuple[List[str], int]:
+        """actors followed by those of added it does not hold yet, up to MAX_ACTORS, and how many of added did
+        not fit: an import or a rename merge adds no more. A family stored with more keeps all of its own."""
+        merged = FamilyEntry.normalizeActors(actors)
+        known = set(merged)
+        new_actors = [actor for actor in FamilyEntry.normalizeActors(added) if actor not in known]
+        fitting = new_actors[: max(0, FamilyEntry.MAX_ACTORS - len(merged))]
+        return merged + fitting, len(new_actors) - len(fitting)
 
     @property
     def is_library(self):

@@ -3,7 +3,7 @@ import re
 
 import falcon
 
-from mcrit.index.MinHashIndex import MinHashIndex
+from mcrit.index.MinHashIndex import ImportRejected, MinHashIndex
 from mcrit.server.utils import db_log_msg, get_username, jsonify, timing
 from mcrit.storage.StorageInterface import BAND_DF_CUTOFF_MAX
 
@@ -34,26 +34,32 @@ class StatusResource:
         db_log_msg(self.index, req, "StatusResource.on_get_config - success / not implemented.")
         return
 
-    @timing
-    def on_get_export(self, req, resp):
+    def _respond_export(self, req, resp, responder, sample_ids=None):
         compress_data = True if "compress" in req.params and req.params["compress"].lower() == "true" else False
         try:
-            exported_data = self.index.getExportData(compress_data=compress_data)
-            resp.data = jsonify({"status": "successful", "data": exported_data})
-            db_log_msg(self.index, req, "StatusResource.on_get_export - success.")
+            export_json = self.index.getExportJson(sample_ids, compress_data=compress_data)
         except MemoryError:
             resp.data = jsonify({"status": "failed", "data": {"message": "Export exceeded assigned maximum memory limit and was cancelled."}})
-            db_log_msg(self.index, req, "StatusResource.on_get_export - failed.")
+            db_log_msg(self.index, req, f"StatusResource.{responder} - failed.")
+            return
+        # sent in the pieces it was built in, as joining them would hold the export's text a second time
+        body = [b'{"status": "successful", "data": ', *export_json, b"}"]
+        resp.content_length = sum(len(fragment) for fragment in body)
+        resp.stream = iter(body)
+        db_log_msg(self.index, req, f"StatusResource.{responder} - success.")
+
+    @timing
+    def on_get_export(self, req, resp):
+        self._respond_export(req, resp, "on_get_export")
 
     @timing
     def on_get_export_selection(self, req, resp, comma_separated_sample_ids=None):
         # NOTE if we encounter extreme cases (super long URLs), we might have to switch to post here.
-        compress_data = True if "compress" in req.params and req.params["compress"].lower() == "true" else False
-        exported_data = {}
         if comma_separated_sample_ids is not None and re.match(r"^\d+(?:[\s]*,[\s]*\d+)*$", comma_separated_sample_ids):
             target_sample_ids = [int(sample_id) for sample_id in comma_separated_sample_ids.split(",")]
-            exported_data = self.index.getExportData(target_sample_ids, compress_data=compress_data)
-        resp.data = jsonify({"status": "successful", "data": exported_data})
+            self._respond_export(req, resp, "on_get_export_selection", target_sample_ids)
+            return
+        resp.data = jsonify({"status": "successful", "data": {}})
         db_log_msg(self.index, req, "StatusResource.on_get_export_selection - success.")
 
     @timing
@@ -68,8 +74,20 @@ class StatusResource:
             resp.status = falcon.HTTP_400
             db_log_msg(self.index, req, "StatusResource.on_post_import - failed - no POST body.")
             return
-        import_data = json.loads(req.stream.read())
-        import_report = self.index.addImportData(import_data)
+        try:
+            try:
+                import_data = json.loads(req.stream.read())
+            except (ValueError, RecursionError) as error:
+                # JSONDecodeError and UnicodeDecodeError are ValueErrors; a RecursionError is JSON nested too deeply
+                raise ImportRejected(f"body is no JSON export ({type(error).__name__}: {error})") from error
+            import_report = self.index.addImportData(import_data)
+        except ImportRejected as error:
+            # a body that is no JSON, or an export of another version or configuration, or one that
+            # cannot be read; any other error of an import, a failed insert say, is the server's
+            resp.data = jsonify({"status": "failed", "data": {"message": f"Import rejected: {error}"}})
+            resp.status = falcon.HTTP_400
+            db_log_msg(self.index, req, "StatusResource.on_post_import - failed - import rejected.")
+            return
         resp.data = jsonify({"status": "successful", "data": import_report})
         db_log_msg(self.index, req, "StatusResource.on_post_import - success.")
         return

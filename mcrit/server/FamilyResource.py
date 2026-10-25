@@ -88,9 +88,15 @@ class FamilyResource:
             actors = information_update["actors"]
             if isinstance(actors, str):
                 actors = [actor for actor in actors.split(",")]
-            if not isinstance(actors, list) or not all(FamilyEntry.isValidActor(actor) for actor in actors):
+            # the cap counts the names stored, each once
+            if not isinstance(actors, list) or not all(FamilyEntry.isValidActor(actor) for actor in actors) or len(FamilyEntry.normalizeActors(actors)) > FamilyEntry.MAX_ACTORS:
                 resp.data = jsonify(
-                    {"status": "failed", "data": {"message": "actors must be a list of 1-64 character names (letters, digits, spaces, dots, dashes, underscores)."}}
+                    {
+                        "status": "failed",
+                        "data": {
+                            "message": f"actors must be a list of at most {FamilyEntry.MAX_ACTORS} names of 1-64 characters (letters, digits, spaces, dots, dashes, underscores)."
+                        },
+                    }
                 )
                 db_log_msg(self.index, req, "FamilyResource.on_put - failed - actors malformed.")
                 return

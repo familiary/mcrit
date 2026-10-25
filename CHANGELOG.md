@@ -15,6 +15,303 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Security
+
+- **A cross compare takes every sample it names once, and at most 1,000 of them.** With
+  `sample_group_only=true` each child job held the functions and disassembly of every other sample
+  named at once, a repeated id once per repetition: naming a sample of 1,000 functions 40 times in a
+  103-byte path made one child hold 41,000 function entries for +495 MiB. Repeated ids are now
+  dropped before the child jobs are made, and a vs-group child reads the other samples one at a time
+  without their disassembly, keeping their function ids and the functions sharing a PicHash with its
+  own. Reports are unchanged. The id list was bounded only by the length of a URL; more than 1,000
+  distinct samples (`MAX_CROSS_COMPARE_SAMPLES` in `mcrit.index.MinHashIndex`) now answer 400.
+
+- **The plain `mcrit worker` stops a matching or unique-blocks job after `QUEUE_WORKER_JOB_TIMEOUT`
+  seconds** (default 3600, `0` for no limit). Its heartbeat kept a job claimed however long it ran,
+  so a job a request can make long held the worker as long. The matching jobs (sample, vs, vs-group,
+  cross, query) and unique blocks now fail after the limit and are retried like any failing job, up
+  to `QUEUE_MAX_ATTEMPTS` times, as a `spawningworker` job process is after
+  `QUEUE_SPAWNINGWORKER_CHILDREN_TIMEOUT`. They only read the index. Binary submission and the
+  minhash updates are not timed, as an interruption between storing a function's minhash and its band
+  postings would leave it out of fuzzy matching with nothing to repair it, and neither is corpus
+  maintenance (`rebuild*`, `recalculate*`, `repair*`, `doDbCleanup`, deletions, modifications), which
+  takes as long as the corpus is large. Needs `SIGALRM` (POSIX) and the worker in the main thread;
+  otherwise it warns and runs unbounded.
+
+- **A unique-blocks request with a large `covers_required` no longer holds a worker for hours.**
+  When `covers_required` is more than the blocks can reach, the greedy cover selects every unique
+  block, rescanning and resorting all of them, with a list lookup against those already selected,
+  for each one: cubic in the number of blocks. `GET
+  /uniqueblocks/samples/{id}?covers_required=1000000000` for 2,000 unique blocks took 33 s against
+  0.07 s at the default 10. The cover now keeps its candidates in a heap and re-scores only the one
+  on top; it selects the same blocks in the same order, so results and `RESULTS_VERSION` are
+  unchanged.
+
+- **A full band posting list no longer drops whole samples from the index.** Without
+  `STORAGE_BAND_BUCKET_SIZE` a band hash is one document, which MongoDB refuses to grow past 16 MiB
+  (about 1.35 million function ids). Copies of one function share all their band hashes, so a
+  function submitted over and over fills them. Each later sample holding that function then failed
+  its minhash job at the first full band with every band after it left unwritten, and the job's
+  retry found the minhashes stored and stamped the sample as indexed. The refused postings are now
+  left out, with an entry in the `error` collection and a warning naming the band and the hash, and
+  the rest of the sample is indexed. A function holding a full hash is still not found through that
+  band; `STORAGE_BAND_BUCKET_SIZE` lifts the cap (docs/TUNING.md). Main already has the bucketing,
+  off by default, so the default is unchanged.
+
+- **`STORAGE_MAX_EXPORT_SIZE` bounds what an export holds.** The cap counted the JSON size of each
+  sample's function entries, while `GET /export` held them as Python objects, loaded a sample's
+  functions all at once, left family names and actors uncounted, and for `compress=true` counted
+  only the compressed text: an uncompressed export held about 11 times the bytes it counted (346 MiB against 32.3 MB on 360 samples), and `GET /export/{ids}` answered
+  500 past the cap. Both routes now read a sample's functions 1,000 at a time
+  (`getFunctionsBySampleIdInBatches`), keep only the entries' JSON text, count all of it before
+  keeping it and send it as it is. Past the cap both routes answer `{"status": "failed"}`. The
+  response is the same JSON; `MinHashIndex.getExportData()` still returns Python objects,
+  `getExportJson()` the text.
+
+- **A cross compare of about a thousand samples that share no code failed in its last step.**
+  `MatcherCross` ordered the clustering tree with one recursive call per tree level, and samples
+  that share no code cluster into a chain as deep as there are samples, so `combineMatchesToCross`
+  raised `RecursionError` at Python's default limit, leaving the result `null`. The tree is now
+  walked with an explicit stack in the same order, so every cross compare that finished before
+  yields the same result.
+### Fixed
+
+- **`POST /import` answers 400 for an export it refuses, and stores nothing of it (#266).** An
+  export of another shingler or MinHash configuration, or of a version that is too old, was answered
+  with 200 and `data: null`, which a client could not tell from success (`McritClient` with
+  `raise_client_errors=True` now raises `McritBadRequest` where it returned `None`). A missing or
+  non-text version was a 500, and any text sorting above `"0.0.0"` was accepted, `latest` and
+  `0.0.0rc1` included, because versions were compared as strings; they are now compared by PEP 440
+  ordering. All of these are answered with 400 ("Import rejected: ..."), as is an export whose
+  structure cannot be read: a section missing or no mapping; a sample, present here already or not,
+  whose architecture is neither text nor null; a field missing from the entry of a sample to be
+  stored, or its `is_library` not a boolean; a family id that is no number, or that names two
+  families; a family name other than text or null; family actors that are not a list; a function
+  whose pichash is no number; content that does not inflate (corrupt, truncated, encrypted) or
+  parse; JSON nested too deeply. A refused export stores nothing, its families included, which a
+  malformed export used to leave behind. A sample's stated number of functions is only reported back
+  as skipped, and one that is missing or no count is read as 0. Function fields are checked only as
+  far as building the entries needs, so some malformed ones still fail while storing, with a 500.
+  `MinHashIndex.addImportData` raises `ImportRejected`, a `ValueError`, where it returned `None`.
+
+- **`POST /import`: what an accepted export changes.** A sample whose family the export names null,
+  as older versions export a report without a family, used to land in a family named null and now
+  goes to the default family. An error while storing, a failed MongoDB insert say, is still a 500
+  and as before removes the samples the import had added, but may leave the families it added for
+  them. The actors of families the import found are merged last and only once everything else is
+  stored, so a failure no longer changes them, and an error merging them is logged rather than
+  failing an import that is otherwise complete.
+
+- **A failed `POST /import` could leave the samples it removed in the function ranges and PicHash
+  counts.** On MongoDB, `discardImportedSample`, which rolls back an import that failed after
+  storing its functions, deleted the functions but neither their function ranges nor their PicHash
+  counts. Those were left behind when the failure came after they were written - the ranges are
+  the last index an import writes, and the counts came just before them - so a range could name a
+  sample that was gone and a hash stay counted too often until `rebuildPicHashCountIndex` ran. Both
+  are now taken out with the functions. The PicHashes of imported functions are counted right after
+  the insert, so that the rollback takes out only what was counted; where functions may be stored
+  without being counted (the counting failed, or removing what a failed insert wrote did), the
+  count index is marked for its rebuild and the rollback leaves the counts alone. Functions whose
+  PicHashes could not be counted are also removed before the import fails: no family has counted
+  them yet, and the rollback would have lowered their family by them. The rollback also lowers the
+  family function counters by the functions it finds stored; on either storage, a counter update
+  that failed left functions stored that their family had not counted, which the rollback then took
+  off it. On MongoDB the import now removes the functions with their PicHash counts before failing,
+  and then takes back the families it had counted; memory storage counts each function before
+  storing it. Every family then keeps its counters, unless removing the functions fails as well: the
+  families counted stay raised for the rollback to lower, while the family whose counter failed is
+  lowered by functions it never counted, until `POST /recompute_family_stats` runs.
+
+- **Memory storage: deleting a sample left its PicHashes behind.** `deleteSample` and
+  `discardImportedSample` emptied a PicHash's set of matches but kept the key, so `isPicHash` stayed
+  true and `num_pichashes` counted hashes no function carried. The key is now removed with its last
+  match. MongoDB storage is not affected.
+
+- **Memory storage: `/rebuild_index` held every MinHash of the corpus in one list.** The bands are
+  now rebuilt one work package at a time, with the same result, and the progress total is exactly
+  the number of work packages (it was one too many when the count divided evenly).
+
+### Security
+
+- A sample whose SMDA report had no timestamp (missing or empty) was stored, but reading it back
+  failed, so the sample listing, the sample itself, its family with samples, the export and every
+  matching job that reached it answered with an error, and the sample could not be deleted through
+  the API. A stored timestamp that cannot be read is now treated as no timestamp. Samples stored
+  earlier read back the same way, without a migration.
+
+- A sample whose SMDA report had no `statistics` was stored in full before submitting it failed with
+  a server error, and from then on every matching job that found a match in it failed with
+  `KeyError: 'num_functions'`. The family counters now count the functions that were stored instead
+  of the figure the report states, the matchers count a sample's functions when its statistics hold
+  none, and importing an export that holds such a sample works.
+
+- The function counter of a family could be set to any value by a report's
+  `statistics.num_functions`; a very large claim saturated it, after which every later report into
+  that family was stored without being counted or hashed. A family now counts the functions that
+  were actually stored, for submitted reports as well as for imports (the sample is counted when its
+  entry is imported and its functions as they are imported). A counter that is already off stays
+  so until `POST /recompute_family_stats` resets it from the stored functions.
+
+- A function in a submitted report whose offset is not one of its blocks, or an AArch64 prologue
+  with an operand such as `#-010`, made the fuzzy shingler raise, which failed every minhash batch
+  holding it (including `complete_minhashes`, `repair_minhashes` and `recalculate_minhashes`, the
+  last after it had already dropped all hashes). The shingler now treats such a function as having
+  no stack frame. A function the shinglers still fail on no longer fails its batch, see below.
+
+- The `sha256` of a submitted SMDA report is now checked to be 64 hex digits; anything else
+  (including a JSON object, which MongoDB read as a query operator and resolved to an existing
+  sample) is answered with 400 and nothing is stored. A report smda refuses as malformed is also
+  answered with 400 instead of a server error.
+
+- A function in a submitted report whose `pic_hash` is not an unsigned 64-bit integer is now
+  answered with 400 and nothing of the report is stored. Before, the in-memory storage stored -1,
+  2**64, 1.5, strings and booleans as they came, and a PicHash like `{"$ne": 0}` or `[1]` failed
+  with a 500 after the sample had already been partly stored.
+
+- Functions whose report carries no PicHash are stored with PicHash 0. The vs and vs-group matchers
+  and the MongoDB sample matching treated 0 as a hash like any other and reported every such
+  function as an exact match of every other one; the in-memory storage failed sample matching, and
+  moving such a sample or its family to another family, with `KeyError: 0`. On MongoDB, a query for
+  PicHash `0000000000000000` answered with every such function. A PicHash of 0 now never matches.
+  Cached matching results from before are recomputed on their next request.
+
+- `POST /import` no longer attaches functions to a sample it did not create. An export entry whose
+  own `sha256` differed from its key, or named a sample already present (including one added by a
+  second import running at the same time), was reported as imported and its functions were stored
+  under the sample id of the exporting instance, on whatever local sample held that id or on none.
+  `importSampleEntry` now returns None for a known sha256, as its interface documents, and the
+  import skips such a sample together with its functions and counts it as skipped. Functions
+  attached by earlier imports are not detached; a sample whose `statistics.num_functions` is lower
+  than its number of functions is worth checking.
+
+- `POST /import` drops imported minhashes whose length is not the configured signature length. Such
+  a minhash used to be stored and banded next to the code it was copied from, and every matching job
+  that drew it as a candidate then failed. The function is still imported, without a minhash, and a
+  minhash repair computes it again. Minhashes of a wrong length stored by earlier imports keep
+  failing matching jobs until `/repair_minhashes` rehashes their sample, if it has disassembly.
+
+- The band projection for the `random` band strategy is derived from the configured signature length
+  instead of from the first minhash a process happens to band. An imported minhash of another length
+  could previously change the band hashes of everything that process wrote afterwards, or make every
+  later banding fail. For correctly configured instances the projection is unchanged.
+
+- A single function that cannot be minhashed no longer fails every batch holding it, on every run.
+  That is one smda cannot rebuild from its stored disassembly (for example an imported `xcfg`
+  holding only an offset), which failed `/complete_minhashes`, `/repair_minhashes`,
+  `/recalculate_minhashes` and `/recalculate_pichashes`, or one the shinglers fail on, from a
+  submitted report or an import, which failed the three minhash jobs, the last of them,
+  `/recalculate_minhashes`, after it had already dropped all hashes. Such a function is skipped and
+  stays unhashed, with a warning naming it, like one without disassembly, and the rest of its batch
+  is hashed.
+  `/recalculate_pichashes` does not stamp its sample as rehashed. `/repair_minhashes` leaves a
+  sample with such a function alone, keeping its minhashes and its stale mark, and counts it as
+  skipped. `/recalculate_minhashes` does not record such a sample as current, so a later repair
+  tries it again.
+
+- Deleting a sample or family, and `/repair_minhashes`, no longer fail on a stored minhash shorter
+  than the configured signature (or not a whole number of entries), as an earlier import could have
+  stored. It never had band entries and is skipped with a warning; before, the sample could not be
+  deleted through the API and every repair run stopped at it.
+
+- `/rebuild_index` no longer stops half way after having emptied the band collections when it meets
+  a function without a minhash field or with a minhash of the wrong length. Those functions are left
+  out with a warning and the rest is indexed.
+
+- `POST /import` limits what it decompresses. Compressed sample content is accepted only as deflate
+  (or stored) data and only up to 20 times its encoded size, or 8 MiB if that is more; anything
+  else is answered with 400 instead of growing the server by gigabytes. Exports of the live corpus
+  inflate to 4 times their encoded size at the median and 11.6 at most. A body that is not JSON is
+  now answered with 400 instead of 500. An export that compresses better than that has to be
+  imported uncompressed. The whole export is read before any sample is stored, so a refused import
+  leaves no sample or function behind.
+
+- A family is attributed to at most 64 actors. `PUT /families/{id}` answers 400 for a longer list,
+  and an import or a family rename that merges into another family adds the first actors that fit
+  and logs a warning for the rest. Deduplication of actor names now takes linear time instead of
+  quadratic. Families already holding more actors keep them.
+
+### Changed
+
+- **`POST /samples/binary` refuses `is_dump`, `bitness` and `base_addr` values it used to misread.**
+  `is_dump=yes` was read as false, so a dump was disassembled as an unmapped file; `bitness=16`
+  became 32 and an unparsable `base_addr` became 0, each without a word. They are now answered with
+  400 and nothing is enqueued. `is_dump` takes `true`/`True`/`1` or `false`/`False`/`0`, `bitness`
+  32 or 64, `base_addr` a hexadecimal address from 0 to 2**64 - 1, and a blank value (`is_dump=`)
+  still means the parameter is absent. A `filename` longer than 255 characters, a `family` or
+  `version` longer than 64, or any of them with a control character (a newline, a tab, a NUL, an
+  escape sequence) or a line separator, is refused the same way; other characters, spaces and
+  non-ASCII included, are stored as given, as before. A client that sent such a value and got a
+  sample anyway now has to correct it.
+
+### Added
+
+- **Four opt-in options for the unique-blocks cover** ([#283]), the other directions the issue
+  proposes, so they can be evaluated against the current cover before any of them becomes a default.
+  All are off by default and leave the cover unchanged unless given. `gentle_length_score` lets
+  blocks past 11 instructions lose length score as 11 / length rather than 1 / (length - 10): a
+  12-instruction block's length score is about 92 instead of 50, so it no longer ranks below a
+  4-instruction block (57). `max_blocks_per_function` caps how many blocks one function of one
+  sample adds to the cover. `demote_generic_blocks` ranks function exits (a block ending in a return
+  that only restores registers and the stack, calls, checks the stack cookie or sets the return
+  value to zero, -1, a flag, a register, a small constant or a local) and blocks that are at least
+  half wildcards behind every other block reaching as many samples; the heuristic is Intel-centric.
+  `exclude_picblockhashes` is a negative set, for siblings that are not in the index: it goes in the
+  body of a POST to either `/uniqueblocks` route, the job stores it as a file rather than in its
+  arguments, and `mcrit.storage.UniqueBlocksResult.picBlockHashesOfReport` computes it from an SMDA
+  report locally. The first three are query parameters on both routes, all four are arguments of
+  `McritClient.requestUniqueBlocksForSamples` and `requestUniqueBlocksForFamily`, and the result's
+  statistics always echo the first three, even when off, and count the blocks the negative set
+  removed. Over the REST API and `McritClient`, an empty negative set and a cap of 0 make the same
+  job as leaving them out. `UniqueBlocksResult.generateBlockCover` takes the cap and the demotion
+  from those statistics, so given the job's `covers_required` and no size filters, the rule MCRITweb
+  renders is the one the job picked.
+
+### Changed
+
+- **`UniqueBlocksResult.generateBlockCover` no longer rescans every block after each pick**
+  ([#283]). It now uses the same cover as `Worker.getUniqueBlocks`, which keeps the blocks in a heap
+  by how many samples each reached when last checked, a count that only shrinks, and rechecks only
+  the block on top until its count is current. It picks the same cover, faster the more blocks it
+  picks: with `covers_required=10`, 20,000 blocks over 50 samples take about 0.1 s instead of 2 s
+  when each reaches 1 to 3 of them, and 0.06 s instead of 0.4 s when they reach up to all 50.
+
+### Fixed
+
+- **The unique-blocks cover broke score ties by dict order** ([#283]). A block's score is 80% the
+  samples it covers and 20% its length, and with one input sample every unique block of 7 to 11
+  instructions scores exactly 100.0. Among those the cover took whichever the storage happened to
+  return last. Ties are now broken by how many hex digits of the block's YARA string are fixed,
+  wildcards not counted, and then by the lowest picblockhash, in both `Worker.getUniqueBlocks` and
+  `UniqueBlocksResult.generateBlockCover`. The same input now always gives the same cover. Scores,
+  the length scoring and every default are unchanged. This prefers longer fixed patterns, not
+  necessarily more distinctive ones: whether it makes rules better, and whether any of the issue's
+  other directions, opt-in above, should become a default, still need the evaluation the issue
+  proposes. `RESULTS_VERSION` is now 3, and since every report job is keyed on it, cached match and
+  unique-blocks reports alike are recomputed once on their next request.
+- **On MongoDB, a unique block found in several functions was represented by whichever one the
+  query answered first** ([#283]). It now takes the lowest `function_id`, as memory storage did, so
+  its function, sample and offset, and with `max_blocks_per_function` the cover, no longer depend
+  on document order.
+- **A unique-blocks job for samples listed its first option as its family** ([#283]).
+  `Job.family_id` read the job's second argument, which for a samples request is whichever option
+  came first, such as `covers_required`; it now reads `family_id` by name.
+- **`UniqueBlocksResult.generateBlockCover` stopped after one block for `required_per_sample=0`**
+  ([#283]). It now clamps it to 1, as `Worker.getUniqueBlocks` already did with `covers_required`,
+  and answers the same 1-of-1 cover as the job.
+- **A unique-blocks job's progress overshot 100% on MongoDB and stayed at 0% on memory storage.**
+  On MongoDB it jumped to 100% once the candidates were eliminated and could then read 200%, or
+  far more after the full scan that an instance without the picblockhash index falls back to; on
+  memory storage it stayed at 0% until the end. Each phase now fills a fixed share, so progress only
+  grows and ends at 100%. A terminated job used to be noticed only at the end, and on MongoDB also
+  during that scan and after the elimination. It is now also noticed at each phase boundary and
+  while the Worker builds the blocks' escaped byte strings. On MongoDB, storage also checks while it
+  collects, eliminates (with the index, once per 20,000 candidates) and scores the candidates, and
+  while it extracts their instructions.
+- **`McritClient.requestUniqueBlocksForSamples` and `requestUniqueBlocksForFamily` ignored
+  `raw_responses`** and answered the parsed job id; they now answer the `requests.Response`, as most
+  other request methods do. A caller that set `raw_responses` but took the job id from these two
+  methods' answers now has to read it from the response.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct
@@ -1531,3 +1828,4 @@ date, the version, and what changed.
 [#57]: https://github.com/danielplohmann/mcrit/issues/57
 [#68]: https://github.com/danielplohmann/mcrit/issues/68
 [#95]: https://github.com/danielplohmann/mcrit/issues/95
+[#283]: https://github.com/danielplohmann/mcrit/issues/283

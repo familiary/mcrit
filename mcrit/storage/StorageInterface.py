@@ -1,7 +1,8 @@
 import datetime
 import logging
 import random
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Protocol, Set, Tuple, Union
+import re
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Protocol, Set, Tuple, Union
 
 from packaging import version
 
@@ -43,6 +44,14 @@ BAND_DF_REFERENCE_CUTOFFS = (50, 100, 200, 500, 1000)
 # The largest cutoff a coverage report can be asked about: it is compared against df inside a
 # MongoDB aggregation, and BSON integers are signed 64-bit, so a larger one cannot be encoded.
 BAND_DF_CUTOFF_MAX = 2**63 - 1
+
+
+_SHA256_PATTERN = re.compile("[0-9a-fA-F]{64}")
+
+
+def isSha256(value) -> bool:
+    """Whether value has the shape of a SHA256, 64 hex digits"""
+    return isinstance(value, str) and _SHA256_PATTERN.fullmatch(value) is not None
 
 
 class BinaryStream(Protocol):
@@ -168,6 +177,19 @@ class StorageInterface:
         """
         raise NotImplementedError
 
+    def getPresentSha256s(self, sha256s: Iterable[str]) -> Set[str]:
+        """Which of the given SHA256 values a stored sample (not a query sample) has, in as few round
+        trips as the storage allows - an import checks every sample of an export at once.
+
+        Args:
+            sha256s: The SHA256 values to look up. Any that is not 64 hex digits matches nothing and
+                is not looked up, so that no value can make a lookup too large to send.
+
+        Returns:
+            The subset of sha256s that samples are stored under.
+        """
+        raise NotImplementedError
+
     def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False) -> Optional["SampleEntry"]:
         """Add a SMDA report to storage to create its sample representation and return corresponding SampleEntry object.
         This also adds the sample's functions. If the sample's family is not in storage yet, it will be added.
@@ -213,7 +235,7 @@ class StorageInterface:
         raise NotImplementedError
 
     def discardImportedSample(self, sample_entry: "SampleEntry") -> None:
-        """Undo importSampleEntry for an import that failed: the sample, the functions it got, and its family counters.
+        """Undo importSampleEntry for an import that failed: the sample, the functions it got, the indexes they were added to, and its family counters.
 
         Args:
             sample_entry: the entry importSampleEntry returned
@@ -407,14 +429,29 @@ class StorageInterface:
         assert smda_report is not None
         return RebuiltSmdaReport(smda_report, extras_missing=smda_extras is None, num_functions_without_disassembly=num_functions_without_disassembly)
 
-    def getFunctionsBySampleId(self, sample_id: int) -> Optional[List["FunctionEntry"]]:
+    def getFunctionsBySampleId(self, sample_id: int, with_xcfg: bool = True) -> Optional[List["FunctionEntry"]]:
         """For a given sample_id, get all corresponding FunctionEntries.
 
         Args:
             sample_id: a sample_id
+            with_xcfg: False leaves each entry's disassembly (xcfg) out - most of what a function
+                weighs, and nothing matching reads
 
         Returns:
             A list of FunctionEntries or None, if sample_id does not exist
+        """
+        raise NotImplementedError
+
+    def getFunctionsBySampleIdInBatches(self, sample_id: int, batch_size: int = 1000) -> Iterator[List["FunctionEntry"]]:
+        """getFunctionsBySampleId one batch at a time, for a caller that should not hold all entries of a large sample at
+        once (the export).
+
+        Args:
+            sample_id: a sample_id
+            batch_size: the number of FunctionEntries per batch
+
+        Returns:
+            An iterator over lists of FunctionEntries, empty if sample_id does not exist
         """
         raise NotImplementedError
 
@@ -700,17 +737,17 @@ class StorageInterface:
         """
         raise NotImplementedError
 
-    # TODO can this happen, that the Function has no pichash?
-    # TODO Maybe remove this function, or restore original behavior?
-    # -> Dict[pichash, Set[Tuple[sample_id, function_id]]]
+    # -> Dict[pichash, Set[Tuple[family_id, sample_id, function_id]]]
     def getPicHashMatchesByFunctionId(self, function_id: int) -> Optional[Dict[int, Set[Tuple[int, int, int]]]]:
-        """Get the PicHash for a given function_id and also return all other sample_id/function_id pairs having the same PicHash
+        """Get the PicHash for a given function_id and also return all functions having the same PicHash
 
         Args:
             function_id: the function id for PicHash matching
 
         Returns:
-            None if the function_id does not exist, or does not have a pichash. Otherwise a dict containing the functions pichash as key and the following value: a set of (sample_id, function_id) having the given pichash
+            None if the function_id does not exist, or does not have a pichash (a function whose report
+            carried none is stored with 0). Otherwise a dict containing the functions pichash as key and
+            the following value: a set of (family_id, sample_id, function_id) having the given pichash
         """
         raise NotImplementedError
 
@@ -838,7 +875,8 @@ class StorageInterface:
 
         Args:
             sample_ids: a list of sample_ids
-            progress_reporter: (optional) might be passed by worker to inquiry progress of this DB only operation
+            progress_reporter: (optional) a UniqueBlocksProgressReporter, as Worker.getUniqueBlocks passes
+                it, whose phases this fills, or any reporter with set_total, step and poll
 
         Returns:
             a dictionary with the isolated blocks
@@ -1175,9 +1213,11 @@ class StorageInterface:
         raise NotImplementedError
 
     def createBandhashProjection(self, minhash):
-        """Calculate a projection for index permutation based on a given minhash
+        """Calculate a projection for index permutation from the configuration
         Args:
-            minhash: the MinHash used as reference
+            minhash: unused - the projection depends on the configuration alone. It used to be drawn
+                from the length of this minhash, so whichever minhash a process banded first (an
+                imported one included) decided the band keys of every later one.
         Returns:
             a dict containing signature indices used for bandhashing by band id
         """
@@ -1188,7 +1228,7 @@ class StorageInterface:
             band_index = 0
             for band_size, num_bands in self._storage_config.STORAGE_BANDS.items():
                 for _ in range(num_bands):
-                    index_sequence = [index for index in range(len(minhash.getMinHashInt()))]
+                    index_sequence = [index for index in range(self._minhash_config.MINHASH_SIGNATURE_LENGTH)]
                     random.shuffle(index_sequence)
                     band_projection[band_index] = index_sequence[:band_size]
                     band_index += 1
@@ -1258,3 +1298,10 @@ class StorageInterface:
             hashed_band_data = MinHash.hashData(band_data, 0)
             band_hashes[band_index] = hashed_band_data
         return band_hashes
+
+    def _hasBandableLength(self, minhash_bytes: bytes) -> bool:
+        """Whether a stored minhash can have band entries. Imports stored minhashes unchecked, and one
+        shorter than the configured signature, or not a whole number of >8-bit entries, never had any:
+        reading or banding it raises, so deleting or repairing its sample has to skip it."""
+        entry_size = 1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4
+        return len(minhash_bytes) % entry_size == 0 and len(minhash_bytes) >= entry_size * self._minhash_config.MINHASH_SIGNATURE_LENGTH

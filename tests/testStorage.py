@@ -2,11 +2,13 @@ import hashlib
 import json
 import logging
 import os
+from copy import deepcopy
 from unittest import TestCase, main
 from unittest.mock import patch
 
 import pytest
 from bson import encode as bson_encode
+from pymongo.collection import Collection
 from smda.common.SmdaReport import SmdaReport
 
 from mcrit.config.McritConfig import McritConfig
@@ -41,7 +43,7 @@ def buildMongoStorageConfig(dbname):
     )
 
 
-class MemoryStorageTest(TestCase):
+class _MemoryStorageFixture:
     def setUp(self):
         self._storage_config = StorageConfig(
             STORAGE_METHOD=StorageFactory.STORAGE_METHOD_MEMORY,
@@ -63,6 +65,18 @@ class MemoryStorageTest(TestCase):
     def tearDown(self):
         self.storage.clearStorage()
 
+    def _twoReports(self, family="family_1"):
+        with open(self.example_file_path) as fjson:
+            smda_json = json.load(fjson)
+        report_a = SmdaReport.fromDict(smda_json)
+        report_b = SmdaReport.fromDict(smda_json)
+        assert report_a is not None and report_b is not None
+        report_a.family = report_b.family = family
+        report_b.sha256 = 64 * "b"
+        return report_a, report_b
+
+
+class MemoryStorageTest(_MemoryStorageFixture, TestCase):
     def testBasicStorageUsage(self):
         self.storage.clearStorage()
         smda_report = SmdaReport.fromFile(self.example_file_path)
@@ -77,6 +91,104 @@ class MemoryStorageTest(TestCase):
         self.assertEqual(1, stats_without_pichash["num_samples"])
         self.assertEqual(10, stats_without_pichash["num_functions"])
         self.assertIsNone(stats_without_pichash["num_pichashes"])
+
+    def testDeletingSamplesDropsPicHashesOnlyWithTheirLastFunction(self):
+        report_a, report_b = self._twoReports()
+        # one function of the second sample differs, so the first holds a PicHash the second does not
+        next(iter(report_b.xcfg.values())).pic_hash = 12345
+        sample_a = self.storage.addSmdaReport(report_a)
+        sample_b = self.storage.addSmdaReport(report_b)
+        assert sample_a is not None and sample_b is not None
+        hashes_a = {entry.pichash for entry in self.storage.getFunctionsBySampleId(sample_a.sample_id) or []}
+        hashes_b = {entry.pichash for entry in self.storage.getFunctionsBySampleId(sample_b.sample_id) or []}
+        self.assertEqual(1, len(hashes_a - hashes_b))
+        self.assertIn(12345, hashes_b - hashes_a)
+        self.assertTrue(self.storage.deleteSample(sample_a.sample_id))
+        for pichash in hashes_b:
+            self.assertTrue(self.storage.isPicHash(pichash))
+            self.assertEqual(1, len(self.storage.getMatchesForPicHash(pichash)))
+        for pichash in hashes_a - hashes_b:
+            self.assertFalse(self.storage.isPicHash(pichash))
+        self.assertEqual(len(hashes_b), self.storage.getStats()["num_pichashes"])
+        self.assertTrue(self.storage.deleteSample(sample_b.sample_id))
+        self.assertFalse(self.storage.isPicHash(12345))
+        self.assertEqual(0, self.storage.getStats()["num_pichashes"])
+
+    def testDiscardingAnImportedSampleRemovesItsLastPicHashReferences(self):
+        report_a, report_b = self._twoReports()
+        sample_a = self.storage.addSmdaReport(report_a)
+        sample_b = self.storage.addSmdaReport(report_b)
+        assert sample_a is not None and sample_b is not None
+        self.storage.discardImportedSample(sample_a)
+        self.assertEqual(10, self.storage.getStats()["num_pichashes"])
+        self.storage.discardImportedSample(sample_b)
+        self.assertEqual(0, self.storage.getStats()["num_pichashes"])
+
+    def _storeASampleAndAnotherFamily(self):
+        report_a, _ = self._twoReports()
+        source = self.storage.addSmdaReport(report_a)
+        assert source is not None
+        return source, self.storage.addFamily("family_2")
+
+    def _importTwoSampleEntries(self, source, other_family_id):
+        """The stored sample imported twice under new sha256s, once in its own family and once in the
+        other, with its functions ready for importFunctionEntries - as addImportData has them at that
+        point. Returns the imported entries and the function entries."""
+        imported, function_entries = [], []
+        for sha256, family_id in (("c" * 64, source.family_id), ("d" * 64, other_family_id)):
+            sample_entry = deepcopy(self.storage.getSampleById(source.sample_id))
+            sample_entry.sha256, sample_entry.family_id = sha256, family_id
+            imported_entry = self.storage.importSampleEntry(sample_entry)
+            assert imported_entry is not None
+            imported.append(imported_entry)
+            for function_entry in deepcopy(self.storage.getFunctionsBySampleId(source.sample_id)):
+                function_entry.sample_id, function_entry.family_id = imported_entry.sample_id, family_id
+                function_entries.append(function_entry)
+        return imported, function_entries
+
+    def _failingForFamily(self, failing_family_id):
+        update_family_stats = self.storage._updateFamilyStats
+
+        def updateFamilyStats(family_id, num_samples_inc, num_functions_inc, num_library_samples_inc):
+            if family_id == failing_family_id and num_functions_inc > 0:
+                raise RuntimeError("connection lost")
+            update_family_stats(family_id, num_samples_inc, num_functions_inc, num_library_samples_inc)
+
+        return patch.object(self.storage, "_updateFamilyStats", side_effect=updateFamilyStats)
+
+    def _familyCounters(self):
+        counters = {}
+        for family_id in self.storage.getFamilyIds():
+            family_entry = self.storage.getFamily(family_id)
+            counters[family_id] = (family_entry.num_samples, family_entry.num_functions, family_entry.num_library_samples)
+        return counters
+
+    def _picHashCountDocuments(self):
+        # only MongoDB storage keeps a pichash count index
+        if not isinstance(self.storage, MongoDbStorage):
+            return None
+        collection = self.storage._getDb()[self.storage._PICHASH_COUNT_COLLECTION]
+        return sorted((document["_pichash"], document["df"]) for document in collection.find({}, {"_id": 0}))
+
+    def testAFailedFamilyCountLeavesEveryFamilyAsItWasAfterTheDiscard(self):
+        # an import of two samples in two families, whose second family's function counter fails
+        # after the first one's was raised: the import is rolled back sample by sample, and each
+        # discard takes off the functions it finds stored, so those must be exactly the ones counted
+        self.storage.clearStorage()
+        source, other_family_id = self._storeASampleAndAnotherFamily()
+        families_before, counts_before, stats_before = self._familyCounters(), self._picHashCountDocuments(), self.storage.getStats()
+        imported, function_entries = self._importTwoSampleEntries(source, other_family_id)
+
+        with self._failingForFamily(other_family_id):
+            with self.assertRaises(RuntimeError):
+                self.storage.importFunctionEntries(function_entries)
+        for imported_entry in imported:
+            self.storage.discardImportedSample(imported_entry)
+
+        self.assertEqual(families_before, self._familyCounters())
+        self.assertEqual(counts_before, self._picHashCountDocuments())
+        stats_after = self.storage.getStats()
+        self.assertEqual((stats_before["num_samples"], stats_before["num_functions"]), (stats_after["num_samples"], stats_after["num_functions"]))
 
     def testModifyFunction(self):
         # fkie-cad/mcritweb#72: a function's name can be set; the name is recorded as a label
@@ -289,16 +401,6 @@ class MemoryStorageTest(TestCase):
         assert entry_c is not None
         self.storage.clearStorage()
         self.assertIsNone(self.storage.getSmdaExtras(entry_c.sample_id))
-
-    def _twoReports(self, family="family_1"):
-        with open(self.example_file_path) as fjson:
-            smda_json = json.load(fjson)
-        report_a = SmdaReport.fromDict(smda_json)
-        report_b = SmdaReport.fromDict(smda_json)
-        assert report_a is not None and report_b is not None
-        report_a.family = report_b.family = family
-        report_b.sha256 = 64 * "b"
-        return report_a, report_b
 
     def _actualFamilyCounts(self, family_id):
         samples = [s for s in self.storage.getSamples(0, 1000) if s.family_id == family_id]
@@ -670,6 +772,21 @@ class MemoryStorageTest(TestCase):
         self.assertEqual(sample_entry.sample_id, self.storage.getSampleBySha256(smda_report.sha256).sample_id)
         self.assertEqual(None, self.storage.getSampleBySha256(64 * "0"))
 
+    def testGetPresentSha256s(self):
+        self.storage.clearStorage()
+        self.assertEqual(set(), self.storage.getPresentSha256s([]))
+        smda_report = SmdaReport.fromFile(self.example_file_path)
+        self.storage.addSmdaReport(smda_report)
+        absent = [f"{index:064x}" for index in range(25)]
+        self.assertEqual({smda_report.sha256}, self.storage.getPresentSha256s(absent + [smda_report.sha256, smda_report.sha256, 7]))
+        # only what can be a sha256 is looked up: keys this long took one $in query beyond 16 MB
+        self.assertEqual(set(), self.storage.getPresentSha256s(["x" * (9 * 1024 * 1024), "y" * (9 * 1024 * 1024), "zz" * 32]))
+        if isinstance(self.storage, MongoDbStorage):
+            # one query per chunk: 26 values in chunks of 10 take three
+            with patch.object(MongoDbStorage, "_PRESENT_SHA256S_CHUNK", 10), patch.object(Collection, "find", autospec=True, side_effect=Collection.find) as find:
+                self.assertEqual({smda_report.sha256}, self.storage.getPresentSha256s(absent + [smda_report.sha256]))
+            self.assertEqual(3, len([call for call in find.call_args_list if call.args[0].name == "samples"]))
+
     def testFunctionHandling(self):
         self.storage.clearStorage()
         # TODO use SmdaReport.fromFile
@@ -788,6 +905,33 @@ class MemoryStorageTest(TestCase):
         minhash_c = MinHash(function_id=1000, minhash_signature=[0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39], minhash_bits=8)
         candidates_after = self.storage.getCandidatesForMinHashes({1000: minhash_c})
         self.assertEqual(candidates, candidates_after)
+
+    def testRebuildMinhashBandIndexLeavesOutMinHashesOfAnotherLength(self):
+        """The rebuild empties every band first, so a stored minhash it cannot band - imports stored
+        them at any length - must not end it there, leaving the index empty on every run."""
+        self.storage.clearStorage()
+        smda_report = SmdaReport.fromFile(self.example_file_path)
+        assert smda_report is not None
+        self.storage.addSmdaReport(smda_report)
+        minhashes = [MinHash(function_id=function_id, minhash_signature=[0x30 + function_id + index for index in range(10)], minhash_bits=8) for function_id in [0, 2, 3, 5]]
+        self.storage.addMinHashes(minhashes)
+        # stored as an import does, without banding: one too short for the projection, one too long
+        odd_entries = []
+        for minhash_bytes in (bytes(3), bytes(range(11))):
+            function_entry = self.storage.getFunctionById(1)
+            assert function_entry is not None
+            function_entry.minhash = minhash_bytes
+            odd_entries.append(function_entry)
+        odd_entries = self.storage.importFunctionEntries(odd_entries)
+        assert odd_entries is not None
+
+        self.storage.rebuildMinhashBandIndex()
+
+        for minhash in minhashes:
+            self.assertIn(minhash.function_id, self.storage.getCandidatesForMinHash(minhash))
+        # the long one shares its first ten entries with this signature, and is not a candidate of it
+        candidates = self.storage.getCandidatesForMinHash(MinHash(function_id=1000, minhash_signature=list(range(10)), minhash_bits=8))
+        self.assertNotIn(odd_entries[1].function_id, candidates)
 
     def testMatchingCache(self):
         cache = self.storage.createMatchingCache([])
@@ -1023,6 +1167,53 @@ class MemoryStorageTest(TestCase):
         self.assertTrue(all(sample_id >= 0 for sample_id in self.storage._smda_extras))
 
 
+class MemoryStorageInternalsTest(_MemoryStorageFixture, TestCase):
+    """Implementation-specific checks that MongoDbStorageTest must not inherit."""
+
+    def testDeletingSamplesLeavesNoEmptyPicHashBuckets(self):
+        report_a, report_b = self._twoReports()
+        # zero means no PicHash and must never become a bucket, even after deletion
+        next(iter(report_b.xcfg.values())).pic_hash = 0
+        sample_a = self.storage.addSmdaReport(report_a)
+        sample_b = self.storage.addSmdaReport(report_b)
+        assert sample_a is not None and sample_b is not None
+        self.assertNotIn(0, self.storage._pichashes)
+        self.assertTrue(self.storage.deleteSample(sample_a.sample_id))
+        self.assertTrue(all(self.storage._pichashes.values()))
+        self.assertNotIn(0, self.storage._pichashes)
+        self.assertTrue(self.storage.deleteSample(sample_b.sample_id))
+        self.assertEqual({}, self.storage._pichashes)
+        self.assertFalse(self.storage.isPicHash(0))
+
+    def testRebuildMinhashBandIndexDecodesOneBatchAtATime(self):
+        report = SmdaReport.fromFile(self.example_file_path)
+        assert report is not None
+        self.storage.addSmdaReport(report)
+        minhashes = [MinHash(function_id=function_id, minhash_signature=[0x30 + function_id + index for index in range(10)], minhash_bits=8) for function_id in [0, 2, 3, 5, 7]]
+        self.storage.addMinHashes(minhashes)
+        self.storage._minhash_config.MINHASH_BAND_REBUILD_WORK_PACKAGE_SIZE = 2
+        events = []
+        original_decode = FunctionEntry.getMinHash
+        original_insert = self.storage._addMinHashToBands
+
+        def decode(entry, bits):
+            events.append("decode")
+            return original_decode(entry, bits)
+
+        def insert(minhash):
+            events.append("insert")
+            return original_insert(minhash)
+
+        with patch.object(FunctionEntry, "getMinHash", decode), patch.object(self.storage, "_addMinHashToBands", insert):
+            self.assertEqual(5, self.storage.rebuildMinhashBandIndex())
+        # The first insert must happen before a third signature is decoded.
+        self.assertEqual(["decode", "decode", "insert"], events[:3])
+        self.assertEqual(5, events.count("decode"))
+        self.assertEqual(5, events.count("insert"))
+        for minhash in minhashes:
+            self.assertIn(minhash.function_id, self.storage.getCandidatesForMinHash(minhash))
+
+
 @pytest.mark.mongo
 class MongoDbStorageTest(MemoryStorageTest):
     def setUp(self):
@@ -1040,6 +1231,66 @@ class MongoDbStorageTest(MemoryStorageTest):
         THIS_FILE_PATH = str(os.path.abspath(__file__))
         PROJECT_ROOT = str(os.path.abspath(os.sep.join([THIS_FILE_PATH, "..", ".."])))
         self.example_file_path = os.sep.join([PROJECT_ROOT, "tests", "example_report.smda"])
+
+    def testAFailedFamilyCountWhoseFunctionsCannotBeRemovedKeepsTheCountedFamiliesRaised(self):
+        # the second family's counter fails, and so does removing the functions: they stay stored, so
+        # the first family stays raised for the discard to take its functions off once - taken back
+        # here as well, the discard took them off a second time. The second family never counted
+        # its functions, which the discard cannot tell, so only the first is checked. The pichash
+        # counts were taken back from functions that stay stored, which only a rebuild sets right
+        self.storage.clearStorage()
+        source, other_family_id = self._storeASampleAndAnotherFamily()
+        family_before = self._familyCounters()[source.family_id]
+        imported, function_entries = self._importTwoSampleEntries(source, other_family_id)
+
+        with self._failingForFamily(other_family_id), patch.object(self.storage, "_discardFunctions", side_effect=RuntimeError("connection lost")):
+            with self.assertRaisesRegex(RuntimeError, "connection lost"):
+                self.storage.importFunctionEntries(function_entries)
+        self.assertFalse(self.storage.isPicHashCountIndexComplete())
+        for imported_entry in imported:
+            self.storage.discardImportedSample(imported_entry)
+
+        self.assertEqual(family_before, self._familyCounters()[source.family_id])
+        self.assertEqual([source.sample_id], self.storage.getSampleIds())
+        self.storage.rebuildPicHashCountIndex()
+        self.assertEqual(10, len(self._picHashCountDocuments()))
+
+    def testAFailedPicHashCountLeavesEveryFamilyAsItWasAfterTheDiscard(self):
+        # the counting fails after the insert, before any family counter is raised: functions left
+        # stored would be taken off their families by the discard, which never counted them. Memory
+        # storage has no such step, it counts each family before storing the function
+        self.storage.clearStorage()
+        source, other_family_id = self._storeASampleAndAnotherFamily()
+        families_before = self._familyCounters()
+        imported, function_entries = self._importTwoSampleEntries(source, other_family_id)
+
+        with patch.object(self.storage, "_addToPicHashCounts", side_effect=RuntimeError("counting failed")):
+            with self.assertRaisesRegex(RuntimeError, "counting failed"):
+                self.storage.importFunctionEntries(function_entries)
+        self.assertFalse(self.storage.isPicHashCountIndexComplete())
+        for imported_entry in imported:
+            self.assertEqual([], self.storage.getFunctionIdsBySampleId(imported_entry.sample_id))
+            self.storage.discardImportedSample(imported_entry)
+
+        self.assertEqual(families_before, self._familyCounters())
+        self.assertEqual([source.sample_id], self.storage.getSampleIds())
+        self.storage.rebuildPicHashCountIndex()
+        self.assertEqual(10, len(self._picHashCountDocuments()))
+
+    def testAFailedPicHashCountWhoseFunctionsCannotBeRemovedRaisesTheCountError(self):
+        # removing the functions fails as well: logged, and the error that failed the import is the
+        # one raised
+        self.storage.clearStorage()
+        source, other_family_id = self._storeASampleAndAnotherFamily()
+        _, function_entries = self._importTwoSampleEntries(source, other_family_id)
+
+        with (
+            patch.object(self.storage, "_addToPicHashCounts", side_effect=RuntimeError("counting failed")),
+            patch.object(self.storage, "_discardFunctions", side_effect=RuntimeError("removing failed")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "counting failed"):
+                self.storage.importFunctionEntries(function_entries)
+        self.assertFalse(self.storage.isPicHashCountIndexComplete())
 
     def testAStrayExtrasChunkDoesNotBlockStoringTheExtras(self):
         # a chunk an interrupted store left behind under the same id must not cause a duplicate key
@@ -1292,7 +1543,8 @@ class MongoDbStorageTest(MemoryStorageTest):
         assert family is not None
         self.assertEqual("family_1", family.family_name)
         self.assertEqual(1, family.num_samples)
-        self.assertEqual(10, family.num_functions)
+        # its functions count once they are imported, not by what its statistics state
+        self.assertEqual(0, family.num_functions)
 
     def testAStatsUpdateAgainstAMissingFamilyIsLogged(self):
         self.storage.clearStorage()
@@ -1668,6 +1920,13 @@ class MongoDbStorageTest(MemoryStorageTest):
         rebuild_result = self.storage.rebuildMinhashBandIndex()
         self.assertEqual(len(minhashes), rebuild_result["minhash_functions_indexed"])
         self.assertEqual(bands_before, dumpBands())
+
+    def testRebuildMinhashBandIndexLeavesOutAFunctionWithoutMinhashField(self):
+        """a function document without the field (an upsert racing a deletion) has nothing to band"""
+        self._storageWithBandedSample()
+        self.storage._getDb().functions.update_one({"function_id": 1}, {"$unset": {"minhash": ""}})
+        rebuild_result = self.storage.rebuildMinhashBandIndex()
+        self.assertEqual(6, rebuild_result["minhash_functions_indexed"])
 
     def _storageWithBandedSample(self):
         self.storage.clearStorage()

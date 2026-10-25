@@ -5,6 +5,7 @@ import falcon
 from bson import json_util
 
 from mcrit.index.MatchingParameters import MatchingParameterError, applyMatchingPreset, resolveMatchingParams
+from mcrit.storage.UniqueBlocksResult import parseBlockHash
 
 LOGGER = logging.getLogger(__name__)
 
@@ -122,9 +123,33 @@ def getUniqueBlocksParams(req_params):
             if key == "min_instructions":
                 # blocks shorter than this are dropped before the cover is chosen
                 parameters["min_instructions"] = max(0, int(value))
+            # the opt-in directions of #283, see Worker.getUniqueBlocks
+            if key == "max_blocks_per_function":
+                # 0 is no cap, as when omitted, and left out so both make the same job
+                if int(value) > 0:
+                    parameters["max_blocks_per_function"] = int(value)
+            if key in ("gentle_length_score", "demote_generic_blocks") and value.lower() == "true":
+                parameters[key] = True
         except (AttributeError, TypeError, ValueError):
             LOGGER.warning(f"Failed to handle request parameter: {key}: {value}")
     return parameters
+
+
+def getExcludedPicBlockHashes(body):
+    """The negative set of a unique-blocks POST body, as sorted distinct integers; ValueError otherwise.
+
+    The body is {"exclude_picblockhashes": [...]}, each hash as parseBlockHash reads it, e.g. from
+    mcrit.storage.UniqueBlocksResult.picBlockHashesOfReport for reports that are not in the index.
+    Sorted and without repeats, so the same set always makes the same job.
+    """
+    if not isinstance(body, dict) or not isinstance(body.get("exclude_picblockhashes"), list):
+        raise ValueError('the body must be {"exclude_picblockhashes": [...]}')
+    unknown = sorted(set(body) - {"exclude_picblockhashes"})
+    if unknown:
+        # shortened as parseBlockHash shortens a value, since the message is answered and logged
+        shown = ", ".join(key if len(key) <= 40 else key[:37] + "..." for key in unknown)
+        raise ValueError(f"unknown keys in the body: {shown} - other parameters go in the query string")
+    return sorted({parseBlockHash(block_hash) for block_hash in body["exclude_picblockhashes"]})
 
 
 def jsonify(content, debug_print=False):

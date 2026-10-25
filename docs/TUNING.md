@@ -54,6 +54,15 @@ and keep it below the container limit so the job is the one stopped rather than 
 Measuring reads the parent of every process on the host from `/proc` once a second per running job,
 which costs little on a worker host but adds up where thousands of processes run beside it.
 
+A `spawningworker` kills a job process after `QUEUE_SPAWNINGWORKER_CHILDREN_TIMEOUT` seconds. A plain
+`mcrit worker` stops a job after `QUEUE_WORKER_JOB_TIMEOUT` seconds (default 3600; `0` turns the limit
+off), but only a job that reads the index and does not write it: matching (sample, vs, vs-group, cross, query)
+and unique blocks. Jobs that write - binary submission and the minhash updates, which store minhashes
+and then their band postings in separate steps that an interruption could split - and corpus
+maintenance (`rebuild*`, `recalculate*`, `repair*`, `doDbCleanup`, deletions and modifications) are
+not timed. A stopped job is retried like any failing job, up to `QUEUE_MAX_ATTEMPTS` (3) times, so one
+oversized request can hold a worker for about three times the limit before it is marked failed.
+
 A worker that runs jobs in its own process (`mcrit worker`, as opposed to `spawningworker`) keeps
 what a job allocated in glibc's arenas after the job ends, so its resident size stays at its
 largest job's peak. It hands the freed memory back to the operating system after every job
@@ -274,12 +283,14 @@ Separate from latency, and a hard stop rather than a slowdown. A band posting li
 pushing ids into one document until the write is refused, a document holds about **1.35 million
 ids** while they fit in 32 bits and about **1.05 million** once they need BSON int64. On a
 7,244-sample real corpus the longest posting list across all 20 bands held 36,183 ids, so
-extrapolating it linearly puts the ceiling near **270,000 samples**.
+extrapolating it linearly puts the ceiling near **270,000 samples**. One function submitted over
+and over reaches it far sooner: every copy adds a posting to the same hash in each band.
 
-What happens there is not gradual: `$push` raises `BSONObj size ... is invalid` and the write
-fails, so indexing stops for any sample containing a function whose band hash is already at the
-cap. **Adding machines does not help** - a document cannot span shards, so this is not something
-sharding fixes.
+What happens there is not gradual: mongod refuses the `$push`, and the hash takes no further
+postings. They are left out - with an entry in the `error` collection and a warning naming the
+band and the hash - while the rest of the sample is indexed as before, so a function holding that
+hash is no longer found through that band. **Adding machines does not help** - a document cannot
+span shards, so this is not something sharding fixes.
 
     STORAGE_BAND_BUCKET_SIZE = 100000
 

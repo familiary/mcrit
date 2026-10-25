@@ -45,7 +45,8 @@ def smdaFunctionFromXcfg(xcfg: Optional[Dict], binary_info: Optional[BinaryInfo]
     a missing blob to ``{}``. smda cannot rebuild a function from ``{}`` - it raises "serialized
     function is incomplete" - so the callers skip such a function instead of failing the whole
     batch it came in. An xcfg that is present but lacks a field smda requires still raises, and
-    names the fields, because that is not a state MCRIT writes.
+    names the fields, because that is not a state MCRIT writes - but an import stores whatever the
+    export holds, so the jobs that rehash the corpus log and skip a function that raises here.
     """
     if not xcfg:
         return None
@@ -53,6 +54,16 @@ def smdaFunctionFromXcfg(xcfg: Optional[Dict], binary_info: Optional[BinaryInfo]
     if missing:
         raise ValueError(f"stored disassembly of the function at offset {xcfg.get('offset')} lacks {', '.join(missing)}, which SmdaFunction.fromDict requires")
     return SmdaFunction.fromDict(xcfg, binary_info=binary_info)
+
+
+def picBlockHashEntries(blockhasher, smda_function: SmdaFunction, lower_addr: int, upper_addr: int) -> List[Dict]:
+    """The picblockhashes of a function's blocks as storage keeps them: each block's offset tuple with its hash."""
+    entries = []
+    for hash_entry in blockhasher.getBlockhashesForFunction(smda_function, lower_addr, upper_addr, hash_size=8):
+        for block_entry in hash_entry["offset_tuples"]:
+            block_entry["hash"] = hash_entry["hash"]
+            entries.append(block_entry)
+    return entries
 
 
 # Dataclass, post init
