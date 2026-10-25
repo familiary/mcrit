@@ -407,7 +407,7 @@ class MemoryStorage(StorageInterface):
         # as MongoDbStorage does; a binary is held in one piece here, so there are no chunks to look for
         report: Dict[str, Any] = {"dry_run": dry_run, "binaries": 0, "stale_sample_ids": 0, "chunk_files": 0}
         for sha256, (_, sample_ids) in list(self._sample_binaries.items()):
-            stale = {sample_id for sample_id in sample_ids if not self.isSampleId(sample_id)}
+            stale = {sample_id for sample_id in sample_ids if self._canLookUpSampleId(sample_id) and not self.isSampleId(sample_id)}
             if stale == sample_ids:
                 report["binaries"] += 1
                 if not dry_run:

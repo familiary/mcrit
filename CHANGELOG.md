@@ -31,7 +31,9 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   looks up the samples they name. A submission of the same bytes racing the job either keeps the
   file or stores a fresh copy, as it does against `deleteSample`, so a real run can delete fewer
   than a dry run counted. A file in the bucket without `metadata.sample_ids` is not one MCRIT
-  wrote and is left alone. This is a route of its own rather than part of the queue sweep: the
+  wrote and is left alone. An id on a file is looked up whatever its numeric type, so a sample
+  whose `sample_id` an edit stored as `5.0` keeps its binary, and an id that is not a number is
+  kept as if its sample existed. This is a route of its own rather than part of the queue sweep: the
   bucket belongs to the storage, and the queue may keep its GridFS in another database. An
   instance that has kept binaries and deleted samples can run it once with `dry_run=true` to see
   whether anything was left. The in-memory storage answers the same, with no chunks.

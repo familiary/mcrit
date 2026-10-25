@@ -629,12 +629,20 @@ class StorageInterface:
 
     def deleteOrphanedSampleBinaries(self, dry_run: bool = False) -> Dict[str, Any]:
         """Delete the kept binaries no existing sample refers to any more, and take the ids of
-        samples that are gone off the binaries other samples still use (#80).
+        samples that are gone off the binaries other samples still use (#80). An id that is not a
+        number names no sample to look up, and is kept as if its sample existed.
 
         Answers {"dry_run", "binaries", "stale_sample_ids", "chunk_files"}: the binaries deleted,
         the ids taken off binaries that stay, and the chunk groups deleted for lack of a file. With
         dry_run nothing is changed, and the answer is what would have been."""
         raise NotImplementedError
+
+    @staticmethod
+    def _canLookUpSampleId(sample_id: Any) -> bool:
+        """Whether an id found on a kept binary can be looked up as a sample's (#80): a number of
+        any type, since an edit outside MCRIT can store 5 as 5.0 and both name the same sample, but
+        not a bool, which Python takes for 1 and MongoDB does not."""
+        return isinstance(sample_id, (int, float)) and not isinstance(sample_id, bool)
 
     def recomputeFamilyStats(self, progress_reporter=None) -> Dict[str, Any]:
         """Set every family's sample/function counters from the samples and functions that exist,

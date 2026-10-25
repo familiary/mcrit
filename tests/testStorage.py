@@ -597,6 +597,24 @@ class MemoryStorageTest(TestCase):
         self.assertEqual(0, self._numStoredBinaries())
         self.assertEqual({"dry_run": False, "binaries": 0, "stale_sample_ids": 0, "chunk_files": 0}, self.storage.deleteOrphanedSampleBinaries())
 
+    def _storeBinaryForIds(self, payload, sample_ids):
+        """A binary carrying whatever ids, as an edit outside MCRIT can leave them."""
+        self.storage._sample_binaries[hashlib.sha256(payload).hexdigest()] = (payload, set(sample_ids))
+
+    def testAnIdOfAnotherNumericTypeIsLookedUpAndAnyOtherIdKept(self):
+        """#80: 5.0 names sample 5 as 5 does, and a number naming no sample is gone whatever its type;
+        an id that is not a number cannot be looked up, and keeps its binary as a missing list does."""
+        self.storage.clearStorage()
+        sample_a, sample_b = self._addTwoSamples()
+        self._storeBinaryForIds(b"MZ double", [float(sample_a)])
+        self._storeBinaryForIds(b"MZ mixed", [sample_b, 4242.0])
+        self._storeBinaryForIds(b"MZ no numbers", ["4242", None, True])
+        self.assertEqual({"dry_run": False, "binaries": 0, "stale_sample_ids": 1, "chunk_files": 0}, self.storage.deleteOrphanedSampleBinaries())
+        self.assertEqual(3, self._numStoredBinaries())
+        self.assertEqual(b"MZ double", self.storage.getSampleBinary(sample_a))
+        self.assertEqual(b"MZ mixed", self.storage.getSampleBinary(sample_b))
+        self.assertEqual({"dry_run": False, "binaries": 0, "stale_sample_ids": 0, "chunk_files": 0}, self.storage.deleteOrphanedSampleBinaries())
+
     def testSampleHandling(self):
         self.storage.clearStorage()
         # TODO: different samples required, because addSmdaReport wont accept identical hashes
@@ -1530,6 +1548,29 @@ class MongoDbStorageTest(MemoryStorageTest):
         with patch.object(self.storage, "_deleteOrphanedBinaryBatch", side_effect=document_arrives):
             self.assertEqual(0, self.storage.deleteOrphanedSampleBinaries()["chunk_files"])
         self.assertEqual(1, db["sample_binaries.chunks"].count_documents({"files_id": files_id}))
+
+    def _storeBinaryForIds(self, payload, sample_ids):
+        self.storage._getBinaries().put(payload, metadata={"sha256": hashlib.sha256(payload).hexdigest(), "sample_ids": list(sample_ids), "size": len(payload)})
+
+    def testABinaryStoredUnderASampleIdWrittenAsADoubleIsKept(self):
+        """#80: a sample_id written back as a double (an edit in mongosh, say) is read as one, since
+        SampleEntry.fromDict keeps the type, so the binary stored for the sample names it as 5.0;
+        the sweep took that for gone and deleted the binary of a sample that exists. An id that is
+        no number at all, such as a dict, cannot even go in a set, and is left alone."""
+        self.storage.clearStorage()
+        db = self.storage._getDb()
+        sample_a, _ = self._addTwoSamples()
+        db.samples.update_one({"sample_id": sample_a}, {"$set": {"sample_id": float(sample_a)}})
+        sample_entry = self.storage.getSampleById(sample_a)
+        assert sample_entry is not None
+        self.assertTrue(self.storage.storeSampleBinary(sample_entry.sample_id, b"MZ double"))
+        self.assertIsInstance(db["sample_binaries.files"].find_one({})["metadata"]["sample_ids"][0], float)
+        self._storeBinaryForIds(b"MZ dict", [{"sample_id": 4242}])
+        nothing = {"binaries": 0, "stale_sample_ids": 0, "chunk_files": 0}
+        self.assertEqual({"dry_run": True, **nothing}, self.storage.deleteOrphanedSampleBinaries(dry_run=True))
+        self.assertEqual({"dry_run": False, **nothing}, self.storage.deleteOrphanedSampleBinaries())
+        self.assertEqual(b"MZ double", self.storage.getSampleBinary(sample_a))
+        self.assertEqual(2, self._numStoredBinaries())
 
     def _numBandEntries(self):
         db = self.storage._getDb()

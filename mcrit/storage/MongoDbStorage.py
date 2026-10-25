@@ -1438,9 +1438,10 @@ class MongoDbStorage(StorageInterface):
     def _deleteOrphanedBinaryBatch(self, documents: Iterable[Dict[str, Any]], dry_run: bool, report: Dict[str, Any]) -> None:
         # a file without a list of samples is not one storeSampleBinary wrote, and not this sweep's to judge
         files = [(document["_id"], document["metadata"]["sample_ids"]) for document in documents if isinstance((document.get("metadata") or {}).get("sample_ids"), list)]
-        existing = self._existingSampleIds({sample_id for _, sample_ids in files for sample_id in sample_ids})
+        existing = self._existingSampleIds(sample_id for _, sample_ids in files for sample_id in sample_ids)
         for file_id, sample_ids in files:
-            stale = [sample_id for sample_id in sample_ids if sample_id not in existing]
+            # an id that is not a number names no sample to look up, and is kept as if it did
+            stale = [sample_id for sample_id in sample_ids if self._canLookUpSampleId(sample_id) and sample_id not in existing]
             if len(stale) < len(sample_ids):
                 # still the binary of a sample: only the samples that are gone come off it, so that
                 # it goes with the last one that exists rather than staying on their account
@@ -1453,17 +1454,20 @@ class MongoDbStorage(StorageInterface):
                 # a submission of the same bytes linked its sample to the file in between: it stays
                 report["stale_sample_ids"] += len(stale)
 
-    def _existingSampleIds(self, sample_ids: Iterable[Any]) -> Set[int]:
-        """Which of the ids belong to a sample - a query sample for a negative one, as in isSampleId."""
+    def _existingSampleIds(self, sample_ids: Iterable[Any]) -> Set[Any]:
+        """Which of the ids belong to a sample - a query sample for a negative one, as in isSampleId.
+
+        Every number is looked up, whatever its type: $in matches 5 to a sample_id stored as 5.0,
+        and 5 == 5.0 in the set answered, so either finds the other."""
         db = self._getDb()
-        ids = [sample_id for sample_id in sample_ids if isinstance(sample_id, int)]
-        existing: Set[int] = set()
+        ids = {sample_id for sample_id in sample_ids if self._canLookUpSampleId(sample_id)}
+        existing: Set[Any] = set()
         for collection, selected in ((db.samples, [i for i in ids if i >= 0]), (db.query_samples, [i for i in ids if i < 0])):
             if selected:
                 existing.update(document["sample_id"] for document in collection.find({"sample_id": {"$in": selected}}, {"sample_id": 1, "_id": 0}))
         return existing
 
-    def _retireAndDeleteOrphanedBinary(self, file_id, stale_sample_ids: List[int]) -> bool:
+    def _retireAndDeleteOrphanedBinary(self, file_id, stale_sample_ids: List[Any]) -> bool:
         """Delete a binary none of whose samples exists, unless a sample has been linked to it since it was read."""
         if stale_sample_ids:
             self._getBinaryFiles().update_one({"_id": file_id}, {"$pullAll": {"metadata.sample_ids": stale_sample_ids}})
