@@ -471,18 +471,17 @@ class MemoryStorageTest(TestCase):
     def _numStoredBinaries(self):
         return len(self.storage._sample_binaries)
 
-    def _addTwoSamples(self):
+    def _addSample(self, sha256):
         with open(self.example_file_path) as fjson:
-            smda_json = json.load(fjson)
-        sample_ids = []
-        for sha256 in (64 * "a", 64 * "b"):
-            report = SmdaReport.fromDict(smda_json)
-            assert report is not None
-            report.sha256 = sha256
-            sample_entry = self.storage.addSmdaReport(report)
-            assert sample_entry is not None
-            sample_ids.append(sample_entry.sample_id)
-        return sample_ids
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        report.sha256 = sha256
+        sample_entry = self.storage.addSmdaReport(report)
+        assert sample_entry is not None
+        return sample_entry.sample_id
+
+    def _addTwoSamples(self):
+        return [self._addSample(sha256) for sha256 in (64 * "a", 64 * "b")]
 
     def testTheSameBytesAreStoredOnceForEverySampleTheyBelongTo(self):
         """#95: binaries are keyed by content, listing their samples, and a binary goes only with
@@ -614,6 +613,22 @@ class MemoryStorageTest(TestCase):
         self.assertEqual(b"MZ double", self.storage.getSampleBinary(sample_a))
         self.assertEqual(b"MZ mixed", self.storage.getSampleBinary(sample_b))
         self.assertEqual({"dry_run": False, "binaries": 0, "stale_sample_ids": 0, "chunk_files": 0}, self.storage.deleteOrphanedSampleBinaries())
+
+    def testANegativeIdIsLookedUpAmongTheQuerySamples(self):
+        """#80: a negative id names a query sample, as in isSampleId: its binary stays while the
+        query sample exists, and goes once no query sample has the id."""
+        self.storage.clearStorage()
+        with open(self.example_file_path) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        query_entry = self.storage.addSmdaReport(report, isQuery=True)
+        assert query_entry is not None
+        self.assertLess(query_entry.sample_id, 0)
+        self.assertTrue(self.storage.storeSampleBinary(query_entry.sample_id, b"MZ query"))
+        self._storeBinaryForIds(b"MZ gone query", [-4242])
+        self.assertEqual({"dry_run": False, "binaries": 1, "stale_sample_ids": 0, "chunk_files": 0}, self.storage.deleteOrphanedSampleBinaries())
+        self.assertEqual(b"MZ query", self.storage.getSampleBinary(query_entry.sample_id))
+        self.assertEqual(1, self._numStoredBinaries())
 
     def testSampleHandling(self):
         self.storage.clearStorage()
@@ -1594,6 +1609,31 @@ class MongoDbStorageTest(MemoryStorageTest):
             report = self.storage.deleteOrphanedSampleBinaries()
         self.assertEqual({"dry_run": False, "binaries": 1, "stale_sample_ids": 0, "chunk_files": 0}, report)
         self.assertEqual(0, self._numStoredBinaries())
+
+    def testASampleLinkedBetweenTheReadAndTheUpdateStaysOnTheBinary(self):
+        """Only the ids found gone come off a binary that stays: writing back the ids read less the
+        gone ones would drop a sample that a submission of the same bytes linked in between, and
+        leave that sample without its binary."""
+        self.storage.clearStorage()
+        sample_a, sample_b = self._addTwoSamples()
+        sample_c = self._addSample(64 * "c")
+        payload = b"MZ" + bytes(range(256)) * 2000
+        self.storage.storeSampleBinary(sample_a, payload)
+        self.storage.storeSampleBinary(sample_b, payload)
+        self._deleteSampleButNotItsBinary(sample_a)
+        look_up, storage = self.storage._existingSampleIds, self.storage
+
+        def look_up_then_link_c(sample_ids):
+            existing = look_up(sample_ids)
+            storage.storeSampleBinary(sample_c, payload)
+            return existing
+
+        with patch.object(self.storage, "_existingSampleIds", side_effect=look_up_then_link_c):
+            report = self.storage.deleteOrphanedSampleBinaries()
+        self.assertEqual({"dry_run": False, "binaries": 0, "stale_sample_ids": 1, "chunk_files": 0}, report)
+        self.assertEqual([sample_b, sample_c], self.storage._getBinaryFiles().find_one({})["metadata"]["sample_ids"])
+        self.assertEqual(payload, self.storage.getSampleBinary(sample_c))
+        self.assertEqual(1, self._numStoredBinaries())
 
     def _numBandEntries(self):
         db = self.storage._getDb()

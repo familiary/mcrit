@@ -207,12 +207,14 @@ class DeleteOrphanedSampleBinariesTest(unittest.TestCase):
                 index.deleteOrphanedQueueFiles.assert_not_called()
 
     def test_anything_but_true_or_false_in_the_query_string_is_refused(self):
-        for query in ("", "dry_run=true&dry_run=true", "dry_run=1", "dry_run=yes"):
-            with self.subTest(query=query):
+        # missing (including sent in the body, which is not read), repeated, or not a boolean
+        for query, body in (("", None), ("", "dry_run=true"), ("dry_run=true&dry_run=true", None), ("dry_run=1", None), ("dry_run=yes", None)):
+            with self.subTest(query=query, body=body):
                 index = MagicMock()
                 app = falcon.App()
                 app.add_route("/delete_orphaned_sample_binaries", StatusResource(index), suffix="delete_orphaned_sample_binaries")
-                response = falcon.testing.TestClient(app).simulate_post("/delete_orphaned_sample_binaries", query_string=query)
+                headers = {"Content-Type": "application/x-www-form-urlencoded"} if body else None
+                response = falcon.testing.TestClient(app).simulate_post("/delete_orphaned_sample_binaries", query_string=query, body=body, headers=headers)
                 self.assertEqual(falcon.HTTP_400, response.status)
                 index.deleteOrphanedSampleBinaries.assert_not_called()
 
