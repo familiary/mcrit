@@ -924,6 +924,11 @@ class MatcherInterface:
                 assert foreign_sample_entry is not None
                 self._sample_id_to_entry[foreign_sample_id] = foreign_sample_entry
             sample_info = self._sample_id_to_entry[foreign_sample_id]
+            # a sample whose report carried no statistics (smda reads them as None) holds {}: count its functions
+            if "num_functions" in sample_info.statistics:
+                num_functions = sample_info.statistics["num_functions"]
+            else:
+                num_functions = len(self._storage.getFunctionIdsBySampleId(foreign_sample_id) or [])
             sample_summary[foreign_sample_id] = {
                 "family": sample_info.family,
                 "family_id": sample_info.family_id,
@@ -934,7 +939,7 @@ class MatcherInterface:
                 "sample_id": foreign_sample_id,
                 "num_bytes": sample_info.binweight,
                 "is_library": sample_info.is_library,
-                "num_functions": sample_info.statistics["num_functions"],
+                "num_functions": num_functions,
                 "matched": {
                     "functions": {
                         "minhashes": 0,

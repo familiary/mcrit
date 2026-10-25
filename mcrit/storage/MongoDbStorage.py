@@ -8,12 +8,13 @@ import threading
 import time
 import traceback
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from itertools import zip_longest
 from operator import itemgetter
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 import gridfs
 import numpy as np
@@ -48,7 +49,7 @@ from mcrit.storage.FunctionEntry import FunctionEntry, smdaFunctionFromXcfg
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
 from mcrit.storage.MatchingCache import MatchingCache
 from mcrit.storage.SampleEntry import SampleEntry
-from mcrit.storage.StorageInterface import BinaryStream, StorageInterface
+from mcrit.storage.StorageInterface import BinaryStream, StorageInterface, isSha256
 
 LOGGER = logging.getLogger(__name__)
 
@@ -943,11 +944,17 @@ class MongoDbStorage(StorageInterface):
         minhashes_to_remove: Dict[int, Dict[int, List[int]]] = {band_number: {} for band_number in range(self._storage_config.STORAGE_NUM_BANDS)}
         num_hashed = 0
         for function_minhash in function_minhashes:
-            minhash = self._getMinHashFromStorage(function_minhash)
+            minhash_bytes = bytes.fromhex(function_minhash.get("minhash") or "")
             # remove minhash entries, if necessary
-            if not minhash or not minhash.hasMinHash():
+            if not minhash_bytes:
                 continue
             num_hashed += 1
+            # judged by its bytes before it is read: reading or banding one that cannot have been
+            # banded raised, on every attempt to delete its sample or repair its minhashes
+            if not self._hasBandableLength(minhash_bytes):
+                LOGGER.warning("Function %d holds a minhash of %d bytes, which cannot have band entries.", function_minhash["function_id"], len(minhash_bytes))
+                continue
+            minhash = MinHash(function_id=function_minhash["function_id"], minhash_bytes=minhash_bytes, minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
             band_hashes = self.getBandHashesForMinHash(minhash)
             for band_number, band_hash in sorted(band_hashes.items()):
                 if band_hash not in minhashes_to_remove[band_number]:
@@ -1146,8 +1153,13 @@ class MongoDbStorage(StorageInterface):
             else:
                 self._getDb().families.delete_one({"family_id": family_id})
             # the attribution moves with the samples: a rename onto an existing family merges
-            # both actor lists (a review of #57 caught the rename dropping them)
-            merged_actors = FamilyEntry.normalizeActors(list(new_family_info.actors or []) + list(old_family_info.actors or []))
+            # both actor lists (a review of #57 caught the rename dropping them), up to MAX_ACTORS
+            # as an import does - uncapped, renaming many families into one grew it without bound
+            merged_actors, num_dropped = FamilyEntry.mergeActors(new_family_info.actors, old_family_info.actors)
+            if num_dropped:
+                LOGGER.warning(
+                    "Family %d would be attributed to more than %d actors, dropping %d actors of merged family %d.", new_family_id, FamilyEntry.MAX_ACTORS, num_dropped, family_id
+                )
             self._getDb().families.update_one(
                 {"family_id": new_family_id},
                 {"$set": {"num_samples": new_num_samples, "num_functions": new_num_functions, "num_library_samples": new_num_lib_samples, "actors": merged_actors}},
@@ -1558,8 +1570,24 @@ class MongoDbStorage(StorageInterface):
         self._over_cap_since.clear()
         self._ensureIndexAndUnknownFamily()
 
+    # sha256 values per $in query: 64 characters each keeps a query well below the 16 MB BSON limit
+    _PRESENT_SHA256S_CHUNK = 10000
+
+    def getPresentSha256s(self, sha256s: Iterable[str]) -> Set[str]:
+        # only what can be a sha256: anything else matches no sample, and a long one would take the
+        # $in query beyond the 16 MB BSON limit
+        candidates = list({sha256 for sha256 in sha256s if isSha256(sha256)})
+        present = set()
+        for start in range(0, len(candidates), self._PRESENT_SHA256S_CHUNK):
+            chunk = candidates[start : start + self._PRESENT_SHA256S_CHUNK]
+            present.update(document["sha256"] for document in self._getDb().samples.find({"sha256": {"$in": chunk}}, {"_id": 0, "sha256": 1}))
+        return present
+
     def getSampleBySha256(self, sha256: str, is_query=False) -> Optional["SampleEntry"]:
         target_sample = None
+        if not isinstance(sha256, str):
+            # an object would be read as a query operator
+            return None
         if is_query:
             report_dict = self._getDb().query_samples.find_one({"sha256": sha256})
         else:
@@ -1648,7 +1676,8 @@ class MongoDbStorage(StorageInterface):
                 self._addToPicBlockHashIndex(function_dicts)
                 self._addToPicHashCounts(function_dicts)
                 self._recordFunctionRange(sample_entry.sample_id, [document["function_id"] for document in function_dicts])
-                self._updateFamilyStats(family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))
+                # the functions stored, as deleteSample counts them: the report's statistics are its own claim
+                self._updateFamilyStats(family_id, +1, len(function_dicts), int(sample_entry.is_library))
                 self._updateDbState()
             else:
                 LOGGER.warning("Sample %s already existed, skipping.", smda_report.sha256)
@@ -1660,10 +1689,12 @@ class MongoDbStorage(StorageInterface):
             sample_entry.sample_id = sample_id
             self._dbInsert("samples", sample_entry.toDict())
             self._ensureFamilyDocument(sample_entry.family_id, sample_entry.family)
-            self._updateFamilyStats(sample_entry.family_id, +1, sample_entry.statistics["num_functions"], int(sample_entry.is_library))
+            # its functions are counted as they are imported, not by the statistics the export states
+            self._updateFamilyStats(sample_entry.family_id, +1, 0, int(sample_entry.is_library))
             self._updateDbState()
             return sample_entry
-        # the entry still carries the id it had in the export, which here may well be another sample's
+        # not this entry's sample: the entry still carries the id it had in the export, which here may
+        # well be another sample's, so the caller must not attach the entry's functions to its sample_id
         LOGGER.warning("Sample %s already existed, skipping.", sample_entry.sha256)
         return None
 
@@ -1675,14 +1706,8 @@ class MongoDbStorage(StorageInterface):
         # add function to regular storage
         function_dict = function_entry.toDict()
         self._encodeFunction(function_dict)
-        try:
-            self._insertXcfgDocuments([function_dict])
-            self._dbInsert("functions", function_dict)
-        except Exception:
-            self._discardFunctions([function_entry.function_id])
-            raise
+        self._insertAndCountFunctions([function_dict], lambda: self._dbInsert("functions", function_dict))
         self._addToPicBlockHashIndex([function_dict])
-        self._addToPicHashCounts([function_dict])
         self._recordFunctionRange(function_entry.sample_id, [function_entry.function_id])
         self._updateDbState()
         return function_entry
@@ -1699,15 +1724,8 @@ class MongoDbStorage(StorageInterface):
             function_dict = function_entry.toDict()
             self._encodeFunction(function_dict)
             functions_as_dicts.append(function_dict)
-        try:
-            self._insertXcfgDocuments(functions_as_dicts)
-            self._dbInsertMany("functions", functions_as_dicts)
-        except Exception:
-            # none of them, rather than the ones before the document that failed
-            self._discardFunctions(function_ids)
-            raise
+        self._insertAndCountFunctions(functions_as_dicts, lambda: self._dbInsertMany("functions", functions_as_dicts))
         self._addToPicBlockHashIndex(functions_as_dicts)
-        self._addToPicHashCounts(functions_as_dicts)
         # as addSmdaReport does: without a range, a shortlisted match never attributes these
         # functions to their sample, and their minhash matches are dropped
         function_ids_by_sample: Dict[int, List[int]] = {}
@@ -1718,6 +1736,77 @@ class MongoDbStorage(StorageInterface):
         # the range lookup is cached per db state: one built while these were being written must not outlive them
         self._updateDbState()
         return function_entries
+
+    def _insertAndCountFunctions(self, function_dicts: List[Dict], insert_functions: Callable[[], Any]) -> None:
+        """Store imported functions with insert_functions, then count them: their pichashes, and their
+        families' function counters.
+
+        discardImportedSample takes both counts of the functions it finds stored out again, so every
+        function it can find has to be counted in both by then. An insert that fails removes what it
+        wrote; should that fail as well, or the pichash counting itself, functions may be stored
+        without their pichashes being counted, and the count index is marked incomplete instead: the
+        discard then leaves the counts alone, and rebuildPicHashCountIndex counts what is stored.
+        Functions whose pichashes could not be counted are removed again as well, since no family has
+        counted them yet, and the discard would take them off their family all the same. A family
+        counter that fails - one that would overflow, say - takes back the functions with their
+        pichash counts, so that the discard finds none of them, and once they are gone the families
+        counted before it. Should removing the functions fail, those families stay raised for the
+        discard to take off what it finds, and the count index is marked incomplete.
+        """
+        function_ids = [function_dict["function_id"] for function_dict in function_dicts]
+        may_be_uncounted = True
+        is_stored = False
+        try:
+            try:
+                self._insertXcfgDocuments(function_dicts)
+                insert_functions()
+            except Exception:
+                # none of them, rather than the ones before the document that failed
+                self._discardFunctions(function_ids)
+                may_be_uncounted = False
+                raise
+            is_stored = True
+            self._addToPicHashCounts(function_dicts)
+            may_be_uncounted = False
+        except Exception:
+            if may_be_uncounted:
+                self._markPicHashCountsUntrusted()
+            if is_stored:
+                # their families are not counted yet, so the discard must not find them
+                try:
+                    self._discardFunctions(function_ids)
+                except Exception:
+                    LOGGER.exception("Could not remove the functions of a failed import, their families may be counted short until recomputed.")
+            raise
+        counted_families = []
+        try:
+            for family_id, num_functions in Counter(function_dict["family_id"] for function_dict in function_dicts).items():
+                self._updateFamilyStats(family_id, 0, num_functions, 0)
+                counted_families.append((family_id, num_functions))
+        except Exception:
+            # the functions go first: only once none of them is left for the discard to find may the
+            # families counted so far be taken back, or the discard would take them off a second time
+            try:
+                self._subtractPicHashCounts(function_dicts)
+                self._discardFunctions(function_ids)
+            except Exception:
+                # stored, or counted, without the other: only a rebuild can tell. The families counted
+                # so far stay raised, for the discard to take off what it finds of theirs
+                LOGGER.exception("Could not remove the functions of a failed import, their pichash counts are left to a rebuild.")
+                self._markPicHashCountsUntrusted()
+            else:
+                for family_id, num_functions in counted_families:
+                    try:
+                        self._updateFamilyStats(family_id, 0, -num_functions, 0)
+                    except Exception:
+                        LOGGER.exception("Could not take the functions of a failed import off family %d.", family_id)
+            raise
+
+    def _markPicHashCountsUntrusted(self) -> None:
+        try:
+            self._setPicHashCountIndexComplete(False)
+        except Exception:
+            LOGGER.exception("Could not mark the pichash counts incomplete, the imported functions may be stored uncounted.")
 
     def _discardFunctions(self, function_ids: Iterable[int]) -> None:
         """Remove what a failed insert of these functions may have written before it failed."""
@@ -1732,13 +1821,27 @@ class MongoDbStorage(StorageInterface):
         # carries the id it had elsewhere, which here may well be another sample's
         if self._getDb().samples.find_one({"sample_id": sample_id, "sha256": sample_entry.sha256}, {"_id": 1}) is None:
             return
-        # the picblockhash index is read from the functions, so before they go, as in deleteSample
+        # the indexes are read from the functions, so before they go, as in deleteSample: the
+        # picblockhash index, and the pichash counts, taken out at most once. The import counts its
+        # functions right after the insert, and marks the count index incomplete where they may not
+        # be (_insertAndCountFunctions), so every function found here was counted or is not taken out
         self._removeSampleFromPicBlockHashIndex(sample_id)
-        self._discardFunctions([document["function_id"] for document in self._getDb().functions.find({"sample_id": sample_id}, {"function_id": 1, "_id": 0})])
-        if self._getDb().samples.delete_one({"sample_id": sample_id, "sha256": sample_entry.sha256}).deleted_count:
-            # the mirror of importSampleEntry's increment; the family stays, since it may have been
-            # there before the import, with actors of its own
-            self._updateFamilyStats(sample_entry.family_id, -1, -sample_entry.statistics["num_functions"], -int(sample_entry.is_library))
+        claim = self._getDb().samples.update_one(
+            {"sample_id": sample_id, "sha256": sample_entry.sha256, "pichash_counts_removed": {"$ne": True}}, {"$set": {"pichash_counts_removed": True}}
+        )
+        if claim.modified_count:
+            self._removeSampleFromPicHashCounts(sample_id)
+        # and its function ranges: left behind, they would attribute the function ids to a sample
+        # that is gone
+        self._getDb()[self._FUNCTION_RANGE_COLLECTION].delete_many({"sample_id": sample_id})
+        function_ids = [document["function_id"] for document in self._getDb().functions.find({"sample_id": sample_id}, {"function_id": 1, "_id": 0})]
+        self._discardFunctions(function_ids)
+        num_samples_deleted = self._getDb().samples.delete_one({"sample_id": sample_id, "sha256": sample_entry.sha256}).deleted_count
+        if num_samples_deleted or function_ids:
+            # the mirror of the increments of importSampleEntry and of the functions as they were stored
+            # (not of its statistics); the family stays, since it may have been there before the import,
+            # with actors of its own
+            self._updateFamilyStats(sample_entry.family_id, -num_samples_deleted, -len(function_ids), -num_samples_deleted * int(sample_entry.is_library))
         self._updateDbState()
 
     def getFunctionsBySampleId(self, sample_id: int) -> Optional[List["FunctionEntry"]]:
@@ -1760,16 +1863,6 @@ class MongoDbStorage(StorageInterface):
         if sample_id < 0:
             return list(self._getDb().query_functions.find({"sample_id": sample_id}, field_selection))
         return list(self._getDb().functions.find({"sample_id": sample_id}, field_selection))
-
-    def _getMinHashFromStorage(self, function_document: Dict[str, Any]) -> Optional["MinHash"]:
-        minhash_hex = function_document.get("minhash")
-        if not minhash_hex:
-            return None
-        return MinHash(
-            function_id=function_document["function_id"],
-            minhash_bytes=bytes.fromhex(minhash_hex),
-            minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS,
-        )
 
     def getFunctionIdsBySampleId(self, sample_id: int) -> Optional[List["int"]]:
         function_ids = None
@@ -1822,7 +1915,8 @@ class MongoDbStorage(StorageInterface):
         self._decodePichash(query_result, delete_old=False)
         encoded_pichash = query_result["_pichash"]
         decoded_pichash = query_result["pichash"]
-        if decoded_pichash is None:
+        # 0 is what a function without a PicHash is stored with (FunctionEntry), not a hash it shares
+        if not decoded_pichash:
             return None
 
         sample_and_function_ids = set(
@@ -1837,15 +1931,19 @@ class MongoDbStorage(StorageInterface):
     def getPicHashMatchesByFunctionIds(self, function_ids: List[int]) -> Dict[int, Set[Tuple[int, int, int]]]:
         # internal format!
         pichash_raw = self._getDb().functions.find({"function_id": {"$in": function_ids}}, {"_pichash": 1, "_id": 0})
-        pichashes_list = list(pichash_raw)  # broken? TODO
+        pichashes_list = list(pichash_raw)
         pichashes = {}
         encoded_to_decoded = {}
         for pichash in pichashes_list:
-            # TODO what happens if pichash does not exist??
+            # a function document without one has no pichash to match, as in the single-id lookup
+            if "_pichash" not in pichash:
+                continue
             self._decodePichash(pichash, delete_old=False)
             encoded_pichash = pichash["_pichash"]
             decoded_pichash = pichash["pichash"]
-            if decoded_pichash in pichashes:
+            # 0 is what a function without a PicHash is stored with: matching it would pair every
+            # such function with every other one as an exact match, as MemoryStorage never does
+            if not decoded_pichash or decoded_pichash in pichashes:
                 continue
             pichashes[decoded_pichash] = set()
             encoded_to_decoded[encoded_pichash] = decoded_pichash
@@ -2707,12 +2805,22 @@ class MongoDbStorage(StorageInterface):
         delete matches `df <= 0` per document, so a count raised again by a concurrent insert in
         between is left alone.
         """
+
+        def function_documents():
+            # a generator, so that nothing is read while the index is incomplete
+            yield from self._getDb().functions.find({"sample_id": sample_id, "_pichash": {"$ne": None}}, {"_pichash": 1, "_id": 0})
+
+        self._subtractPicHashCounts(function_documents())
+
+    def _subtractPicHashCounts(self, function_documents: Iterable[Dict]) -> None:
+        """Take these functions out of the pichash counts, the mirror of _addToPicHashCounts."""
         if not self.isPicHashCountIndexComplete():
             return
         decrements: Dict[Any, int] = {}
-        for function_document in self._getDb().functions.find({"sample_id": sample_id, "_pichash": {"$ne": None}}, {"_pichash": 1, "_id": 0}):
-            encoded_pichash = function_document["_pichash"]
-            decrements[encoded_pichash] = decrements.get(encoded_pichash, 0) + 1
+        for function_document in function_documents:
+            encoded_pichash = function_document.get("_pichash")
+            if encoded_pichash is not None:
+                decrements[encoded_pichash] = decrements.get(encoded_pichash, 0) + 1
         if not decrements:
             return
         collection = self._getDb()[self._PICHASH_COUNT_COLLECTION]
@@ -2987,7 +3095,6 @@ class MongoDbStorage(StorageInterface):
         # STORAGE_DROP_DISASSEMBLY now genuinely shrinks the instance (#137)
         self._getDb()["xcfg"].drop()
 
-    # TODO move to storage interface, remove this from memory storage?
     def getLibraryInfoForSampleId(self, sample_id: int) -> Optional[Dict[str, str]]:
         sample_entry = self.getSampleById(sample_id)
         if sample_entry is None:
@@ -2997,11 +3104,16 @@ class MongoDbStorage(StorageInterface):
         return None
 
     def isPicHash(self, pichash: int) -> bool:
+        # 0 is what a function without a PicHash is stored with, not a hash (as in MemoryStorage)
+        if not pichash:
+            return False
         query = {"pichash": pichash}
         self._encodePichash(query)
         return self._getDb().functions.find_one(query) is not None
 
     def getMatchesForPicHash(self, pichash: int) -> Set[Tuple[int, int, int]]:
+        if not pichash:
+            return set()
         query = {"pichash": pichash}
         self._encodePichash(query)
         return set(
@@ -3014,6 +3126,8 @@ class MongoDbStorage(StorageInterface):
     def getMatchesForPicHashes(self, pichashes: List[int]) -> Dict[int, Set[Tuple[int, int, int]]]:
         encoded_to_decoded = {}
         for pichash in set(pichashes):
+            if not pichash:
+                continue
             query = {"pichash": pichash}
             self._encodePichash(query)
             encoded_to_decoded[query["_pichash"]] = pichash
@@ -3348,6 +3462,13 @@ class MongoDbStorage(StorageInterface):
         # re-add minhashes in batches
         total_functions = self._getDb().functions.count_documents(filter={})
         minhash_functions = 0
+        # every band is gone by now, so a record that cannot be banded must not end the rebuild - it
+        # failed at that batch, leaving it and every later one out of the index, on every run. A
+        # function document without a minhash field (an upsert racing a deletion) has nothing to
+        # band, and a minhash of another length than the configured signatures (imports stored such
+        # unchecked) does not fit the projection, so both are left out
+        signature_bytes = self._minhash_config.MINHASH_SIGNATURE_LENGTH * (1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4)
+        num_skipped = 0
         batch_size = self._minhash_config.MINHASH_BAND_REBUILD_WORK_PACKAGE_SIZE
         if progress_reporter:
             progress_reporter.set_total((total_functions // batch_size) + 1)
@@ -3361,15 +3482,22 @@ class MongoDbStorage(StorageInterface):
             last_function_id = function_documents[-1]["function_id"]
             minhashes = []
             for function_document in function_documents:
-                if function_document["minhash"]:
-                    function_id = function_document["function_id"]
-                    minhash_bytes = bytes.fromhex(function_document["minhash"])
-                    minhash_obj = MinHash(function_id, minhash_bytes, minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
-                    minhashes.append(minhash_obj)
+                minhash_bytes = bytes.fromhex(function_document.get("minhash") or "")
+                if "minhash" not in function_document:
+                    LOGGER.warning("Function %d has no minhash field, leaving it out of the band index.", function_document["function_id"])
+                if not minhash_bytes:
+                    continue
+                if len(minhash_bytes) != signature_bytes:
+                    num_skipped += 1
+                    continue
+                minhash_obj = MinHash(function_document["function_id"], minhash_bytes, minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS)
+                minhashes.append(minhash_obj)
             self._addMinHashesToBands(minhashes)
             minhash_functions += len(minhashes)
             if progress_reporter:
                 progress_reporter.step()
+        if num_skipped:
+            LOGGER.warning("Left %d functions out of the band index, their minhashes are not %d bytes long; recalculating minhashes indexes them.", num_skipped, signature_bytes)
         return {"minhash_functions_indexed": minhash_functions}
 
     def _resetBands(self) -> None:
@@ -3393,7 +3521,8 @@ class MongoDbStorage(StorageInterface):
         self._resetBands()
         functions = self._getDb().functions
         kept_sample_ids: Set[int] = set()
-        num_dropped = num_kept = 0
+        num_dropped = num_kept = num_unbandable = 0
+        signature_bytes = self._minhash_config.MINHASH_SIGNATURE_LENGTH * (1 if self._minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4)
         # streamed in function_id order rather than listed first: a corpus of ten million functions
         # would otherwise hold every id at once. Each batch only changes documents already read.
         hashed = functions.find({"minhash": {"$nin": ["", None]}}, {"function_id": 1, "_id": 0}).sort("function_id", 1).batch_size(10000)
@@ -3411,7 +3540,15 @@ class MongoDbStorage(StorageInterface):
             kept = [function_id for function_id in batch if function_id not in with_disassembly]
             if kept:
                 kept_documents = list(functions.find({"function_id": {"$in": kept}}, {"function_id": 1, "sample_id": 1, "minhash": 1, "_id": 0}))
-                kept_minhashes = [minhash for minhash in (self._getMinHashFromStorage(document) for document in kept_documents) if minhash is not None]
+                # as in rebuildMinhashBandIndex, one of another length than the configured signature
+                # does not fit the band projection: it stays stored, but is left out of the bands
+                kept_minhashes = []
+                for document in kept_documents:
+                    minhash_bytes = bytes.fromhex(document.get("minhash") or "")
+                    if len(minhash_bytes) != signature_bytes:
+                        num_unbandable += 1
+                        continue
+                    kept_minhashes.append(MinHash(document["function_id"], minhash_bytes, minhash_bits=self._minhash_config.MINHASH_SIGNATURE_BITS))
                 self._addMinHashesToBands(kept_minhashes)
                 kept_sample_ids.update(document["sample_id"] for document in kept_documents)
                 num_kept += len(kept_minhashes)
@@ -3421,6 +3558,8 @@ class MongoDbStorage(StorageInterface):
             num_kept,
             len(kept_sample_ids),
         )
+        if num_unbandable:
+            LOGGER.warning("Left %d kept minhashes out of the band index, they are not %d bytes long.", num_unbandable, signature_bytes)
         return kept_sample_ids
 
     @staticmethod
@@ -3488,29 +3627,35 @@ class MongoDbStorage(StorageInterface):
                     xcfg_missing += 1
                     sample_xcfg_missing += 1
                     continue
-                smda_xcfg = json.loads(function_document["_xcfg"])
-                # rebuilt before anything is counted: a function stored as {} is skipped, and its
-                # old block hashes are not updatable
-                smda_function = smdaFunctionFromXcfg(smda_xcfg, binary_info)
+                # rebuilt and rehashed before anything is counted: a function stored as {} is skipped,
+                # and its old block hashes are not updatable
+                try:
+                    smda_function = smdaFunctionFromXcfg(json.loads(function_document["_xcfg"]), binary_info)
+                    if smda_function is not None:
+                        old_pichash = int(function_document["_pichash"], 16)
+                        old_blockhashes = [{**blockhash, "hash": int(blockhash["hash"], 16)} for blockhash in function_document.get("_picblockhashes", [])]
+                        new_pichash = smda_function.getPicHash(binary_info)
+                        hash_entries = self.blockhasher.getBlockhashesForFunction(
+                            smda_function, binary_info.base_addr, binary_info.base_addr + binary_info.binary_size, hash_size=8
+                        )
+                except Exception as error:
+                    # an imported function holds whatever disassembly and hashes, and its sample whatever
+                    # architecture, base address and size, the export stated: one that cannot be rehashed
+                    # would fail the job on every run, so it is skipped like one without disassembly
+                    LOGGER.warning("Function %d of sample %d cannot be rehashed from its stored disassembly and is skipped: %s", function_document["function_id"], sample_id, error)
+                    smda_function = None
                 if smda_function is None:
                     # stored as {} - as unrehashable as a missing blob, so the sample must not be stamped
                     xcfg_missing += 1
                     sample_xcfg_missing += 1
                     continue
-                old_pichash = int(function_document["_pichash"], 16)
-                old_blockhashes = []
-                if "_picblockhashes" in function_document:
-                    for blockhash in function_document["_picblockhashes"]:
-                        blockhash["hash"] = int(blockhash["hash"], 16)
-                        old_blockhashes.append(blockhash)
-                    picblockhashes_updatable += len(old_blockhashes)
-                new_pichash = smda_function.getPicHash(binary_info)
+                picblockhashes_updatable += len(old_blockhashes)
                 if old_pichash != new_pichash:
                     functions_updated += 1
                     update_document["pichash"] = new_pichash
                 # check if any blockhashes changed and possibly stage for update
                 picblockhashes = []
-                for hash_entry in self.blockhasher.getBlockhashesForFunction(smda_function, binary_info.base_addr, binary_info.base_addr + binary_info.binary_size, hash_size=8):
+                for hash_entry in hash_entries:
                     for block_entry in hash_entry["offset_tuples"]:
                         block_entry["hash"] = hash_entry["hash"]
                         picblockhashes.append(block_entry)

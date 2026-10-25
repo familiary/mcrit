@@ -109,9 +109,6 @@ class IngestWriteOrderMixin(unittest.TestCase):
     def test_a_failed_import_leaves_a_sample_another_writer_stored_meanwhile_alone(self):
         export_data = self._export_of("example_report.smda", "example_report_2.smda")
         first_sha256, second_sha256 = list(export_data["sample_entries"])
-        broken = copy.deepcopy(export_data)
-        function_entries = broken["function_entries"][second_sha256]
-        function_entries[next(iter(function_entries))] = {}
         target = self._index()
         storage = target.getStorage()
         import_sample_entry = storage.importSampleEntry
@@ -124,9 +121,12 @@ class IngestWriteOrderMixin(unittest.TestCase):
                 theirs.append(storage.addSmdaReport(load_report("example_report.smda")))
             return import_sample_entry(sample_entry)
 
+        # an export that does not read is refused before any sample is stored, so the import fails
+        # after its samples are written instead: at the function insert, as one MongoDB refuses
         with mock.patch.object(storage, "importSampleEntry", side_effect=stored_meanwhile):
-            with self.assertRaises(Exception):
-                target.addImportData(broken)
+            with mock.patch.object(storage, "importFunctionEntries", side_effect=RuntimeError("refused")):
+                with self.assertRaises(RuntimeError):
+                    target.addImportData(export_data)
         assert theirs[0] is not None
         self.assertEqual(export_data["sample_entries"][first_sha256]["sample_id"], theirs[0].sample_id)
         still_there = storage.getSampleBySha256(first_sha256)
