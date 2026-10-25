@@ -678,7 +678,8 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         from the cache. A cross compare reruns each of the jobs it combined the same way, and its new
         combining job waits for those. Every job involved is checked before any is queued: raises
         JobNotFoundError for an unknown id, JobNotRerunnableError for a job that is queued or running, is
-        no analysis, or whose input is no longer stored.
+        no analysis, or whose input is no longer stored. A cross compare that fails to queue one of its
+        jobs deletes those it queued before, and raises what failed.
         """
         job = self.queue.get_job(job_id)
         if job is None:
@@ -695,8 +696,17 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             self._checkRerunnable(child)
             # keyed by int again, as getMatchesCross submits it, so the descriptor reads like a new cross compare's
             children[int(sample_id)] = child
-        params["0"] = {sample_id: self._rerun(child, username) for sample_id, child in children.items()}
-        return self._rerun(job, username, params=params, await_jobs=list(params["0"].values()))
+        params["0"] = {}
+        try:
+            for sample_id, child in children.items():
+                params["0"][sample_id] = self._rerun(child, username)
+            return self._rerun(job, username, params=params, await_jobs=list(params["0"].values()))
+        except Exception:
+            # no combining job waits for the jobs queued so far, they would only be computed for nobody;
+            # deleting them releases their files too, a job that failed to queue gave up its claims itself
+            for child_job_id in params["0"].values():
+                self.queue.delete_job(child_job_id)
+            raise
 
     def _checkRerunnable(self, job):
         if job.method not in self.RERUNNABLE_METHODS:

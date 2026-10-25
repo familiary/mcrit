@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import falcon
 import falcon.testing
 import pymongo
+import pymongo.errors
 import pytest
 from bson import ObjectId
 from smda.common.SmdaReport import SmdaReport
@@ -153,6 +154,40 @@ class JobRerunTest(unittest.TestCase):
         self.index.deleteJob(newer)
         self.assertFalse(self._fileExists(file_id))
 
+    def test_a_query_rerun_keeps_the_file_when_the_old_job_is_deleted_before_it_is_linked(self):
+        old = self.index.getMatchesForSmdaReport(load_report_json("example_report_3.smda"))
+        self._runQueuedJobs()
+        file_id = self._payload(old, "file_params")["0"]
+        put = self.index.queue.put
+
+        def put_after_deleting_the_old_job(payload, **kwargs):
+            # the file is claimed for the rerun by now, and not linked to it yet
+            self.assertEqual(1, self.index.deleteJob(old))
+            return put(payload, **kwargs)
+
+        with patch.object(self.index.queue, "put", side_effect=put_after_deleting_the_old_job):
+            new = self.index.rerunJob(old)
+        self._runQueuedJobs()
+        self.assertIsNotNone(self._job(new).result)
+        self.assertEqual((0, [new]), (self._fileMeta(file_id)["tmp_lock"], self._fileMeta(file_id)["jobs"]))
+        self.index.deleteJob(new)
+        self.assertFalse(self._fileExists(file_id))
+
+    def test_a_rerun_that_fails_to_queue_gives_up_its_claim_on_the_file(self):
+        old = self.index.getMatchesForSmdaReport(load_report_json("example_report_3.smda"))
+        self._runQueuedJobs()
+        file_id = self._payload(old, "file_params")["0"]
+        count = self._jobCount()
+        # the database going away as the job is put, say
+        with patch.object(self.index.queue, "put", side_effect=pymongo.errors.AutoReconnect("gone")):
+            with self.assertRaises(pymongo.errors.AutoReconnect):
+                self.index.rerunJob(old)
+        self.assertEqual(count, self._jobCount())
+        self.assertEqual((0, [old]), (self._fileMeta(file_id)["tmp_lock"], self._fileMeta(file_id)["jobs"]))
+        # a claim left behind would keep the file after its last job
+        self.index.deleteJob(old)
+        self.assertFalse(self._fileExists(file_id))
+
     def test_a_cross_compare_reruns_every_job_it_combined(self):
         for sample_group_only in (False, True):
             with self.subTest(sample_group_only=sample_group_only):
@@ -173,6 +208,43 @@ class JobRerunTest(unittest.TestCase):
                 self._runQueuedJobs()
                 self.assertEqual(("combineMatchesToCross", "bob"), (self._job(new).method, self._job(new).username))
                 self.assertEqual(self.index.getResultForJob(old), self.index.getResultForJob(new))
+
+    def test_a_cross_compare_asked_for_again_is_served_by_the_rerun(self):
+        # a new cross compare keys its jobs by int sample id, which the descriptor sorts 2 before 12; keyed by str,
+        # "12" would come first, and the rerun would have a descriptor that no new cross compare has
+        for _ in range(10):
+            self.index._storage._useCounter("samples")
+        late_sample_id = self.index.addReport(load_report("library_report.smda"))["sample_info"]["sample_id"]
+        self._runQueuedJobs()
+        sample_ids = [max(self.sample_ids), late_sample_id]
+        self.assertNotEqual(sorted(sample_ids), sorted(sample_ids, key=str))
+        old = self.index.getMatchesCross(sample_ids)
+        self._runQueuedJobs()
+        new = self.index.rerunJob(old)
+        self._runQueuedJobs()
+        self.assertEqual(new, self.index.getMatchesCross(sample_ids))
+
+    def test_a_cross_compare_that_fails_to_queue_deletes_the_jobs_it_queued(self):
+        cross = self.index.getMatchesCross(self.sample_ids)
+        self._runQueuedJobs()
+        count = self._jobCount()
+        put = self.index.queue.put
+        # the puts up to the one that fails: on the second job, and on the combining job after all the others
+        for puts in (["getMatchesForSample"] * 2, ["getMatchesForSample"] * len(self.sample_ids) + ["combineMatchesToCross"]):
+            with self.subTest(failing=puts[-1]):
+                methods = []
+
+                def put_failing_at_the_last(payload, **kwargs):
+                    methods.append(payload["method"])
+                    if len(methods) == len(puts):
+                        raise pymongo.errors.AutoReconnect("gone")
+                    return put(payload, **kwargs)
+
+                with patch.object(self.index.queue, "put", side_effect=put_failing_at_the_last):
+                    with self.assertRaises(pymongo.errors.AutoReconnect):
+                        self.index.rerunJob(cross)
+                self.assertEqual(puts, methods)
+                self.assertEqual(count, self._jobCount())
 
     def test_a_failed_or_terminated_job_can_be_rerun(self):
         failed = self.index.getMatchesForSample(12345)  # no such sample: every attempt fails

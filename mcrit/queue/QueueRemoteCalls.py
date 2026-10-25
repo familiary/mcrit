@@ -305,23 +305,34 @@ def resubmit_payload(self, payload, results_version=None, params=None, await_job
     the <results_version> given rather than the one the stored job was made with. The files are not
     uploaded again: each is claimed by its id, as upload_file_params claims one by its hash, and then
     linked to the new job, so deleting either job keeps the files the other one needs. A file that is
-    gone, or retired on its way out, raises JobNotRerunnableError, and nothing is queued.
+    gone, or retired on its way out, raises JobNotRerunnableError, and nothing is queued. Whatever
+    fails, the claims not yet handed to the new job are given up again.
     """
     if params is None:
         params = json.loads(payload["params"])
     grid_params = json.loads(payload["file_params"])
     hashes = {}
-    for key, file_id in grid_params.items():
-        file_hash = self.queue.claim_file(file_id)
-        if file_hash is None:
-            for claimed_key in hashes:
-                self.queue.release_file(grid_params[claimed_key])
-            raise JobNotRerunnableError("A file the job was given is no longer stored.")
-        hashes[key] = file_hash
-    descriptor = get_descriptor(payload["method"], params, hashes, results_version=results_version)
-    new_payload = _createJobPayload(payload["method"], params, grid_params, descriptor)
-    job_id = str(self.queue.put(new_payload, await_jobs=await_jobs or [], username=username))
-    add_job_id_to_files(self, job_id, grid_params)
+    # the files claimed and not linked yet: a claim left behind keeps its file from ever being deleted,
+    # as delete_job and delete_orphaned_files both pass over a file whose tmp_lock is raised
+    claimed = []
+    try:
+        for key, file_id in grid_params.items():
+            file_hash = self.queue.claim_file(file_id)
+            if file_hash is None:
+                raise JobNotRerunnableError("A file the job was given is no longer stored.")
+            claimed.append(file_id)
+            hashes[key] = file_hash
+        descriptor = get_descriptor(payload["method"], params, hashes, results_version=results_version)
+        new_payload = _createJobPayload(payload["method"], params, grid_params, descriptor)
+        job_id = str(self.queue.put(new_payload, await_jobs=await_jobs or [], username=username))
+        while claimed:
+            # linking lowers the lock the claim raised, so a linked file's claim is the new job's
+            self.queue.add_job_id_to_file(job_id, claimed[-1])
+            claimed.pop()
+    except Exception:
+        for file_id in claimed:
+            self.queue.release_file(file_id)
+        raise
     return job_id
 
 

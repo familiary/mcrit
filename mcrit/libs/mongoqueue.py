@@ -771,7 +771,7 @@ class MongoQueue:
         return file and file["metadata"]["sha256"] or None
 
     def release_file(self, file_id):
-        """Give up a claim no job was linked by; the file is then deleted when no job and no claim holds it."""
+        """Give up a claim no job was linked by. Nothing is deleted here: a file no job holds any more is left to delete_orphaned_files."""
         self._getFsFiles().update_one({"_id": ObjectId(file_id)}, {"$inc": {"metadata.tmp_lock": -1}})
 
     def clean(self):
