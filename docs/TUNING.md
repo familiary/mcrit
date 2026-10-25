@@ -441,7 +441,10 @@ sample still uses, which then outlives that one too. `POST /delete_orphaned_samp
 stale ids off, and deletes chunks without a file document once they are an hour old;
 `dry_run=true` or `dry_run=false` is required in the query string, and with `true` it only
 counts them. It looks at `sample_binaries` alone; the job queue's GridFS has its own sweep,
-`POST /delete_orphaned_queue_files`.
+`POST /delete_orphaned_queue_files`. Chunks younger than an hour without a file document are left
+alone as a store still writing, their age read from the id the writing host stamped, so a writer
+paused for over an hour, or one whose clock runs more than an hour behind the worker running the
+job, could have chunks removed in mid-write - an assumption the queue's sweep makes as well.
 
 Keeping and serving are separate switches because they are separate decisions. The stored
 binaries are the submitted samples - on most instances, live malware - and serving them makes

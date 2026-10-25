@@ -19,24 +19,26 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 - **`POST /delete_orphaned_sample_binaries` (`McritClient.deleteOrphanedSampleBinaries`) collects
   the kept binaries no sample refers to any more** ([#80]). A process dying between deleting a
-  sample and releasing its binary, or while storing one, left files in the `sample_binaries`
-  bucket that nothing deleted, and a deleted sample's id left on a binary shared with another
-  sample kept that binary after the other was deleted too. The job deletes the binaries none of
-  whose samples exists, takes the ids of samples that are gone off the binaries that stay (and
-  deletes one that this leaves with none, its last sample having been deleted while it ran), and
-  deletes chunks without a file document once they are an hour old, since younger ones may be a
-  store still running. Its result counts each (`binaries`, `stale_sample_ids`, `chunk_files`).
-  `dry_run` works as for `POST /delete_orphaned_queue_files`: it is required in the query string,
-  and with `dry_run=true` nothing is changed. A sample submitted while the job runs keeps its
-  binary, because a sample is written before its binary and the job reads the files before it
-  looks up the samples they name. A submission of the same bytes racing the job either keeps the
-  file or stores a fresh copy, as it does against `deleteSample`, so a real run can delete fewer
-  than a dry run counted. A file in the bucket without `metadata.sample_ids` is not one MCRIT
-  wrote and is left alone. An id on a file is looked up whatever its numeric type, so a sample
-  whose `sample_id` an edit stored as `5.0` keeps its binary, and an id that is not a number is
-  kept as if its sample existed. This is a route of its own rather than part of the queue sweep: the
-  bucket belongs to the storage, and the queue may keep its GridFS in another database. An
-  instance that has kept binaries and deleted samples can run it once with `dry_run=true` to see
+  sample and releasing its binary, or while storing one, left files in the `sample_binaries` bucket
+  that nothing deleted, and a deleted sample's id left on a binary shared with another sample kept
+  that binary after the other was deleted too. The job deletes the binaries none of whose samples
+  exists, takes the ids of samples that are gone off the binaries that stay (and deletes one that
+  this leaves with none, its last sample having been deleted while it ran), and deletes chunks
+  without a file document once they are an hour old, since younger ones may be a store still
+  running. As with the queue's sweep, that assumes no store stalls for over an hour and the hosts'
+  clocks agree to within one: a writer paused that long, or one whose clock runs over an hour behind
+  the worker's, could lose chunks it is still writing. Its result counts each (`binaries`,
+  `stale_sample_ids`, `chunk_files`). `dry_run` works as for `POST /delete_orphaned_queue_files`: it
+  is required in the query string, and with `dry_run=true` nothing is changed. A sample submitted
+  while the job runs keeps its binary, because a sample is written before its binary and the job
+  reads the files before it looks up the samples they name. A submission of the same bytes racing
+  the job either keeps the file or stores a fresh copy, as it does against `deleteSample`, so a real
+  run can delete fewer than a dry run counted. A file in the bucket without `metadata.sample_ids` is
+  not one MCRIT wrote and is left alone. An id on a file is looked up whatever its numeric type, so
+  a sample whose `sample_id` an edit stored as `5.0` keeps its binary, and an id that is not a
+  number is kept as if its sample existed. This is a route of its own rather than part of the queue
+  sweep: the bucket belongs to the storage, and the queue may keep its GridFS in another database.
+  An instance that has kept binaries and deleted samples can run it once with `dry_run=true` to see
   whether anything was left. The in-memory storage answers the same, with no chunks.
 
 ## [1.16.0] - 2026-10-16
