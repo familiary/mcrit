@@ -353,7 +353,42 @@ and every new setting is off by default.
   pooled connection the server already closed, which surfaces as a connection error on that call.
   Tests patch `requests.Session` methods instead of the module-level `requests` functions. (#254)
 
+- **Pichashes and picblockhashes are stored zero-padded to 16 hex digits ([#145])**, so that
+  their string order is their numeric order: the MongoDB backend now answers range conditions on
+  `pichash` and sorts (and pages) function searches by it. A new instance is padded from the
+  start. An existing one keeps its variable-width values, and keeps rejecting both, until
+  `python -m mcrit.migrations.migrate_pichash_padding --mode pad` has rewritten them and set the
+  `pichash_padded` settings flag (`--mode verify` checks, `--mode unpad` rolls back); every other
+  reader accepts both widths meanwhile, and `/status` reports `pichash_padded`. Stop the server
+  and workers for the migration and restart them afterwards. It drops the two indexes keyed on the
+  stored spelling - `pichash_counts` and the inverted `picblockhashes` index - and marks them
+  incomplete, since left behind they would miss every lookup: the cutoff would drop every PicHash
+  match, and `getUniqueBlocks` would report every shared block with a leading zero as unique (15
+  blocks unique to a sample that has none, in the test data). Both fall back to reading the
+  functions collection, correctly but slowly, until `rebuildPicHashCountIndex()` and
+  `rebuildPicBlockHashIndex()` (`GET /rebuild_picblockhash_index`) have run. Unique-block results
+  and the YARA rules built from them name blocks by the stored hex, so on a padded instance those
+  names are 16 digits wide. A run that finds nothing to rewrite (a repeated `pad`, or `pad` on an
+  instance padded from the start) keeps both indexes. Until the migration is complete a value may
+  be stored in both spellings; the cutoff (`MINHASH_PICHASH_MAX_MATCHES`) sums the holders of both
+  and keeps or drops the value as a unit, and without its count index it counts them the slow way
+  and logs a warning, with the same results. Only values of 0..2^64-1 fit 16 digits, so a report or
+  import naming a pichash or picblockhash outside that range is now refused: `POST /samples`
+  answers 400, a query job fails, and `POST /import` skips the sample and counts it as skipped.
+  Padding -5 would have stored `"0x-000000000000005"`, which nothing reads back. Older releases
+  stored such values unchecked (-5 as `"-0x5"`); `pad` and `unpad` leave them alone, and `verify`
+  reports them as a problem until their sample is deleted. A pichash-sorted search pages through
+  a new (`_pichash`, `function_id`) index like the other sort fields, instead of sorting the whole
+  `functions` collection for every page; the first start after upgrading builds it once.
+
 ### Fixed
+
+- **A pic_hash that isn't an integer no longer half-stores a sample.** A report's
+  `metadata.pic_hash` comes straight from the submitter, and a dict such as `{"$eq": ...}` was
+  stored as a sub-document; the insert then failed halfway, leaving a sample without its function
+  range and family statistics. It's refused now with the rest of the out-of-range values (see the
+  zero-padded pichash entry). `POST /samples` also answers 400 instead of 500 for any report smda
+  refuses as malformed.
 
 - **`McritClient` raised a `JSONDecodeError` for a 2xx whose body is not JSON** ([#257]). A reverse
   proxy's error or login page, or an empty answer, with a 200 or 202 status went through
@@ -1490,6 +1525,7 @@ date, the version, and what changed.
 [1.9.0]: https://github.com/danielplohmann/mcrit/compare/v1.8.1...v1.9.0
 [#44]: https://github.com/danielplohmann/mcrit/issues/44
 [#142]: https://github.com/danielplohmann/mcrit/issues/142
+[#145]: https://github.com/danielplohmann/mcrit/issues/145
 [#147]: https://github.com/danielplohmann/mcrit/pull/147
 [#149]: https://github.com/danielplohmann/mcrit/issues/149
 [#150]: https://github.com/danielplohmann/mcrit/issues/150

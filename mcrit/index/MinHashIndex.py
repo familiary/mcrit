@@ -346,6 +346,20 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                     import_report["num_samples_skipped"] += 1
                     import_report["num_functions_skipped"] += sample_entry_dict["statistics"]["num_functions"]
                     continue
+                function_entries = []
+                if sample_sha256 in export_data["function_entries"]:
+                    function_entry_dicts = export_data["function_entries"][sample_sha256]
+                    # decompress function_entries if necessary
+                    if is_compressed:
+                        function_entry_dicts = json.loads(decompress_decode(function_entry_dicts))
+                    function_entries = [FunctionEntry.fromDict(function_entry_dict) for function_entry_dict in function_entry_dicts.values()]
+                # checked before the sample is added: a pichash that cannot be stored would be written in
+                # a form no reader decodes, failing every read, search page and export that meets it
+                if not all(function_entry.hasValidPicHashes() for function_entry in function_entries):
+                    LOGGER.warning("Sample with SHA256 %s carries a pichash or picblockhash that is not an integer of 0..2**64-1, skipping...", sample_sha256)
+                    import_report["num_samples_skipped"] += 1
+                    import_report["num_functions_skipped"] += len(function_entries)
+                    continue
                 sample_entry = SampleEntry.fromDict(sample_entry_dict)
                 # adjust family_id in sample_entry using our remapping
                 sample_entry.family_id = family_id_remapping[sample_entry.family_id]
@@ -359,18 +373,12 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                     continue
                 import_report["num_samples_imported"] += 1
                 imported_sample_entries.append(remapped_sample_entry)
-                if sample_sha256 in export_data["function_entries"]:
-                    function_entries = export_data["function_entries"][sample_sha256]
-                    # decompress function_entries if necessary
-                    if is_compressed:
-                        function_entries = json.loads(decompress_decode(function_entries))
-                    # iterate functions and add them, adjusting family_id and sample_id
-                    for old_function_id, function_entry_dict in function_entries.items():
-                        function_entry = FunctionEntry.fromDict(function_entry_dict)
-                        function_entry.sample_id = remapped_sample_entry.sample_id
-                        function_entry.family_id = remapped_sample_entry.family_id
-                        function_entries_to_import.append(function_entry)
-                        import_report["num_functions_imported"] += 1
+                # iterate functions and add them, adjusting family_id and sample_id
+                for function_entry in function_entries:
+                    function_entry.sample_id = remapped_sample_entry.sample_id
+                    function_entry.family_id = remapped_sample_entry.family_id
+                    function_entries_to_import.append(function_entry)
+                    import_report["num_functions_imported"] += 1
                 LOGGER.info("Sample %d with SHA256 %s added...", index, sample_sha256)
 
             adjusted_function_entries = storage.importFunctionEntries(function_entries_to_import)
@@ -733,6 +741,9 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 "num_families": storage_stats["num_families"],
                 "num_functions": storage_stats["num_functions"],
                 "num_pichashes": storage_stats["num_pichashes"],
+                # False on an instance created before pichashes were stored zero-padded and not yet
+                # migrated (migrate_pichash_padding); range conditions and sorting by pichash need True (#145)
+                "pichash_padded": storage_stats.get("pichash_padded", True),
                 # minhashes are only comparable across functions escaped by the same smda; see
                 # mcrit/minhash/EscaperFingerprint.py for why this is worth surfacing
                 "smda_version": SMDA_VERSION,

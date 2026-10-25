@@ -155,7 +155,14 @@ class SampleResource:
             db_log_msg(self.index, req, "SampleResource.on_post_collection - failed - JSON not processible.")
             return
         username = req.get_header("username", default="anonymous")
-        summary = self.index.addReportJson(req.media, username=username)
+        try:
+            summary = self.index.addReportJson(req.media, username=username)
+        except ValueError as error:
+            # a report smda refuses as malformed, or one stating a pic_hash that cannot be stored
+            resp.data = jsonify({"status": "failed", "data": {"message": f"SMDA report rejected: {error}"}})
+            resp.status = falcon.HTTP_400
+            db_log_msg(self.index, req, "SampleResource.on_post_collection - failed - report rejected.")
+            return
         if summary is not None:
             resp.data = jsonify({"status": "successful", "data": summary})
             db_log_msg(self.index, req, "SampleResource.on_post_collection - success.")

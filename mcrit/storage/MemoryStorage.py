@@ -20,7 +20,7 @@ from mcrit.index.SearchQueryTree import AndNode, BaseVisitor, FilterSingleElemen
 from mcrit.minhash.MinHash import MinHash
 from mcrit.minhash.MinHasher import MINHASH_SHINGLER_REVISION
 from mcrit.storage.FamilyEntry import FamilyEntry
-from mcrit.storage.FunctionEntry import FunctionEntry
+from mcrit.storage.FunctionEntry import FunctionEntry, checkSubmittedPicHashes
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
 from mcrit.storage.MatchingCache import MatchingCache, StorageBackedMatchingCache
 from mcrit.storage.SampleEntry import TIMESTAMP_FORMAT, SampleEntry
@@ -544,6 +544,8 @@ class MemoryStorage(StorageInterface):
 
     def addSmdaReport(self, smda_report: "SmdaReport", isQuery=False) -> Optional["SampleEntry"]:
         assert smda_report.sha256 is not None
+        # refused as MongoDbStorage refuses it, before any of the report is stored
+        checkSubmittedPicHashes(smda_report)
         sample_entry = None
         if isQuery:
             sample_entry = SampleEntry(smda_report, sample_id=-1 * self._useCounter("query_samples"), family_id=0)
@@ -1067,6 +1069,8 @@ class MemoryStorage(StorageInterface):
             "num_bands": len(self._bands),
             # None signals "not computed", so that consumers can distinguish it from an actual count of 0
             "num_pichashes": len(self._pichashes) if with_pichash else None,
+            # pichashes are kept as integers here, so their order is always numeric (#145)
+            "pichash_padded": True,
         }
         return stats
 
