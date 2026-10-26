@@ -320,7 +320,12 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         for exported_family_id, actors in (export_data.get("family_actors") or {}).items():
             remapped_family_id = family_id_remapping.get(int(exported_family_id))
             local_family = storage.getFamily(remapped_family_id) if remapped_family_id is not None else None
-            # held to what the API accepts: an export is data from elsewhere
+            # held to what the API accepts: an export is data from elsewhere. A value that is not a
+            # list was iterated, so a string "APT28" imported as the actors A, P, T, 2 and 8; it is one
+            # invalid value instead
+            if actors is not None and not isinstance(actors, list):
+                LOGGER.warning("Dropping the actors of imported family %s, which are not a list.", exported_family_id)
+                actors = []
             valid_actors = [actor for actor in actors or [] if FamilyEntry.isValidActor(actor)]
             if len(valid_actors) != len(actors or []):
                 LOGGER.warning("Dropping %d invalid actor name(s) of imported family %s.", len(actors or []) - len(valid_actors), exported_family_id)
