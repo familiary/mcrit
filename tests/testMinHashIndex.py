@@ -326,6 +326,28 @@ class EscaperProvenanceTestSuite(unittest.TestCase):
         target.addImportData(export_data)
         self.assertEqual(["Actor A"], target.getStorage().getFamily(target_family_id).actors)
 
+    def testImportedActorsThatAreNotAListAreNone(self):
+        """a string was iterated, so "APT28" imported as the actors A, P, T, 2 and 8 - each of them a
+        valid name, so nothing even warned"""
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_report.smda")) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        report.family = "actors_family"
+        source = MinHashIndex(config)
+        sample_entry = source.getStorage().addSmdaReport(report)
+        assert sample_entry is not None
+        export_data = json.loads(json.dumps(source.getExportData()))
+        export_data["family_actors"] = {str(sample_entry.family_id): "APT28"}
+        target = MinHashIndex(config)
+        target_family_id = target.getStorage().addFamily("actors_family")
+        target.getStorage().modifyFamily(target_family_id, {"actors": ["Actor B"]})
+        with patch("mcrit.index.MinHashIndex.LOGGER") as logger:
+            target.addImportData(export_data)
+        self.assertEqual(["Actor B"], target.getStorage().getFamily(target_family_id).actors)
+        self.assertIn(
+            f"Dropping the actors of imported family {sample_entry.family_id}, which are not a list.", [call.args[0] % call.args[1:] for call in logger.warning.call_args_list]
+        )
+
     def testImportOfMatchingEscaperIsNotFlagged(self):
         index = MinHashIndex(config)
         report = index.addImportData(self._minimalExport(index))

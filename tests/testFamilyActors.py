@@ -22,6 +22,14 @@ class FamilyEntryActors(unittest.TestCase):
         self.assertEqual([], FamilyEntry.fromDict(legacy).actors)
         self.assertEqual([], FamilyEntry(family_name="x").actors)
 
+    def test_actors_that_are_not_a_list_read_as_none(self):
+        """fromDict took list() of whatever it found, so "actors": "APT28" read as the actors
+        A, P, T, 2 and 8"""
+        for value in ("APT28", {"APT28": 1}, 5):
+            entry_dict = FamilyEntry(family_name="win.citadel", family_id=5).toDict()
+            entry_dict["actors"] = value
+            self.assertEqual([], FamilyEntry.fromDict(entry_dict).actors)
+
     def test_normalisation(self):
         self.assertEqual(["A", "B"], FamilyEntry.normalizeActors([" A ", "B", "A", "", "  "]))
         self.assertEqual([], FamilyEntry.normalizeActors(None))
