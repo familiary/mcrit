@@ -4,6 +4,7 @@ import smda.common.SmdaFunction as smda_function_module
 from smda.common.BinaryInfo import BinaryInfo
 from smda.common.SmdaFunction import SmdaFunction
 
+from mcrit.libs.tags import tagsOfEntryDict
 from mcrit.libs.utility import decode_two_complement, encode_two_complement
 from mcrit.minhash.MinHash import MinHash
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
@@ -80,6 +81,8 @@ class FunctionEntry:
     binweight: float
     offset: int
     xcfg: Optional[Dict]
+    # free labels an analyst attached, normalised by mcrit.libs.tags (#53)
+    tags: List[str]
 
     def __init__(
         self,
@@ -103,6 +106,7 @@ class FunctionEntry:
             self.pichash = smda_function.pic_hash or 0
             self.picblockhashes = []
         self.function_labels = []
+        self.tags = []
         self.matches = {}
         empty_minhash = MinHash()
         self.minhash = minhash.getMinHash() if minhash else empty_minhash.getMinHash()
@@ -139,6 +143,10 @@ class FunctionEntry:
             "sample_id": self.sample_id,
             "xcfg": self.xcfg,
         }
+        # most functions carry no tags, and a whole-corpus export or report holds millions of them,
+        # so the key is left out while empty; fromDict reads it missing as no tags (#53)
+        if self.tags:
+            function_entry["tags"] = list(self.tags)
         return function_entry
 
     @classmethod
@@ -162,6 +170,8 @@ class FunctionEntry:
         function_entry.binweight = entry_dict["binweight"]
         function_entry.offset = decode_two_complement(entry_dict["offset"])
         function_entry.xcfg = entry_dict["xcfg"] if "xcfg" in entry_dict else None
+        # functions stored before #53 carry no tags, and MongoDbStorage leaves the field out while empty
+        function_entry.tags = tagsOfEntryDict(entry_dict)
         return function_entry
 
     def __str__(self):
