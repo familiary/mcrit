@@ -19,7 +19,9 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 - `mcrit client submit --disassembler ida`, using IDA Pro headlessly instead of SMDA to disassemble
   submitted files, with `--ida-sigs` applying a FLIRT signature bundle and `--ida-sig-min-matches`
-  setting how many functions a signature must name to be kept. It needs IDA Pro 9.1+, its licence
+  setting how many functions a signature must name to be kept, and `--ida-saved-databases` opening the
+  database saved beside a sample (`<sample>.i64`) so the functions an analyst named there reach MCRIT
+  as labels. It needs IDA Pro 9.1+, its licence
   accepted once in the GUI, `pip install "mcrit[ida]"` and `IDADIR`; without the package the run
   stops with that hint before any file is touched. Every file
   is disassembled in its own subprocess because the headless IDA library holds one database per

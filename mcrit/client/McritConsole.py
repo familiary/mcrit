@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from smda.common.SmdaReport import SmdaReport
 from smda.Disassembler import Disassembler
 
-from mcrit.client.IdaReportProducer import IDA_MISSING_MESSAGE, produceIdaReport, removeAbandonedWorkingDirectories, workingDirectoryPrefix
+from mcrit.client.IdaReportProducer import IDA_MISSING_MESSAGE, isIdaDatabaseFile, produceIdaReport, removeAbandonedWorkingDirectories, workingDirectoryPrefix
 from mcrit.client.McritClient import McritClient
 from mcrit.storage.FamilyEntry import FamilyEntry
 from mcrit.storage.FunctionEntry import FunctionEntry
@@ -156,6 +156,8 @@ def getSmdaReportFromFilepath(args, filepath):
                 smda_report = SmdaReport.fromFile(filepath)
             except Exception:
                 print(f"Failed to parse SMDA report: {filepath}")
+    elif args.ida_saved_databases and isIdaDatabaseFile(filepath):
+        print(f"Skipping an IDA database file, it is opened with its sample: {filepath}")
     else:
         if args.executables_only and not is_pe_or_elf(filepath):
             print(f"Skipping a file not recognized as executable: {filepath}")
@@ -166,7 +168,7 @@ def getSmdaReportFromFilepath(args, filepath):
                     if base_addr is not None:
                         print(f"NOTE: Ignoring the base address in the filename, IDA's loader decides: {filepath}")
                     min_matches = IDA_SIG_MIN_MATCHES if args.ida_sig_min_matches is None else args.ida_sig_min_matches
-                    smda_report = produceIdaReport(filepath, args.ida_sigs, min_matches)
+                    smda_report = produceIdaReport(filepath, args.ida_sigs, min_matches, args.ida_saved_databases)
                     # IDA loads a file of no known format as a raw binary instead of refusing it
                     if not smda_report.num_functions:
                         print(f"Skipping a file in which IDA found no functions: {filepath}")
@@ -231,6 +233,8 @@ def submitViaSubprocess(args, filepath):
         command.extend(["--ida-sigs", args.ida_sigs])
     if args.ida_sig_min_matches is not None:
         command.extend(["--ida-sig-min-matches", str(args.ida_sig_min_matches)])
+    if args.ida_saved_databases:
+        command.extend(["--ida-saved-databases"])
     command.append(filepath)
     # the child's temporary files - for IDA the working copy of the sample and its database - go to a
     # directory removed below: a child killed at the timeout or crashing natively cannot clean up itself
@@ -323,6 +327,11 @@ class McritConsole:
             type=int,
             default=None,
             help=f"Number of functions a FLIRT signature must name to be kept (only with --disassembler ida, default: {IDA_SIG_MIN_MATCHES}).",
+        )
+        client_submit.add_argument(
+            "--ida-saved-databases",
+            action="store_true",
+            help="Open the IDA database saved beside a sample (<sample>.i64 or .idb) instead of analysing it afresh, so its function names reach MCRIT; IDA's own files are not submitted as samples (only with --disassembler ida).",
         )
         client_submit.add_argument("-w", "--worker", action="store_true", help="Spawn workers to process the submission (only in modes: dir/recursive/malpedia, default: False).")
         client_submit.add_argument("-t", "--worker-timeout", type=int, default=300, help="Timeout for workers to conclude the submission (default: 300 seconds).")
@@ -519,8 +528,8 @@ class McritConsole:
         if args.disassembler == "ida" and args.smda:
             print("Disassembler <ida> is not compatible with SMDA report loading.")
             return
-        if args.disassembler != "ida" and (args.ida_sigs is not None or args.ida_sig_min_matches is not None):
-            print("Options <ida-sigs|ida-sig-min-matches> only work with disassembler <ida>.")
+        if args.disassembler != "ida" and (args.ida_sigs is not None or args.ida_sig_min_matches is not None or args.ida_saved_databases):
+            print("Options <ida-sigs|ida-sig-min-matches|ida-saved-databases> only work with disassembler <ida>.")
             return
         if args.ida_sigs is not None and not os.path.isdir(args.ida_sigs):
             print("Your <ida-sigs> is not a directory or does not exist.")

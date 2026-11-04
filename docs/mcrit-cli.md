@@ -10,7 +10,8 @@ Here is its documentation:
 ```
 usage: mcrit client submit [-h] [--mode {file,dir,recursive,malpedia}] [-f FAMILY] [-v VERSION] [-l] [-u] [-x]
                            [-o OUTPUT] [-s] [--disassembler {smda,ida}] [--ida-sigs IDA_SIGS]
-                           [--ida-sig-min-matches IDA_SIG_MIN_MATCHES] [-w] [-t WORKER_TIMEOUT]
+                           [--ida-sig-min-matches IDA_SIG_MIN_MATCHES] [--ida-saved-databases] [-w]
+                           [-t WORKER_TIMEOUT]
                            filepath
 
 positional arguments:
@@ -41,6 +42,10 @@ options:
   --ida-sig-min-matches IDA_SIG_MIN_MATCHES
                         Number of functions a FLIRT signature must name to be kept (only with --disassembler ida,
                         default: 10).
+  --ida-saved-databases
+                        Open the IDA database saved beside a sample (<sample>.i64 or .idb) instead of analysing it
+                        afresh, so its function names reach MCRIT; IDA's own files are not submitted as samples
+                        (only with --disassembler ida).
   -w, --worker          Spawn workers to process the submission (only in modes: dir/recursive/malpedia, default:
                         False).
   -t, --worker-timeout WORKER_TIMEOUT
@@ -117,11 +122,19 @@ top-level `windows/ linux/ golang/ rust/` directories. Candidate signatures are 
 format and architecture of the sample, then each candidate is applied and kept only if it names at
 least `--ida-sig-min-matches` functions, and undone otherwise.
 
+`--ida-saved-databases` submits an analyst's work instead of a fresh analysis: where IDA has saved a
+database beside a sample as `<sample>.i64` (or `.idb`), a copy of that database is opened, so the
+functions named in it reach MCRIT as labels. A sample without one is analysed as usual. The sample's
+SHA-256 and filename still come from the sample file. In `dir` and `recursive` modes IDA's own files
+(`.i64`, `.idb`, `.id0`, `.id1`, `.id2`, `.nam`, `.til`) are skipped rather than submitted. FLIRT
+signatures from `--ida-sigs` are applied on top and only name functions still unnamed.
+
 Caveats:
 
 * FLIRT results reach MCRIT only as function names, which the server stores as function labels attributed
   to the submitting user. There is no per-function library flag - `--library` remains a per-sample property.
-* The sample is copied to a temporary directory before analysis, so no IDA database files appear next to it.
+* The sample (or, with `--ida-saved-databases`, its database) is copied to a temporary directory before
+  analysis, so no IDA database files appear next to it and a saved database is never modified.
 * IDA loads a file of no format it recognises as a raw binary instead of refusing it, so a file in which
   it finds no functions is skipped rather than stored as an empty sample.
 * If the `ida-domain` package is missing, the run stops with an install hint before touching any file.

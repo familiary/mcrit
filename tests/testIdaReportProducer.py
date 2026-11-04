@@ -13,7 +13,15 @@ from unittest import mock
 
 from packaging import version
 
-from mcrit.client.IdaReportProducer import applySigs, produceIdaReport, removeAbandonedWorkingDirectories, selectCandidateSigs, workingDirectoryPrefix
+from mcrit.client.IdaReportProducer import (
+    applySigs,
+    findSavedDatabase,
+    isIdaDatabaseFile,
+    produceIdaReport,
+    removeAbandonedWorkingDirectories,
+    selectCandidateSigs,
+    workingDirectoryPrefix,
+)
 
 LOG = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)-15s %(message)s")
@@ -226,10 +234,10 @@ class ProduceIdaReportTest(unittest.TestCase):
         self.assertNotEqual(os.path.dirname(self.sample_path), os.path.dirname(path))
         return self.interface
 
-    def _patchedRun(self, disassembler, sig_root=None):
+    def _patchedRun(self, disassembler, sig_root=None, use_saved_database=False):
         with mock.patch.object(self.ida_interface_class, "fromPath", self._fromPath):
             with mock.patch("smda.Disassembler.Disassembler", disassembler):
-                return produceIdaReport(self.sample_path, sig_root=sig_root)
+                return produceIdaReport(self.sample_path, sig_root=sig_root, use_saved_database=use_saved_database)
 
     def testReportMetadataComesFromOriginalFile(self):
         class FakeDisassembler:
@@ -278,6 +286,60 @@ class ProduceIdaReportTest(unittest.TestCase):
         self.assertIn("mcrit[ida]", str(context.exception))
         self.assertIn("IDADIR", str(context.exception))
         self.assertIsNone(self.ida_interface_class.instance)
+
+
+    def testSavedDatabaseIsOpenedInsteadOfTheSample(self):
+        class FakeDisassembler:
+            def __init__(self, config=None, backend=None):
+                pass
+
+            def disassembleBuffer(self, buffer, base_addr):
+                return FakeReport()
+
+        database_path = self.sample_path + ".i64"
+        with open(database_path, "wb") as database_file:
+            database_file.write(b"IDA2")
+        opened = []
+        original = self._fromPath
+        self._fromPath = lambda path, save_on_close=False: opened.append(os.path.basename(path)) or original(path, save_on_close)
+        report = self._patchedRun(FakeDisassembler, use_saved_database=True)
+        self.assertEqual(["sample.exe.i64"], opened)
+        # the report still describes the sample, not the database
+        self.assertEqual(hashlib.sha256(self.sample_content).hexdigest(), report.sha256)
+        self.assertEqual("sample.exe", report.filename)
+        with open(database_path, "rb") as database_file:
+            self.assertEqual(b"IDA2", database_file.read())
+
+    def testSampleIsAnalysedWhenNoDatabaseIsSaved(self):
+        class FakeDisassembler:
+            def __init__(self, config=None, backend=None):
+                pass
+
+            def disassembleBuffer(self, buffer, base_addr):
+                return FakeReport()
+
+        opened = []
+        original = self._fromPath
+        self._fromPath = lambda path, save_on_close=False: opened.append(os.path.basename(path)) or original(path, save_on_close)
+        self._patchedRun(FakeDisassembler, use_saved_database=True)
+        self.assertEqual(["sample.exe"], opened)
+
+
+class SavedDatabaseTest(unittest.TestCase):
+    def testFindsI64ThenIdbBesideTheSample(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample = os.path.join(temp_dir, "sample")
+            self.assertIsNone(findSavedDatabase(sample))
+            open(sample + ".idb", "wb").close()
+            self.assertEqual(sample + ".idb", findSavedDatabase(sample))
+            open(sample + ".i64", "wb").close()
+            self.assertEqual(sample + ".i64", findSavedDatabase(sample))
+
+    def testRecognisesTheFilesOfADatabase(self):
+        for name in ("a.i64", "a.IDB", "a.id0", "a.id1", "a.id2", "a.nam", "a.til"):
+            self.assertTrue(isIdaDatabaseFile(name), name)
+        for name in ("a.exe", "a.dll", "a", "a.i64.txt"):
+            self.assertFalse(isIdaDatabaseFile(name), name)
 
 
 class AbandonedWorkingDirectoriesTest(unittest.TestCase):

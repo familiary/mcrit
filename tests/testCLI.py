@@ -171,6 +171,39 @@ class TestCLI(unittest.TestCase):
                 mock_popen.return_value.wait.assert_called_once()
                 self.assertEqual([], os.listdir(parent_tmp))
 
+    def testIdaSavedDatabasesRequireIdaDisassembler(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            console, args = self._submitArgs(["--ida-saved-databases", tmp_dir, "--mode", "dir"])
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                console._handle_submit(args)
+            self.assertIn("only work with disassembler <ida>", stdout.getvalue())
+            console.client.getSamples.assert_not_called()
+
+    def testIdaSavedDatabasesReachTheProducer(self):
+        _, args = self._submitArgs(["--disassembler", "ida", "--ida-saved-databases", "/some/sample"])
+        with patch("mcrit.client.McritConsole.produceIdaReport", return_value=MagicMock(family="", version="")) as mock_produce:
+            with contextlib.redirect_stdout(io.StringIO()):
+                getSmdaReportFromFilepath(args, "/some/sample")
+        mock_produce.assert_called_once_with("/some/sample", None, 10, True)
+
+    def testIdaDatabaseFilesAreNotSubmittedAsSamples(self):
+        _, args = self._submitArgs(["--disassembler", "ida", "--ida-saved-databases", "/some/dir", "--mode", "dir"])
+        with patch("mcrit.client.McritConsole.produceIdaReport") as mock_produce:
+            with contextlib.redirect_stdout(io.StringIO()):
+                for name in ("/some/dir/sample.i64", "/some/dir/sample.id0", "/some/dir/sample.nam"):
+                    self.assertIsNone(getSmdaReportFromFilepath(args, name))
+        mock_produce.assert_not_called()
+
+    def testIdaSavedDatabasesAreForwardedToWorkers(self):
+        console = McritConsole()
+        args = console.parser.parse_args(["client", "submit", "/some/dir", "--mode", "dir", "--disassembler", "ida", "--ida-saved-databases"])
+        with patch("mcrit.client.McritConsole.subprocess.Popen") as mock_popen:
+            mock_popen.return_value.communicate.return_value = (b"", b"")
+            with contextlib.redirect_stdout(io.StringIO()):
+                submitViaSubprocess(args, "/some/sample")
+        self.assertTrue(console.parser.parse_args(mock_popen.call_args[0][0][3:]).ida_saved_databases)
+
     def testSubprocessCommandParsesWithServerAndToken(self):
         console = McritConsole()
         args = console.parser.parse_args(["client", "--server", "http://127.0.0.1:1", "--apitoken", "token", "submit", "/some/dir", "--mode", "dir", "-f", "some_family"])
@@ -199,7 +232,7 @@ class TestCLI(unittest.TestCase):
             with patch("mcrit.client.McritConsole.produceIdaReport", return_value=report) as mock_produce:
                 with contextlib.redirect_stdout(io.StringIO()):
                     result = getSmdaReportFromFilepath(args, "/some/sample")
-            mock_produce.assert_called_once_with("/some/sample", tmp_dir, 10)
+            mock_produce.assert_called_once_with("/some/sample", tmp_dir, 10, False)
             self.assertIs(result, report)
             self.assertEqual(report.family, "some_family")
             self.assertEqual(report.version, "some_version")

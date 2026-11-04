@@ -227,16 +227,38 @@ def removeAbandonedWorkingDirectories(temp_root: Optional[str] = None) -> List[s
     return removed
 
 
-def produceIdaReport(filepath: str, sig_root: Optional[str] = None, min_matches: int = 10) -> SmdaReport:
-    """Disassemble a file through a headless IDA database and return it as an SmdaReport."""
+# the files IDA keeps for a database: the packed form, and the unpacked parts beside an open one
+IDA_DATABASE_SUFFIXES = (".i64", ".idb", ".id0", ".id1", ".id2", ".nam", ".til")
+
+
+def isIdaDatabaseFile(filepath: str) -> bool:
+    return filepath.lower().endswith(IDA_DATABASE_SUFFIXES)
+
+
+def findSavedDatabase(filepath: str) -> Optional[str]:
+    """The database IDA saved beside a sample, <sample>.i64 or <sample>.idb, if there is one."""
+    for suffix in (".i64", ".idb"):
+        if os.path.isfile(filepath + suffix):
+            return filepath + suffix
+    return None
+
+
+def produceIdaReport(
+    filepath: str, sig_root: Optional[str] = None, min_matches: int = 10, use_saved_database: bool = False
+) -> SmdaReport:
+    """Disassemble a file through a headless IDA database and return it as an SmdaReport.
+
+    With use_saved_database, a database saved beside the sample is opened instead of analysing the
+    sample afresh, so the function names an analyst gave it reach the report."""
     from smda.Disassembler import Disassembler
     from smda.ida.IdaInterface import IdaInterface
     from smda.SmdaConfig import SmdaConfig
 
     with tempfile.TemporaryDirectory(prefix=workingDirectoryPrefix("ida")) as temp_dir:
         # IDA writes its database files next to the input, so it must never see the original sample
-        working_copy = os.path.join(temp_dir, os.path.basename(filepath))
-        shutil.copyfile(filepath, working_copy)
+        source = (use_saved_database and findSavedDatabase(filepath)) or filepath
+        working_copy = os.path.join(temp_dir, os.path.basename(source))
+        shutil.copyfile(source, working_copy)
         interface = None
         try:
             try:
