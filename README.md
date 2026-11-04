@@ -97,6 +97,8 @@ $ mcrit client submit sample_unpacked -f some_family
  1.039s -> (architecture: intel.32bit, base_addr: 0x10000000): 634 functions
 ```
 
+Submissions are disassembled with SMDA by default. With `pip install "mcrit[ida]"` and an `IDADIR` pointing at an IDA Pro 9.1+ installation, `mcrit client submit --disassembler ida` uses IDA Pro headlessly instead, optionally applying FLIRT signatures - see [Using IDA Pro as the disassembler](docs/mcrit-cli.md#using-ida-pro-as-the-disassembler).
+
 A more extensive documentation of the MCRIT CLI is available [here](docs/mcrit-cli.md)
 
 ### MCRIT IDA Plugin
