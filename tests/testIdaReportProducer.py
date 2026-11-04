@@ -227,9 +227,11 @@ class ProduceIdaReportTest(unittest.TestCase):
         self.addCleanup(setattr, self.ida_interface_class, "instance", None)
         self.interface = FakeInterface()
         self.working_dirs = []
+        self.opened = []
 
     def _fromPath(self, path, save_on_close=False):
         self.working_dirs.append(os.path.dirname(path))
+        self.opened.append(os.path.basename(path))
         self.assertTrue(os.path.isfile(path))
         self.assertNotEqual(os.path.dirname(self.sample_path), os.path.dirname(path))
         return self.interface
@@ -298,11 +300,8 @@ class ProduceIdaReportTest(unittest.TestCase):
         database_path = self.sample_path + ".i64"
         with open(database_path, "wb") as database_file:
             database_file.write(b"IDA2")
-        opened = []
-        original = self._fromPath
-        self._fromPath = lambda path, save_on_close=False: opened.append(os.path.basename(path)) or original(path, save_on_close)
         report = self._patchedRun(FakeDisassembler, use_saved_database=True)
-        self.assertEqual(["sample.exe.i64"], opened)
+        self.assertEqual(["sample.exe.i64"], self.opened)
         # the report still describes the sample, not the database
         self.assertEqual(hashlib.sha256(self.sample_content).hexdigest(), report.sha256)
         self.assertEqual("sample.exe", report.filename)
@@ -317,11 +316,8 @@ class ProduceIdaReportTest(unittest.TestCase):
             def disassembleBuffer(self, buffer, base_addr):
                 return FakeReport()
 
-        opened = []
-        original = self._fromPath
-        self._fromPath = lambda path, save_on_close=False: opened.append(os.path.basename(path)) or original(path, save_on_close)
         self._patchedRun(FakeDisassembler, use_saved_database=True)
-        self.assertEqual(["sample.exe"], opened)
+        self.assertEqual(["sample.exe"], self.opened)
 
 
 class SavedDatabaseTest(unittest.TestCase):
