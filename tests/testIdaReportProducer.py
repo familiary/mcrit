@@ -287,7 +287,6 @@ class ProduceIdaReportTest(unittest.TestCase):
         self.assertIn("IDADIR", str(context.exception))
         self.assertIsNone(self.ida_interface_class.instance)
 
-
     def testSavedDatabaseIsOpenedInsteadOfTheSample(self):
         class FakeDisassembler:
             def __init__(self, config=None, backend=None):

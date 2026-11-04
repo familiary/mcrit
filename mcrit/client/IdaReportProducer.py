@@ -243,9 +243,7 @@ def findSavedDatabase(filepath: str) -> Optional[str]:
     return None
 
 
-def produceIdaReport(
-    filepath: str, sig_root: Optional[str] = None, min_matches: int = 10, use_saved_database: bool = False
-) -> SmdaReport:
+def produceIdaReport(filepath: str, sig_root: Optional[str] = None, min_matches: int = 10, use_saved_database: bool = False) -> SmdaReport:
     """Disassemble a file through a headless IDA database and return it as an SmdaReport.
 
     With use_saved_database, a database saved beside the sample is opened instead of analysing the
