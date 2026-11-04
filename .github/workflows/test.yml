@@ -89,7 +89,8 @@ jobs:
       TEST_MONGODB: 127.0.0.1:27017
     services:
       mongo:
-        image: mongo:8.0
+        # MongoDB 8.0+ bundles a TCMalloc that crashes at startup on the runners' Linux 6.19+ kernels (SERVER-121912)
+        image: mongo:7.0
         ports:
           - 27017:27017
         options: >-
