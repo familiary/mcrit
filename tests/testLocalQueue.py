@@ -1,7 +1,13 @@
 import unittest
 
 from mcrit.queue.LocalQueue import LocalQueue
-from mcrit.queue.QueueRemoteCalls import _createJobPayload, get_descriptor, rearrange_params
+from mcrit.queue.QueueRemoteCalls import BaseRemoteCallerClass, _createJobPayload, get_descriptor, rearrange_params
+
+
+def test_local_queue_statistics_support_the_server_refresh_contract():
+    index = BaseRemoteCallerClass(LocalQueue())
+    assert index.getQueueStats() == {}
+    assert index.getQueueStats(refresh=True) == {}
 
 
 def _payload(method, *params, **kwparams):
