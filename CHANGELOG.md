@@ -15,6 +15,11 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+### Fixed
+
+- Queue statistics on the in-memory backend accept the server's `refresh` keyword,
+  so `GET /jobs/stats` works with LocalQueue as well as MongoQueue.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct

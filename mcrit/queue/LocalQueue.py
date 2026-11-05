@@ -394,7 +394,7 @@ class LocalQueue:
         # left empty, as we only have one worker in local mode
         pass
 
-    def getQueueStatistics(self):
+    def getQueueStatistics(self, refresh=False):
         # we don't track stats for the volatile local mode
         return {}
 
