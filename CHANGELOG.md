@@ -19,6 +19,8 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 - Queue statistics on the in-memory backend accept the server's `refresh` keyword,
   so `GET /jobs/stats` works with LocalQueue as well as MongoQueue.
+- Integration CI uses MongoDB 7.0 to avoid MongoDB 8.0's Linux 6.19+ startup refusal
+  (SERVER-121912), and raises the file limit for the suite's WiredTiger collections.
 
 ## [1.16.0] - 2026-10-16
 
