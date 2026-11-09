@@ -35,6 +35,7 @@ A query parameter given more than once answers 400 naming it (`RepeatedParameter
 | `GET` | `/jobs/stats` | Queue statistics per method and state; ``with_refresh=true`` recounts instead of answering the cached numbers. | `getQueueStatistics` |
 | `DELETE` | `/jobs/{job_id}` | Delete one job (and its result) by id. | `deleteJob` |
 | `GET` | `/jobs/{job_id}` | One job by its 24 hex digit id. Malformed ids answer 400, unknown ones 404. | `getJobData` |
+| `POST` | `/jobs/{job_id}/rerun` | Queue a finished, failed or terminated analysis again with what it was given (familiary/mcritweb#55). Answers the new job's id. | `requestJobRerun` |
 | `GET` | `/jobs/{job_id}/result` | The result of a job by job id, or null while it is not finished; ``compact=true`` strips the per-function matches. | `getResultForJob` |
 | `GET` | `/matches/function/{function_id:int}` | Not implemented; answers 501. | - |
 | `GET` | `/matches/function/{function_id:int}/{function_id_b:int}` | Compare two functions directly: their minhash score, pichash equality and the matched function entry. Unknown ids answer 404. | `getMatchFunctionVs` |

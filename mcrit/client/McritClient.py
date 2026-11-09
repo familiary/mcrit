@@ -1171,15 +1171,11 @@ class McritClient:
         if data is not None:
             return Job(data, None)
 
-    def requestJobRerun(self, job_id: str) -> Any:
-        """
-        Queue the finished, failed or terminated analysis job <job_id> again with the arguments and files it was given, never answered from the cache; answers the new job id
-        A cross compare reruns each of the jobs it combined as well. None for an unknown job (404), and for one that is still queued or running or is no analysis (409); raise_client_errors raises McritNotFound or McritConflict instead
-        Answers the requests.Response itself in raw mode, like deleteJob
-        """
+    def requestJobRerun(self, job_id: str) -> Optional[str]:
+        """POST /jobs/{job_id}/rerun: queue the finished, failed or terminated analysis job ``job_id`` again with the arguments and files it was given, never answered from the cache; answers the new job id. A cross compare reruns each of the jobs it combined as well. None for an unknown job (404), and for one that is still queued or running or is no analysis (409); raise_client_errors raises McritNotFound or McritConflict instead. Answers the requests.Response itself in raw mode, like deleteJob."""
         response = self._session.post(f"{self.mcrit_server}/jobs/{job_id}/rerun", headers=self.headers, timeout=self.timeout)
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
     def getResultForJob(self, job_id: str, compact: bool = False) -> Optional[Any]:
