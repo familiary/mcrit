@@ -727,6 +727,11 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   writer in mcrit stores a list, so only an export edited by hand or written elsewhere was
   affected; families already imported that way keep the single-character actors until edited.
 
+- Queue statistics on the in-memory backend accept the server's `refresh` keyword,
+  so `GET /jobs/stats` works with LocalQueue as well as MongoQueue.
+- Integration CI uses MongoDB 7.0 to avoid MongoDB 8.0's Linux 6.19+ startup refusal
+  (SERVER-121912), and raises the file limit for the suite's WiredTiger collections.
+
 ### Security
 
 - A sample whose SMDA report had no timestamp (missing or empty) was stored, but reading it back

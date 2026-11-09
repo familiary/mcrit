@@ -408,7 +408,7 @@ class LocalQueue:
         # so no job is ever held by a consumer that exits; Job.__exit__ releases on error itself
         pass
 
-    def getQueueStatistics(self):
+    def getQueueStatistics(self, refresh=False):
         # we don't track stats for the volatile local mode
         return {}
 
