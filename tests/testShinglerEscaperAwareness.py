@@ -115,6 +115,28 @@ class ShinglerEscaperAwarenessTestSuite(unittest.TestCase):
         # and one beyond the log buckets counts as none, as for Intel
         huge = self._aarch64_function("crossarch_aarch64_a.smda", 0x100002AB0, first_operands="sp, sp, #0xfff, lsl #12")
         self.assertEqual(0, shingler._getStackSize(huge))
+        # decimal immediates read as before
+        decimal = self._aarch64_function("crossarch_aarch64_b.smda", 0x10000496C, replace={0: ("stp", "x29, x30, [sp, #-32]!")})
+        self.assertEqual(32, shingler._getStackSize(decimal))
+
+    def test_fuzzy_stat_pair_shingler_survives_what_only_a_submitted_report_carries(self):
+        """smda's fromDict accepts a function offset outside the function's blocks and any operand
+        string; the shingler raised for both, which failed every minhash batch holding the function."""
+        shingler = FuzzyStatPairShingler(config.SHINGLER_CONFIG)
+        function_dict = self._load_intel_function().toDict()
+        function_dict["offset"] += 1
+        self.assertNotIn(function_dict["offset"], {int(offset) for offset in function_dict["blocks"]})
+        malformed = []
+        for architecture in ("intel", "aarch64"):
+            binary_info = BinaryInfo(b"")
+            binary_info.architecture = architecture
+            malformed.append(SmdaFunction.fromDict(function_dict, binary_info=binary_info))
+        # int(x, 0) refuses a decimal with a leading zero, and any of more than 4300 digits
+        malformed.append(self._aarch64_function("crossarch_aarch64_b.smda", 0x10000496C, replace={0: ("stp", "x29, x30, [sp, #-010]!")}))
+        malformed.append(self._aarch64_function("crossarch_aarch64_a.smda", 0x100002AB0, first_operands="sp, sp, #" + "9" * 4301))
+        for function in malformed:
+            self.assertEqual(0, shingler._getStackSize(function))
+            self.assertTrue(shingler.process(function, 0))
 
 
 if __name__ == "__main__":

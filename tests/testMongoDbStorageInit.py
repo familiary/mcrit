@@ -121,16 +121,18 @@ class MongoDbStorageInitTest(TestCase):
         expected = {
             "families": [("family_name", "family_id"), ("num_samples", "family_id"), ("num_library_samples", "family_id"), ("num_functions", "family_id")],
             "samples": [(field, "sample_id") for field in ("family_id", "family", "filename", "version", "bitness", "sha256", "statistics.num_functions")],
-            "functions": [(field, "function_id") for field in ("family_id", "sample_id", "function_name", "offset", "num_instructions", "num_blocks")],
+            # a pichash sort runs on the stored "_pichash" (#145)
+            "functions": [(field, "function_id") for field in ("family_id", "sample_id", "function_name", "offset", "num_instructions", "num_blocks", "_pichash")],
         }
         for collection, pairs in expected.items():
             keys = [tuple(key for key, _ in info["key"]) for info in database[collection].index_information().values()]
             for pair in pairs:
                 self.assertIn(pair, keys, f"{collection} {pair}")
         # and a sorted search plans no blocking sort, in either direction
-        for direction in (1, -1):
-            plan = database["functions"].find({"function_name": {"$regex": "sub"}}, sort=[("num_blocks", direction), ("function_id", direction)], limit=10).explain()
-            self.assertNotIn("SORT", str(plan["queryPlanner"]["winningPlan"]))
+        for field in ("num_blocks", "_pichash"):
+            for direction in (1, -1):
+                plan = database["functions"].find({"function_name": {"$regex": "sub"}}, sort=[(field, direction), ("function_id", direction)], limit=10).explain()
+                self.assertNotIn("SORT", str(plan["queryPlanner"]["winningPlan"]), f"{field} {direction}")
 
 
 if __name__ == "__main__":

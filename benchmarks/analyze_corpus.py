@@ -94,9 +94,9 @@ def main():
         if not minhash:
             continue
         num_hashed += 1
-        # minhashes are stored as hex strings; the identity that matters is the byte
-        # sequence, and the hex form is a bijection of it, so count the string directly
-        signature_counter[minhash] += 1
+        # minhashes are stored as binary, or as hex strings before; the identity that matters is
+        # the byte sequence, and the hex form is a bijection of it, so count that
+        signature_counter[minhash.hex() if isinstance(minhash, bytes) else minhash] += 1
     multiplicities = list(signature_counter.values())
     report["num_hashed_functions"] = num_hashed
     report["num_distinct_signatures"] = len(signature_counter)

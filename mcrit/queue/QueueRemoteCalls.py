@@ -2,7 +2,9 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import time
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from functools import wraps
 from typing import Iterator, List, Optional
@@ -104,18 +106,16 @@ class BaseRemoteCallerClass:
         return result_dict
 
     def awaitResult(self, job_id):
+        """Wait for a result ID.
+
+        Returns None if the job is failed or terminated, does not exist, or disappears while being
+        polled (removed by queue cleanup under QUEUE_TRANSIENT_JOB_RETENTION_SECONDS, or by a clear).
+        """
         job = self.queue.get_job(job_id)
-        terminated = job._is_terminated(use_cached=True)
-        failed = job.is_failed
-        result_id = job.result
-        while (result_id is None) and (not terminated) and (not failed):
+        while job is not None and job.result is None and not job._is_terminated(use_cached=True) and not job.is_failed:
             time.sleep(0.05)
-            # TODO what if job is already killed by clear?
             job = self.queue.get_job(job_id)
-            terminated = job._is_terminated(use_cached=True)
-            failed = job.is_failed
-            result_id = job.result
-        return result_id
+        return None if job is None else job.result
 
 
 ########### START Class Metaprogramming
@@ -155,6 +155,14 @@ class UncacheableResult(dict):
     whose shortlist fell back because the function range index went incomplete after the job was
     submitted (#217) - and the worker then marks the job so the queue's cache lookup skips it.
     """
+
+
+class JobNotFoundError(LookupError):
+    """No job has the id that was asked for."""
+
+
+class JobNotRerunnableError(ValueError):
+    """A job that cannot be queued again from what it stored; the message says why."""
 
 
 # Wrapper that creates a remote call proxy for a given method
@@ -289,6 +297,45 @@ def add_job_id_to_files(self, job_id, grid_params):
         self.queue.add_job_id_to_file(job_id, val)
 
 
+def resubmit_payload(self, payload, results_version=None, params=None, await_jobs=None, username=None):
+    """Queue a new job from a stored job's payload, as remote_call_function does with force_recalculation.
+
+    The new job gets the stored method and file parameters, and the stored parameters unless <params>
+    replaces them (keyed as rearrange_params leaves them). Its descriptor is computed anew, so it carries
+    the <results_version> given rather than the one the stored job was made with. The files are not
+    uploaded again: each is claimed by its id, as upload_file_params claims one by its hash, and then
+    linked to the new job, so deleting either job keeps the files the other one needs. A file that is
+    gone, or retired on its way out, raises JobNotRerunnableError, and nothing is queued. Whatever
+    fails, the claims not yet handed to the new job are given up again.
+    """
+    if params is None:
+        params = json.loads(payload["params"])
+    grid_params = json.loads(payload["file_params"])
+    hashes = {}
+    # the files claimed and not linked yet: a claim left behind keeps its file from ever being deleted,
+    # as delete_job and delete_orphaned_files both pass over a file whose tmp_lock is raised
+    claimed = []
+    try:
+        for key, file_id in grid_params.items():
+            file_hash = self.queue.claim_file(file_id)
+            if file_hash is None:
+                raise JobNotRerunnableError("A file the job was given is no longer stored.")
+            claimed.append(file_id)
+            hashes[key] = file_hash
+        descriptor = get_descriptor(payload["method"], params, hashes, results_version=results_version)
+        new_payload = _createJobPayload(payload["method"], params, grid_params, descriptor)
+        job_id = str(self.queue.put(new_payload, await_jobs=await_jobs or [], username=username))
+        while claimed:
+            # linking lowers the lock the claim raised, so a linked file's claim is the new job's
+            self.queue.add_job_id_to_file(job_id, claimed[-1])
+            claimed.pop()
+    except Exception:
+        for file_id in claimed:
+            self.queue.release_file(file_id)
+        raise
+    return job_id
+
+
 # Function to encode call
 def _createJobPayload(method_name, params, grid_params, descriptor):
     payload = {
@@ -307,11 +354,13 @@ def _createJobPayload(method_name, params, grid_params, descriptor):
 
 
 # Marks Functions within a QueueRemoteCallee
-def Remote(progress=False, file_locations=[], kwfile_locations=[], json_locations=[], kwjson_locations=[], results_version=None):
+def Remote(progress=False, file_locations=[], kwfile_locations=[], json_locations=[], kwjson_locations=[], results_version=None, time_limited=False):
     def change_function(function):
         function.remote = True
         function.progressor = progress
         function.results_version = results_version
+        # whether a plain worker's QUEUE_WORKER_JOB_TIMEOUT applies: for jobs whose cost a request controls
+        function.time_limited = time_limited
         function.file_locations = file_locations
         function.kwfile_locations = kwfile_locations
         function.json_locations = json_locations
@@ -319,6 +368,35 @@ def Remote(progress=False, file_locations=[], kwfile_locations=[], json_location
         return function
 
     return change_function
+
+
+class JobTimeoutExceeded(BaseException):
+    """Raised inside a job that ran longer than its worker allows (QUEUE_WORKER_JOB_TIMEOUT).
+
+    A BaseException, so that the `except Exception` blocks of the job's own code do not swallow it.
+    """
+
+
+@contextmanager
+def job_deadline(seconds):
+    """Raise JobTimeoutExceeded in the block once it has run for ``seconds``; 0 is no limit.
+
+    Uses SIGALRM, so it only works in the main thread of a POSIX process, and leaves no alarm armed.
+    """
+    if seconds <= 0:
+        yield
+        return
+
+    def expire(signum, frame):
+        raise JobTimeoutExceeded(f"The job ran longer than QUEUE_WORKER_JOB_TIMEOUT ({seconds} s) and was stopped.")
+
+    previous_handler = signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 # Class to be extended
@@ -329,6 +407,8 @@ class QueueRemoteCallee(BaseRemoteCallerClass):
         self.queue.clean()
         self._alive = True
         self.t_last_cleanup = time.time()
+        # seconds a job may run before it is stopped, 0 for no limit; set by the plain worker's run()
+        self._job_timeout = 0
         # NOTE: the profiling variant is kept in a separate attribute rather than rebinding
         # _executeJob itself, so the method keeps its normal signature.
         self._executeJobProfiled = self.profiling_wrapper(self._executeJobImpl, profiling_path) if profiling_path is not None else None
@@ -383,7 +463,10 @@ class QueueRemoteCallee(BaseRemoteCallerClass):
             LOGGER.debug("kwparams: %s", kwparams)
             kwparams["progress_reporter"] = JobProgressReporter(job, 0.1)
         LOGGER.debug("EXECUTE JOB: %s", job_payload)
-        result = method(*params, **kwparams)
+        # only the job's own work is timed, so the alarm cannot cut into the queue's bookkeeping; maintenance
+        # jobs run as long as their corpus needs and are not timed
+        with job_deadline(self._job_timeout if getattr(method, "time_limited", False) else 0):
+            result = method(*params, **kwparams)
         LOGGER.debug("FINISHED JOB: %s", job_payload)
         return result
 
@@ -419,7 +502,7 @@ class QueueRemoteCallee(BaseRemoteCallerClass):
                 # ensure we always have a job_id for finished job payloads
                 job.result = self._storeJobResult(job, result)
                 LOGGER.info("Finished Remote Job: %s", job)
-        except Exception:
+        except (Exception, JobTimeoutExceeded):
             # the failure may include the Job.__exit__ error() write itself (e.g. the
             # database went away mid-job), in which case the job is still locked by us
             # with its release lost - reconcile before the next claim
@@ -522,6 +605,9 @@ class NoProgressReporter:
     def step(self):
         pass
 
+    def poll(self):
+        pass
+
     def get_total(self):
         return 1
 
@@ -553,6 +639,10 @@ class JobProgressReporter:
 
     def step(self):
         self._count += 1
+        self.poll()
+
+    # report progress and check for termination once the interval has passed, without counting a step
+    def poll(self):
         now = time.time()
         if now - self._last_update > self._report_interval:
             progress = self._count / self._total

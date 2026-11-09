@@ -1,6 +1,9 @@
 import base64
 import io
 import zipfile
+import zlib
+
+import numpy as np
 
 
 def generate_unique_pairs(data):
@@ -45,21 +48,114 @@ def generate_segmented_sequence(weights, sequence_length):
     return sequence
 
 
+# base64.b85encode holds a list entry per 4 input bytes, about 40 times the input: encoded a slice at a time (a
+# multiple of 4 bytes, so the result is the same), it holds that for one slice only
+B85_SLICE_SIZE = 1 << 18
+
+
+def b85encode_sliced(data) -> str:
+    view = memoryview(data)
+    return b"".join(base64.b85encode(view[start : start + B85_SLICE_SIZE]) for start in range(0, len(view), B85_SLICE_SIZE)).decode()
+
+
+def compress_encode_fragments(fragments):
+    """compress_encode of the UTF-8 text the byte fragments join to, compressed as they come instead of joined first."""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+        with zip_file.open("content", "w") as content:
+            for fragment in fragments:
+                content.write(fragment)
+    return b85encode_sliced(zip_buffer.getvalue())
+
+
 def compress_encode(content):
     zip_buffer = io.BytesIO()
     zip_base64 = ""
     with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
         zip_file.writestr("content", content)
-    zip_base64 = base64.b85encode(zip_buffer.getvalue()).decode()
+    zip_base64 = b85encode_sliced(zip_buffer.getvalue())
     return zip_base64
 
 
-def decompress_decode(compressed_b64):
-    de_b64ed = base64.b85decode(compressed_b64)
+_B85_ALPHABET = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~"
+_B85_DIGITS = np.full(256, -1, dtype=np.int16)
+_B85_DIGITS[np.frombuffer(_B85_ALPHABET, dtype=np.uint8)] = np.arange(85, dtype=np.int16)
+# groups of five characters decoded per step, so the uint64 intermediates stay at a few dozen MB
+_B85_GROUPS_PER_CHUNK = 1 << 20
+
+
+def b85decode(data):
+    """base64.b85decode, vectorised: the standard library decodes in pure Python, at about 10 MB/s.
+
+    Returns the same bytes for every input base64.b85decode accepts. Input it refuses - characters
+    outside the alphabet, a group beyond 32 bits, anything but ASCII text or bytes - is handed to
+    base64.b85decode, so that it raises the error it always raised."""
+    if isinstance(data, str):
+        if not data.isascii():
+            return base64.b85decode(data)
+        data = data.encode("ascii")
+    if not isinstance(data, (bytes, bytearray)):
+        return base64.b85decode(data)
+    padding = -len(data) % 5
+    characters = np.frombuffer(bytes(data) + b"~" * padding, dtype=np.uint8).reshape(-1, 5)
+    decoded = []
+    for offset in range(0, len(characters), _B85_GROUPS_PER_CHUNK):
+        digits = _B85_DIGITS[characters[offset : offset + _B85_GROUPS_PER_CHUNK]]
+        if (digits < 0).any():
+            return base64.b85decode(data)
+        digits = digits.astype(np.uint64)
+        values = (((digits[:, 0] * 85 + digits[:, 1]) * 85 + digits[:, 2]) * 85 + digits[:, 3]) * 85 + digits[:, 4]
+        if (values > 0xFFFFFFFF).any():
+            return base64.b85decode(data)
+        decoded.append(values.astype(">u4").tobytes())
+    result = b"".join(decoded)
+    return result[: len(result) - padding] if padding else result
+
+
+# An export's function entries inflate to 3-12 times their encoded size: 4.1 times at the median and
+# 11.6 at most over the 475 non-Intel samples of the live corpus (a CIL sample in which 94% of the
+# functions share one pichash), 6.3 at most for Intel reports kept with their disassembly. Content
+# inflating to many times more is no export but a decompression bomb. The ratio also bounds what
+# json.loads makes of it, up to 24 bytes of Python objects per byte for [{},{},...], so it stays low:
+# at 100x, a 0.5 MB POST /import still grew the server by 1.3 GB. A floor keeps small, repetitive
+# samples from being refused for the ratio, as content that small is no danger either way.
+MAX_DECOMPRESSION_RATIO = 20
+MIN_DECOMPRESSED_SIZE = 8 * 1024 * 1024
+# The cap above holds per blob, and an import holds one blob per sample, so it is capped as a whole
+# too: all its blobs together inflate to at most the ratio times the size of the encoded export, or
+# to this floor if that is more. No blob of the live corpus inflates to more than 11.6 times its
+# size, so no export of it to more than 11.6 times its own.
+MIN_IMPORT_DECOMPRESSED_SIZE = 64 * 1024 * 1024
+
+
+def decompress_decode(compressed_b64, max_size=None):
+    """Inflate content compress_encode wrote, up to its own cap and to max_size, when given: what
+    remains of an import's budget."""
+    de_b64ed = b85decode(compressed_b64)
     zip_buffer = io.BytesIO(de_b64ed)
     decompressed = ""
-    with zipfile.ZipFile(zip_buffer, "r", zipfile.ZIP_DEFLATED, False) as zip_file:
-        decompressed = zip_file.read("content")
+    own_max_size = max(MAX_DECOMPRESSION_RATIO * len(compressed_b64), MIN_DECOMPRESSED_SIZE)
+    if max_size is None or max_size >= own_max_size:
+        max_size = own_max_size
+        too_large = f"Compressed content inflates to more than {MAX_DECOMPRESSION_RATIO} times its size and {MIN_DECOMPRESSED_SIZE} bytes."
+    else:
+        too_large = f"Compressed content inflates to more than the {max_size} bytes left of the import's budget."
+    try:
+        with zipfile.ZipFile(zip_buffer, "r", zipfile.ZIP_DEFLATED, False) as zip_file:
+            content_info = zip_file.getinfo("content")
+            # only what compress_encode writes: bzip2 and LZMA members are inflated in one piece, which no read size bounds
+            if content_info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                raise ValueError("Compressed content must be deflated or stored.")
+            if content_info.file_size > max_size:
+                raise ValueError(too_large)
+            with zip_file.open(content_info) as content_file:
+                decompressed = content_file.read(max_size + 1)
+    except (zipfile.BadZipFile, KeyError, zlib.error, EOFError, RuntimeError) as error:
+        # no zip, no content member, a corrupt or truncated deflate stream, an encrypted member or one
+        # of a method zipfile lacks (NotImplementedError is a RuntimeError): content that is not readable
+        raise ValueError(f"Compressed content cannot be read ({type(error).__name__}: {error})") from error
+    if len(decompressed) > max_size:
+        raise ValueError(too_large)
     return decompressed
 
 

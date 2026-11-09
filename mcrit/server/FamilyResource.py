@@ -13,6 +13,7 @@ class FamilyResource:
 
     @timing
     def on_get(self, req, resp, family_id=None):
+        """One family by id, with its samples unless ``with_samples=false``. Unknown ids answer 404."""
         # parse optional request parameters
         with_samples = True
         if "with_samples" in req.params:
@@ -40,6 +41,7 @@ class FamilyResource:
 
     @timing
     def on_post_by_ids(self, req, resp):
+        """The families with the comma-separated ids in the body, keyed by family id, without their sample lists; ids that are not found are left out."""
         if not req.content_length:
             resp.data = jsonify(
                 {
@@ -65,6 +67,7 @@ class FamilyResource:
 
     @timing
     def on_put(self, req, resp, family_id=None):
+        """Modify a family; JSON body with ``family_name`` (alphanumeric, dots, dashes, underscores) and/or ``is_library``. Answers 202 on success, 400 for a malformed body."""
         resp.status = falcon.HTTP_400
         if not req.content_length or not isinstance(req.media, dict):
             resp.data = jsonify({"status": "failed", "data": {"message": "PUT request without body can't be processed."}})
@@ -88,9 +91,15 @@ class FamilyResource:
             actors = information_update["actors"]
             if isinstance(actors, str):
                 actors = [actor for actor in actors.split(",")]
-            if not isinstance(actors, list) or not all(FamilyEntry.isValidActor(actor) for actor in actors):
+            # the cap counts the names stored, each once
+            if not isinstance(actors, list) or not all(FamilyEntry.isValidActor(actor) for actor in actors) or len(FamilyEntry.normalizeActors(actors)) > FamilyEntry.MAX_ACTORS:
                 resp.data = jsonify(
-                    {"status": "failed", "data": {"message": "actors must be a list of 1-64 character names (letters, digits, spaces, dots, dashes, underscores)."}}
+                    {
+                        "status": "failed",
+                        "data": {
+                            "message": f"actors must be a list of at most {FamilyEntry.MAX_ACTORS} names of 1-64 characters (letters, digits, spaces, dots, dashes, underscores)."
+                        },
+                    }
                 )
                 db_log_msg(self.index, req, "FamilyResource.on_put - failed - actors malformed.")
                 return
@@ -106,6 +115,7 @@ class FamilyResource:
 
     @timing
     def on_delete(self, req, resp, family_id=None):
+        """Delete a family and its samples; with ``keep_samples=true`` the samples move to the unknown family instead. Unknown ids answer 404."""
         if family_id is None or self.index.getFamily(family_id) is None:
             resp.data = jsonify(
                 {
@@ -127,12 +137,13 @@ class FamilyResource:
             resp.status = falcon.HTTP_202
         else:
             db_log_msg(self.index, req, f"FamilyResource.on_delete - failed - family_id: {family_id}, keep_samples={keep_samples}")
-            resp.data = jsonify({"status": "failed", "data": {"message": "Failed to delete family."}})
-            # TODO whats the correct code?
-            resp.status = falcon.HTTP_410
+            # not reached through the queue, which raises when it cannot queue a job
+            resp.data = jsonify({"status": "failed", "data": {"message": "Failed to queue the family deletion."}})
+            resp.status = falcon.HTTP_503
 
     @timing
     def on_get_collection(self, req, resp):
+        """All families keyed by id; optional ``start`` (first family id) and ``limit``."""
         db_log_msg(self.index, req, "FamilyResource.on_get_collection")
         # parse optional request parameters
         start_index = 0

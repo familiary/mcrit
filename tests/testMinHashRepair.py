@@ -1,6 +1,7 @@
 import json
 import os
 import unittest
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 import falcon
@@ -12,6 +13,7 @@ from smda.SmdaConfig import SmdaConfig
 
 from mcrit.client.McritClient import McritClient
 from mcrit.config.McritConfig import McritConfig
+from mcrit.config.MinHashConfig import MinHashConfig
 from mcrit.config.QueueConfig import QueueConfig
 from mcrit.config.StorageConfig import StorageConfig
 from mcrit.index.MinHashIndex import MinHashIndex
@@ -30,8 +32,8 @@ class SelectiveMinHashRepair(unittest.TestCase):
     """#142: only the samples an older escaper hashed are rehashed, and /status says how many
     there are"""
 
-    def _index_with_report(self):
-        index = MinHashIndex(config)
+    def _index_with_report(self, mcrit_config=config):
+        index = MinHashIndex(mcrit_config)
         with open(EXAMPLE_REPORT) as fjson:
             report = SmdaReport.fromDict(json.load(fjson))
         assert report is not None
@@ -102,6 +104,28 @@ class SelectiveMinHashRepair(unittest.TestCase):
         storage._minhash_versions.clear()
         index.getResultForJob(index.recalculateMinHashes(force_recalculation=True))
         self.assertEqual([], storage.getSamplesWithStaleMinHashes("4.4.5"))
+
+    def test_a_minhash_that_cannot_have_been_banded_blocks_neither_repair_nor_deletion(self):
+        """imports stored minhashes unchecked: one shorter than the signature, or not a whole number
+        of 32-bit entries, raised on every repair and every deletion of its sample"""
+        config_32 = deepcopy(config)
+        # a new object, not an edit: McritConfig holds its sub-configs as class attributes shared by every copy
+        config_32.MINHASH_CONFIG = MinHashConfig(MINHASH_SIGNATURE_BITS=32)
+        for mcrit_config, damage in ((config, lambda minhash: minhash[:8]), (config_32, lambda minhash: minhash + b"\x00")):
+            with self.subTest(bits=mcrit_config.MINHASH_CONFIG.MINHASH_SIGNATURE_BITS):
+                index, sample_entry = self._index_with_report(mcrit_config)
+                storage = index.getStorage()
+                hashed_before = self._hashed_function_ids(index, sample_entry.sample_id)
+                self.assertGreater(len(hashed_before), 1)
+                storage._functions[hashed_before[0]].minhash = damage(storage._functions[hashed_before[0]].minhash)
+                storage.setMinHashVersionForSamples("4.0.0", [sample_entry.sample_id])
+                report = index.getResultForJob(index.repairMinHashes(force_recalculation=True))
+                self.assertEqual(1, report["num_samples_repaired"])
+                self.assertEqual(len(hashed_before), report["num_functions_dropped"])
+                self.assertEqual(hashed_before, self._hashed_function_ids(index, sample_entry.sample_id))
+                storage._functions[hashed_before[1]].minhash = damage(storage._functions[hashed_before[1]].minhash)
+                self.assertTrue(storage.deleteSample(sample_entry.sample_id))
+                self.assertFalse(storage.isSampleId(sample_entry.sample_id))
 
 
 AARCH64_REPORT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "crossarch_aarch64_a.smda")

@@ -7,6 +7,7 @@ import unittest
 from smda.common.SmdaReport import SmdaReport
 
 from mcrit.config.McritConfig import McritConfig
+from mcrit.config.MinHashConfig import MinHashConfig
 from mcrit.config.ShinglerConfig import ShinglerConfig
 from mcrit.config.StorageConfig import StorageConfig
 from mcrit.minhash.MinHash import MinHash
@@ -62,6 +63,8 @@ class MinHashingTestSuite(unittest.TestCase):
         config.STORAGE_CONFIG = StorageConfig()
         config.STORAGE_CONFIG.STORAGE_BANDS = {2: 2, 3: 1}
         config.STORAGE_CONFIG.STORAGE_BAND_SEED = 0
+        # the band projection is drawn from the configured signature length, not from the minhash
+        config.MINHASH_CONFIG = MinHashConfig(MINHASH_SIGNATURE_LENGTH=10)
         minhash_a = MinHash(function_id=1, minhash_signature=[0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39])
         minhash_b = MinHash(function_id=2, minhash_signature=[0x30, 0x31, 0x30, 0x33, 0x30, 0x30, 0x30, 0x37, 0x38, 0x39])
 
@@ -78,6 +81,7 @@ class MinHashingTestSuite(unittest.TestCase):
         config.STORAGE_CONFIG = StorageConfig()
         config.STORAGE_CONFIG.STORAGE_BANDS = {2: 2, 3: 1}
         config.STORAGE_CONFIG.STORAGE_BAND_SEED = 0
+        config.MINHASH_CONFIG = MinHashConfig(MINHASH_SIGNATURE_LENGTH=10)
         minhash_a = MinHash(
             function_id=1,
             minhash_signature=[0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39],

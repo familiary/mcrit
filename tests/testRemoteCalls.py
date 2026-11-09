@@ -2,14 +2,17 @@ import logging
 import os
 import time
 import unittest
+from datetime import datetime, timedelta
 from threading import Thread
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pymongo
+import pymongo.errors
 import pytest
 from bson import ObjectId
 from bson.json_util import dumps, loads
+from pymongo.collection import Collection
 
 from mcrit.config.QueueConfig import QueueConfig
 from mcrit.libs.mongoqueue import MongoQueue
@@ -24,6 +27,7 @@ from mcrit.queue.QueueRemoteCalls import (
     rearrange_params,
     upload_file_params,
 )
+from mcrit.queue.retention import TRANSIENT_JOB_METHODS
 
 from .context import getTestMongoServerAndPort
 
@@ -33,6 +37,26 @@ logging.disable(logging.CRITICAL)
 
 
 class myWorker(QueueRemoteCallee):
+    @Remote()
+    def addBinarySample(self):
+        return {"kind": "transient"}
+
+    @Remote()
+    def getMatchesForSample(self):
+        return {"kind": "matching"}
+
+    @Remote()
+    def getMatchesForSmdaReport(self):
+        return {"kind": "query"}
+
+    @Remote()
+    def combineMatchesToCross(self):
+        return {"kind": "cross"}
+
+    @Remote()
+    def getUniqueBlocks(self):
+        return {"kind": "blocks"}
+
     @Remote(
         file_locations=[0, 2, 1],
         json_locations=[3, 4],
@@ -119,6 +143,47 @@ class LocalQueueRemoteCallTest(TestCase):
         job = self.queue.get_job(id)
         self.assertGreater(job._data["progress"], 0)
 
+    def test_await_result_of_missing_job(self):
+        self.assertIsNone(self.caller.awaitResult(str(ObjectId())))
+        pending = Mock(result=None, is_failed=False)
+        pending._is_terminated.return_value = False
+        with patch.object(self.queue, "get_job", side_effect=[pending, None]), patch("mcrit.queue.QueueRemoteCalls.time.sleep") as sleep:
+            self.assertIsNone(self.caller.awaitResult("removed-during-poll"))
+        sleep.assert_called_once_with(0.05)
+
+    def test_clean_preserves_results_and_expires_only_transient_jobs(self):
+        transient_id = self.caller.addBinarySample(force_recalculation=True)
+        kept_ids = [
+            self.caller.getMatchesForSample(force_recalculation=True),
+            self.caller.getMatchesForSmdaReport(force_recalculation=True),
+            self.caller.combineMatchesToCross(force_recalculation=True),
+            self.caller.getUniqueBlocks(force_recalculation=True),
+        ]
+        self.caller.awaitResult(transient_id)
+        for job_id in kept_ids:
+            self.caller.awaitResult(job_id)
+        transient = self.queue.get_job(transient_id)
+        transient_result = transient.result
+        kept_jobs = [self.queue.get_job(job_id) for job_id in kept_ids]
+        kept_results = [job.result for job in kept_jobs]
+        old_finish = datetime.now() - timedelta(days=8)
+        for job in (transient, *kept_jobs):
+            if isinstance(self.queue, LocalQueue):
+                job._data["finished_at"] = old_finish
+            else:
+                self.queue._getCollection().update_one({"_id": ObjectId(job.job_id)}, {"$set": {"finished_at": old_finish}})
+
+        self.queue.transient_methods = TRANSIENT_JOB_METHODS
+        self.queue.clean()  # retention_seconds is 0 by default, which deletes nothing
+        self.assertIsNotNone(self.queue.get_job(transient_id))
+        self.queue.retention_seconds = 7 * 24 * 60 * 60
+        self.queue.clean()
+        self.assertIsNone(self.queue.get_job(transient_id))
+        self.assertIsNone(self.queue._grid_to_file(transient_result))
+        for job_id, result_id in zip(kept_ids, kept_results):
+            self.assertIsNotNone(self.queue.get_job(job_id))
+            self.assertIsNotNone(self.queue._grid_to_file(result_id))
+
     @pytest.mark.sleep
     def test_termination(self):
         id = self.caller.test_progress()
@@ -142,11 +207,97 @@ class LocalQueueRemoteCallTest(TestCase):
                 self.assertEqual(str(self.queue._grid_to_meta(result_id)["job"]), job_id)
         self.queue.clear()
 
+    def _backdate(self, job_id, terminated=False):
+        old_finish = datetime.now() - timedelta(days=8)
+        if isinstance(self.queue, LocalQueue):
+            self.queue._jobs[job_id]["finished_at"] = old_finish
+            if terminated:
+                self.queue._jobs[job_id]["terminated"] = True
+        else:
+            fields = {"finished_at": old_finish}
+            if terminated:
+                fields["terminated"] = True
+            self.queue._getCollection().update_one({"_id": ObjectId(job_id)}, {"$set": fields})
+
+    def test_clean_keeps_terminated_job_that_finished(self):
+        # a termination arriving after the method returned still leaves finished_at set
+        self.queue.transient_methods = TRANSIENT_JOB_METHODS
+        self.queue.retention_seconds = 7 * 24 * 60 * 60
+        job_id = self.caller.addBinarySample(force_recalculation=True)
+        self.caller.awaitResult(job_id)
+        self._backdate(job_id, terminated=True)
+        self.queue.clean()
+        self.assertIsNotNone(self.queue.get_job(job_id))
+
+    def test_clean_deletes_at_most_clean_max_jobs(self):
+        self.queue.transient_methods = TRANSIENT_JOB_METHODS
+        self.queue.retention_seconds = 7 * 24 * 60 * 60
+        job_ids = [self.caller.addBinarySample(force_recalculation=True) for _ in range(5)]
+        for job_id in job_ids:
+            self.caller.awaitResult(job_id)
+        old_finish = datetime.now() - timedelta(days=8)
+        for number, job_id in enumerate(job_ids):
+            when = old_finish + timedelta(minutes=number)
+            if isinstance(self.queue, LocalQueue):
+                self.queue._jobs[job_id]["finished_at"] = when
+            else:
+                self.queue._getCollection().update_one({"_id": ObjectId(job_id)}, {"$set": {"finished_at": when}})
+        with patch.object(type(self.queue), "CLEAN_MAX_JOBS", 3):
+            self.queue.clean()
+            # the oldest three go first
+            self.assertEqual([None, None, None], [self.queue.get_job(job_id) for job_id in job_ids[:3]])
+            self.assertTrue(all(self.queue.get_job(job_id) is not None for job_id in job_ids[3:]))
+            self.queue.clean()
+        self.assertTrue(all(self.queue.get_job(job_id) is None for job_id in job_ids))
+
+    def test_transient_methods_are_worker_remote_methods(self):
+        from mcrit.Worker import Worker
+
+        for name in TRANSIENT_JOB_METHODS:
+            function = getattr(Worker, name, None)
+            self.assertTrue(getattr(function, "remote", False), name)
+            # a method with a results_version produces a cached report
+            self.assertIsNone(getattr(function, "results_version", None), name)
+        kept = {"getBandDfCutoffCoverage", "combineMatchesToCross", *Worker.QUERY_JOB_METHODS}
+        self.assertEqual(set(), TRANSIENT_JOB_METHODS & kept)
+
+    def test_queue_factory_sets_retention(self):
+        from mcrit.config.McritConfig import McritConfig
+        from mcrit.queue.QueueFactory import QueueFactory
+
+        config = McritConfig()
+        config.QUEUE_CONFIG = QueueConfig(QUEUE_METHOD=QueueFactory.QUEUE_METHOD_FAKE, QUEUE_TRANSIENT_JOB_RETENTION_SECONDS=123)
+        queue = QueueFactory.getQueue(config, storage=Mock())
+        self.assertEqual(123, queue.retention_seconds)
+        self.assertEqual(TRANSIENT_JOB_METHODS, queue.transient_methods)
+
+    def test_queue_factory_defaults_retention_for_config_without_the_setting(self):
+        from mcrit.config.McritConfig import McritConfig
+        from mcrit.queue.QueueFactory import QueueFactory
+
+        config = McritConfig()
+        queue_config = Mock(spec=["QUEUE_METHOD", "QUEUE_CLEAN_INTERVAL"])
+        queue_config.QUEUE_METHOD = QueueFactory.QUEUE_METHOD_FAKE
+        queue_config.QUEUE_CLEAN_INTERVAL = 60
+        config.QUEUE_CONFIG = queue_config
+        queue = QueueFactory.getQueue(config, storage=Mock())
+        self.assertEqual(0, queue.retention_seconds)
+
+    def test_clean_treats_overflowing_retention_as_never(self):
+        self.queue.transient_methods = TRANSIENT_JOB_METHODS
+        self.queue.retention_seconds = 10**18
+        job_id = self.caller.addBinarySample(force_recalculation=True)
+        self.caller.awaitResult(job_id)
+        self._backdate(job_id)
+        self.queue.clean()
+        self.assertIsNotNone(self.queue.get_job(job_id))
+
     @pytest.mark.sleep
     def test_clean_period(self):
-        old_cache_time = self.queue.cache_time
+        old_retention = self.queue.retention_seconds
         old_clean_interval = self.queue.clean_interval
-        self.queue.cache_time = 0.0
+        self.queue.retention_seconds = 0.1
+        self.queue.transient_methods = TRANSIENT_JOB_METHODS | {"test"}
         self.queue.clean()
         self.queue.clean_interval = 0.8
 
@@ -173,7 +324,7 @@ class LocalQueueRemoteCallTest(TestCase):
 
         self.assertEqual(self.queue.get_job(job_id_1), None)
 
-        self.queue.cache_time = old_cache_time
+        self.queue.retention_seconds = old_retention
         self.queue.clean_interval = old_clean_interval
 
     def test_multiple_cleans(self):
@@ -380,7 +531,8 @@ class LocalQueueRemoteCallTest(TestCase):
 
     @pytest.mark.sleep
     def test_queue_clean(self):
-        self.queue.cache_time = 0.1
+        self.queue.retention_seconds = 0.1
+        self.queue.transient_methods = TRANSIENT_JOB_METHODS | {"test"}
         self.queue.clean_interval = 1e100
 
         params = [b"cde"]
@@ -397,7 +549,7 @@ class LocalQueueRemoteCallTest(TestCase):
         files = loads(self.queue.get_job(job_id).payload["file_params"])
 
         # start job again but with changed params
-        time.sleep(self.queue.cache_time)
+        time.sleep(self.queue.retention_seconds)
         params = []
         job_id_3 = self.caller.test(*params, force_recalculation=True, **kwparams)
         result_id_3 = self.caller.awaitResult(job_id_3)
@@ -438,6 +590,28 @@ class LocalQueueRemoteCallTest(TestCase):
         self.queue.clear()
 
 
+class SingleJobWorkerRetentionTest(TestCase):
+    def test_single_job_worker_does_not_run_a_retention_pass_at_start(self):
+        from mcrit.config.McritConfig import McritConfig
+        from mcrit.SingleJobWorker import SingleJobWorker
+
+        queue = Mock()
+        queue.retention_seconds = 3600
+        retention_at_clean = []
+        queue.clean.side_effect = lambda: retention_at_clean.append(queue.retention_seconds)
+        SingleJobWorker("job", queue=queue, config=McritConfig(), storage=Mock())
+        self.assertEqual([0], retention_at_clean)
+
+    def test_a_failing_queue_setup_still_fails_worker_construction(self):
+        from mcrit.config.McritConfig import McritConfig
+        from mcrit.SingleJobWorker import SingleJobWorker
+
+        queue = Mock()
+        queue.clean.side_effect = pymongo.errors.ServerSelectionTimeoutError("no server")
+        with self.assertRaises(pymongo.errors.ServerSelectionTimeoutError):
+            SingleJobWorker("job", queue=queue, config=McritConfig(), storage=Mock())
+
+
 ### Added mongo attribute
 @pytest.mark.mongo
 class MongoQueueRemoteCallTest(LocalQueueRemoteCallTest):
@@ -453,6 +627,34 @@ class MongoQueueRemoteCallTest(LocalQueueRemoteCallTest):
         self.worker = myWorker(self.queue)
         self.worker_thread = Thread(target=self.worker.run)
         self.worker_thread.start()
+
+    def test_a_failing_queue_setup_fails_worker_construction_even_with_retention_on(self):
+        # the expiry pass is guarded, the lazy collection setup clean() runs first is not: a worker
+        # that started with a half-done setup would run without its heartbeat thread
+        queue_config = QueueConfig()
+        queue_config.QUEUE_SERVER, queue_config.QUEUE_PORT = getTestMongoServerAndPort()
+        queue_config.QUEUE_MONGODB_DBNAME = "test_queue_remote_calls"
+        queue_config.QUEUE_MONGODB_COLLECTION_NAME = "queue_setup_fails"
+        queue = MongoQueue(queue_config, "consumer_setup_fails")
+        queue.retention_seconds = 3600
+        queue.transient_methods = TRANSIENT_JOB_METHODS
+        with patch.object(Collection, "find_one", side_effect=pymongo.errors.ServerSelectionTimeoutError("not up yet")):
+            with self.assertRaises(pymongo.errors.ServerSelectionTimeoutError):
+                myWorker(queue)
+
+    def test_a_failing_expiry_pass_is_logged_and_left_for_the_next_cleanup(self):
+        self.queue.transient_methods = TRANSIENT_JOB_METHODS
+        self.queue.retention_seconds = 7 * 24 * 60 * 60
+        job_id = self.caller.addBinarySample(force_recalculation=True)
+        self.caller.awaitResult(job_id)
+        self._backdate(job_id)
+        with patch.object(self.queue, "delete_job", side_effect=pymongo.errors.AutoReconnect("gone")):
+            with patch("mcrit.libs.mongoqueue.LOGGER") as logger:
+                self.queue.clean()
+        logger.error.assert_called_once()
+        self.assertIsNotNone(self.queue.get_job(job_id))
+        self.queue.clean()
+        self.assertIsNone(self.queue.get_job(job_id))
 
     def _set_job_fields(self, job_id, **fields):
         queue = self.queue
@@ -508,6 +710,18 @@ class MongoQueueRemoteCallTest(LocalQueueRemoteCallTest):
             self.caller.function_that_isnt_remote(1, 2, 3)
         with self.assertRaises(AttributeError):
             self.caller.function_that_doesnt_exist(1, 2, 3)
+
+    def test_worker_construction_sets_up_collection(self):
+        queue_config = QueueConfig()
+        queue_config.QUEUE_SERVER, queue_config.QUEUE_PORT = getTestMongoServerAndPort()
+        queue_config.QUEUE_MONGODB_DBNAME = "test_queue_remote_calls"
+        queue_config.QUEUE_MONGODB_COLLECTION_NAME = "queue_setup"
+        queue = MongoQueue(queue_config, "consumer_setup")
+        self.assertIsNone(queue.collection)
+        self.assertEqual(0, queue.retention_seconds)  # expiry off: clean() still does the lazy setup
+        myWorker(queue)
+        self.assertIsNotNone(queue.collection)
+        self.assertIsNotNone(queue.fs_files)
 
     def tearDown(self):
         self.worker.terminate()

@@ -41,7 +41,9 @@ def main():
     print("loading signatures per sample ...", flush=True)
     per_sample = defaultdict(list)
     for document in database.functions.find({"minhash": {"$ne": ""}}, {"minhash": 1, "sample_id": 1, "_id": 0}):
-        per_sample[document["sample_id"]].append(document["minhash"])
+        # binary, or hex text in a corpus stored before; one form, so equal signatures compare equal
+        minhash = document["minhash"]
+        per_sample[document["sample_id"]].append(minhash.hex() if isinstance(minhash, bytes) else minhash)
     sample_ids = sorted(per_sample)
     print("%d samples, %d hashed functions" % (len(sample_ids), sum(len(v) for v in per_sample.values())), flush=True)
 

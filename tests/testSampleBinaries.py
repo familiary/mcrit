@@ -1,5 +1,7 @@
+import hashlib
 import io
 import json
+import os
 import unittest
 from types import SimpleNamespace
 from typing import Any, cast
@@ -7,11 +9,15 @@ from unittest.mock import MagicMock, patch
 
 import falcon
 import falcon.testing
+from smda.common.SmdaReport import SmdaReport
 
 from mcrit.client.McritClient import McritClient, McritNotFound, McritServerError
 from mcrit.config.StorageConfig import StorageConfig
 from mcrit.index.MinHashIndex import MinHashIndex
 from mcrit.server.SampleResource import SampleResource
+from mcrit.server.StatusResource import StatusResource
+from mcrit.storage.SampleEntry import SampleEntry
+from mcrit.storage.StorageFactory import StorageFactory
 from mcrit.Worker import Worker
 
 from .context import config
@@ -139,7 +145,7 @@ class WorkerKeepsBinariesTest(unittest.TestCase):
         sample_entry = MagicMock()
         sample_entry.sample_id = 42
         sample_entry.toDict.return_value = {"sample_id": 42}
-        setattr(worker, "_addReport", lambda report: sample_entry)
+        setattr(worker, "_addReport", lambda report, **kwargs: sample_entry)
         return worker, storage
 
     def test_the_binary_is_kept_only_when_configured(self):
@@ -161,6 +167,8 @@ class WorkerKeepsBinariesTest(unittest.TestCase):
             worker, storage = self._worker(keep=True)
             known = MagicMock()
             known.sample_id = 7
+            # disassembled from these bytes before; an unverified one is checked instead (#270)
+            known.sha256_verified = True
             known.toDict.return_value = {"sample_id": 7}
             storage.getSampleBySha256.return_value = known
             storage.hasSampleBinary.return_value = False
@@ -175,6 +183,122 @@ class WorkerKeepsBinariesTest(unittest.TestCase):
             result = worker.addBinarySample(b"MZ", "a.exe", "fam", "1", False, None, None)
             storage.storeSampleBinary.assert_not_called()
             self.assertNotIn("binary_stored", result)
+
+
+class Sha256VerifiedTest(unittest.TestCase):
+    """#270: a sample is verified only when MCRIT disassembled it from the bytes itself"""
+
+    BINARY = b"MZ\x90\x00 a binary"
+
+    @staticmethod
+    def _report(sha256):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_report.smda")) as fjson:
+            report = SmdaReport.fromDict(json.load(fjson))
+        assert report is not None
+        report.sha256 = sha256
+        return report
+
+    def _addBinarySample(self, storage, report):
+        worker = Worker(queue=MagicMock(), config=config, storage=storage)
+        with patch("mcrit.Worker.Disassembler") as disassembler:
+            disassembler.return_value.disassembleUnmappedBuffer.return_value = report
+            return worker.addBinarySample(self.BINARY, "a.exe", "fam", "1", False, None, None)
+
+    def test_a_sample_disassembled_from_the_upload_is_verified(self):
+        storage = StorageFactory.getStorage(config)
+        binary_sha256 = hashlib.sha256(self.BINARY).hexdigest()
+        result = self._addBinarySample(storage, self._report(binary_sha256))
+        self.assertIs(True, result["sample_info"]["sha256_verified"])
+        stored = storage.getSampleBySha256(binary_sha256)
+        assert stored is not None
+        self.assertIs(True, stored.sha256_verified)
+
+    def test_a_report_hashing_other_bytes_than_the_upload_is_not(self):
+        # smda hashes what it was handed; should that ever differ from the upload, the sample is
+        # keyed by bytes MCRIT has not checked against the request
+        storage = StorageFactory.getStorage(config)
+        result = self._addBinarySample(storage, self._report(64 * "d"))
+        self.assertIs(False, result["sample_info"]["sha256_verified"])
+
+    def test_a_submitted_report_is_not_verified(self):
+        index = MinHashIndex(config)
+        result = index.addReport(self._report(64 * "e"), calculate_hashes=False)
+        self.assertIs(False, result["sample_info"]["sha256_verified"])
+        result = index.addReportJson(self._report(64 * "f").toDict(), calculate_hashes=False)
+        self.assertIs(False, result["sample_info"]["sha256_verified"])
+
+    def _submitFor(self, sha256_verified):
+        index = MagicMock()
+        sample_entry = SampleEntry(self._report(64 * "a"), sample_id=5, family_id=1, sha256_verified=sha256_verified)
+        index.getSampleBySha256.return_value = sample_entry
+        index.addBinarySample.return_value = "job"
+        req = falcon.Request(falcon.testing.create_environ(path="/samples/binary", method="POST", body=self.BINARY))
+        resp = falcon.Response()
+        SampleResource(index).on_post_submit_binary(req, resp)
+        assert resp.data is not None
+        return index, resp.status, json.loads(resp.data)["data"]
+
+    def test_only_a_verified_sample_refuses_the_upload(self):
+        index, status, data = self._submitFor(True)
+        self.assertEqual(falcon.HTTP_409, status)
+        index.addBinarySample.assert_not_called()
+        self.assertEqual({"message": "Conflict: Binary already exists as sample with ID: 5.", "sample_id": 5, "sha256_verified": True}, data)
+        # indexed from a report or an import, or stored before this was recorded: the job checks
+        # the sample against the binary (#270)
+        for sha256_verified in (False, None):
+            index, status, data = self._submitFor(sha256_verified)
+            self.assertEqual(falcon.HTTP_202, status)
+            self.assertEqual("job", data)
+            index.addBinarySample.assert_called_once()
+
+
+class DeleteOrphanedSampleBinariesTest(unittest.TestCase):
+    """#80: the sweep of kept binaries is reached the way the queue's is, as a job behind a POST"""
+
+    def test_the_job_runs_on_the_worker_and_answers_the_report(self):
+        index = MinHashIndex(config)
+        storage = cast(Any, index._storage)
+        # a binary whose only sample is gone, as an interrupted deletion leaves it
+        storage._sample_binaries["ab" * 32] = (b"MZ", {4242})
+        dry_job = index.deleteOrphanedSampleBinaries(True, force_recalculation=True)
+        self.assertEqual({"dry_run": True, "binaries": 1, "stale_sample_ids": 0, "chunk_files": 0}, index.getResultForJob(dry_job))
+        self.assertIn("ab" * 32, storage._sample_binaries)
+        real_job = index.deleteOrphanedSampleBinaries(False, force_recalculation=True)
+        self.assertEqual({"dry_run": False, "binaries": 1, "stale_sample_ids": 0, "chunk_files": 0}, index.getResultForJob(real_job))
+        self.assertEqual({}, storage._sample_binaries)
+
+    def test_the_route_schedules_the_job_with_dry_run_as_asked(self):
+        for query, dry_run in (("dry_run=true", True), ("dry_run=false", False), ("dry_run=TRUE", True)):
+            with self.subTest(query=query):
+                index = MagicMock()
+                index.deleteOrphanedSampleBinaries.return_value = "0123456789abcdef01234567"
+                app = falcon.App()
+                app.add_route("/delete_orphaned_sample_binaries", StatusResource(index), suffix="delete_orphaned_sample_binaries")
+                response = falcon.testing.TestClient(app).simulate_post("/delete_orphaned_sample_binaries", query_string=query)
+                self.assertEqual(falcon.HTTP_200, response.status)
+                self.assertEqual("0123456789abcdef01234567", response.json["data"])
+                index.deleteOrphanedSampleBinaries.assert_called_once_with(dry_run, force_recalculation=True)
+                index.deleteOrphanedQueueFiles.assert_not_called()
+
+    def test_anything_but_true_or_false_in_the_query_string_is_refused(self):
+        # missing (including sent in the body, which is not read), repeated, or not a boolean
+        for query, body in (("", None), ("", "dry_run=true"), ("dry_run=true&dry_run=true", None), ("dry_run=1", None), ("dry_run=yes", None)):
+            with self.subTest(query=query, body=body):
+                index = MagicMock()
+                app = falcon.App()
+                app.add_route("/delete_orphaned_sample_binaries", StatusResource(index), suffix="delete_orphaned_sample_binaries")
+                headers = {"Content-Type": "application/x-www-form-urlencoded"} if body else None
+                response = falcon.testing.TestClient(app).simulate_post("/delete_orphaned_sample_binaries", query_string=query, body=body, headers=headers)
+                self.assertEqual(falcon.HTTP_400, response.status)
+                index.deleteOrphanedSampleBinaries.assert_not_called()
+
+    def test_the_client_posts_to_the_route(self):
+        with patch("mcrit.client.McritClient.requests.Session.post") as post:
+            post.return_value.status_code = 200
+            post.return_value.json.return_value = {"status": "successful", "data": "0123456789abcdef01234567"}
+            self.assertEqual("0123456789abcdef01234567", McritClient("http://mcrit.test").deleteOrphanedSampleBinaries(dry_run=True))
+        self.assertEqual("http://mcrit.test/delete_orphaned_sample_binaries", post.call_args.args[0])
+        self.assertEqual({"dry_run": "true"}, post.call_args.kwargs["params"])
 
 
 if __name__ == "__main__":

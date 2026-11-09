@@ -118,7 +118,6 @@ class SpawningWorker(Worker):
         return self
 
     def __exit__(self, *args):
-        # TODO unregister our worker_id from all in-progress jobs found in the queue
         try:
             self.queue.unregisterWorker()
             self.queue.release_all_jobs()
@@ -131,8 +130,9 @@ class SpawningWorker(Worker):
     #### NO REDIRECTION: SPAWM SINGLE JOB WORKERS INSTEAD ###
 
     def _jobCommand(self, job):
-        # sys.executable rather than "python", which may not be on PATH or may be another interpreter
-        return [sys.executable, "-m", "mcrit", "singlejobworker", "--job_id", str(job.job_id)]
+        # sys.executable rather than "python", which may not be on PATH or may be another interpreter;
+        # -P as -m would put the inherited working directory first on sys.path, ahead of mcrit itself
+        return [sys.executable, "-P", "-m", "mcrit", "singlejobworker", "--job_id", str(job.job_id)]
 
     def _awaitJobProcess(self, console_handle, job):
         """Wait for a job process, stopping it at QUEUE_SPAWNINGWORKER_CHILDREN_TIMEOUT or, when

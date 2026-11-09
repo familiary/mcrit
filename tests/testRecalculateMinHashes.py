@@ -5,10 +5,12 @@ minhashes of functions whose disassembly is gone (STORAGE_DROP_DISASSEMBLY, or n
 lost for good, and their samples were stamped as hashed by the running smda all the same.
 """
 
+import dataclasses
 import json
 import logging
 import os
 import unittest
+from copy import deepcopy
 
 import pymongo
 import pytest
@@ -45,6 +47,15 @@ class RecalculationMixin(unittest.TestCase):
 
     def _minhashes(self, storage, sample_id):
         return {entry.function_id: entry.minhash for entry in storage.getFunctionsBySampleId(sample_id) if entry.minhash}
+
+    def _tracking(self, mcrit_config):
+        """the config with shingles tracked, so that minhashes carry a shingle composition"""
+        # a new object, not an edit: McritConfig holds its sub-configs as class attributes shared by every copy
+        mcrit_config.MINHASH_CONFIG = dataclasses.replace(mcrit_config.MINHASH_CONFIG, MINHASH_TRACK_SHINGLES=True)
+        return mcrit_config
+
+    def _compositions(self, storage, sample_id):
+        return {entry.function_id: entry.minhash_shingle_composition for entry in storage.getFunctionsBySampleId(sample_id) if entry.minhash}
 
     def test_minhashes_without_disassembly_are_kept_and_found(self):
         index = MinHashIndex(self._config())
@@ -88,12 +99,43 @@ class RecalculationMixin(unittest.TestCase):
         # it keeps minhashes of an older smda, so it stays listed
         self.assertEqual([sample_entry.sample_id], storage.getSamplesWithStaleMinHashes(Worker.getMinHashCompatibilityThreshold()))
 
+    def test_a_repair_keeps_the_compositions_of_functions_without_disassembly(self):
+        """re-added as rebuilt from their bytes, their minhashes wrote an empty composition"""
+        index = MinHashIndex(self._tracking(self._config()))
+        storage = index.getStorage()
+        sample_entry = self._add(index, "example_report.smda")
+        before = self._compositions(storage, sample_entry.sample_id)
+        self.assertGreater(len(before), 1)
+        self.assertTrue(all(before.values()))
+        without = sorted(before)[: len(before) // 2]
+        self._drop_disassembly(storage, sample_entry.sample_id, function_ids=without)
+        storage.setMinHashVersionForSamples("4.0.0", [sample_entry.sample_id])
+        report = index.getResultForJob(index.repairMinHashes(force_recalculation=True))
+        self.assertEqual(1, report["num_samples_repaired"])
+        # those rehashed get the composition computed again, the same as before
+        self.assertEqual(before, self._compositions(storage, sample_entry.sample_id))
+
 
 class RecalculationMemoryTest(RecalculationMixin):
     __test__ = True
 
     def _config(self):
-        return config
+        return deepcopy(config)
+
+    def test_a_recalculation_keeps_the_compositions_of_functions_without_disassembly(self):
+        """re-banded through addMinHash, their minhashes wrote an empty composition; MongoDB
+        storage only re-bands them"""
+        index = MinHashIndex(self._tracking(self._config()))
+        storage = index.getStorage()
+        without_disassembly = self._add(index, "example_report.smda")
+        with_disassembly = self._add(index, "example_report_2.smda")
+        kept_before = self._compositions(storage, without_disassembly.sample_id)
+        rehashed_before = self._compositions(storage, with_disassembly.sample_id)
+        self.assertTrue(kept_before and all(kept_before.values()) and rehashed_before and all(rehashed_before.values()))
+        self._drop_disassembly(storage, without_disassembly.sample_id)
+        index.getResultForJob(index.recalculateMinHashes(force_recalculation=True))
+        self.assertEqual(kept_before, self._compositions(storage, without_disassembly.sample_id))
+        self.assertEqual(rehashed_before, self._compositions(storage, with_disassembly.sample_id))
 
     def _drop_disassembly(self, storage, sample_id, function_ids=None):
         for entry in storage.getFunctionsBySampleId(sample_id):

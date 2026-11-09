@@ -1,7 +1,9 @@
 import datetime
 import functools
+import inspect
 import logging
 import math
+import weakref
 from collections import Counter, defaultdict
 from timeit import default_timer as timer
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -12,6 +14,7 @@ import tqdm
 import mcrit.matchers.MatcherFlags as MatcherFlags
 from mcrit.libs.parallel import create_process_pool
 from mcrit.queue.QueueRemoteCalls import NoProgressReporter
+from mcrit.storage.StorageInterface import BandDfSkips
 
 if TYPE_CHECKING:  # pragma: no cover
     from mcrit.storage.FunctionEntry import FunctionEntry
@@ -70,6 +73,22 @@ def shortlistUnavailableReason(storage) -> Optional[str]:
     return None
 
 
+# per storage method (the function under a bound method): whether it takes the `skips` argument
+_ACCEPTS_SKIPS: "weakref.WeakKeyDictionary[Any, bool]" = weakref.WeakKeyDictionary()
+
+
+def acceptsSkips(getter) -> bool:
+    """Whether a candidate lookup takes `skips` (#201), by name or through **kwargs; cached per method."""
+    function = getattr(getter, "__func__", None)
+    if function is not None and function in _ACCEPTS_SKIPS:
+        return _ACCEPTS_SKIPS[function]
+    parameters = inspect.signature(getter).parameters.values()
+    accepts = any(parameter.name == "skips" or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+    if function is not None:
+        _ACCEPTS_SKIPS[function] = accepts
+    return accepts
+
+
 class MatcherInterface:
     # how many band votes one exact (PicHash) match is worth when ranking the shortlist
     _PICHASH_SHORTLIST_VOTE_WEIGHT = 4
@@ -117,6 +136,12 @@ class MatcherInterface:
         self._shortlist_candidate_cache: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None
         # the shortlist as a sorted array, for vectorised membership tests
         self._shortlist_array: Optional[np.ndarray] = None
+        # what candidate generation left out, for the report (#201): band lookups the df cutoff
+        # skipped, and samples and candidates the shortlist did not keep
+        self._band_df_skips = BandDfSkips()
+        self._shortlist_voted_samples: Optional[int] = None
+        self._shortlist_dropped_samples: Optional[int] = None
+        self._shortlist_dropped_candidates = 0
         if minhash_threshold is None:
             minhash_threshold = self._worker.config.MINHASH_CONFIG.MINHASH_MATCHING_THRESHOLD
         self._minhash_threshold = minhash_threshold
@@ -138,6 +163,14 @@ class MatcherInterface:
         self._shortlist_unavailable = shortlist_unavailable
         # why a requested shortlist was not applied, for the report
         self._shortlist_fallback: Optional[str] = None
+        # per sample, how many entries the PicHash matches would list with every copy paired with every
+        # other (set by _harmonizePicHashMatches); the shortlist votes by it, whatever is listed
+        self._pichash_vote_entries: Counter = Counter()
+        # corpus sample ids that functions still point to but that have no sample document (an
+        # import of an older release, a delete that crashed half-way, a sample deleted while this
+        # job ran), and the matches left out because of them; logged once per job
+        self._orphaned_sample_ids: Set[int] = set()
+        self._orphaned_matches: Set[Tuple[int, int, int]] = set()
         self._additional_setup()
         self._sample_to_lib_info: Dict[int, bool]
         # NOTE: query matchers seed this with a sentinel entry for the query sample itself
@@ -175,10 +208,21 @@ class MatcherInterface:
             function_id_to_minhash = {}
             for function_entry in self._function_entries[start:end]:
                 function_id_to_minhash[function_entry.function_id] = function_entry.getMinHash(minhash_bits=self._worker._minhash_config.MINHASH_SIGNATURE_BITS)
-            candidate_groups = self._storage.getCandidatesForMinHashes(
-                function_id_to_minhash, band_matches_required=self._band_matches_required, band_df_cutoff=self._band_df_cutoff
-            )
+            candidate_groups = self._lookupCandidates(self._storage.getCandidatesForMinHashes, function_id_to_minhash, self._band_df_skips)
         return self._restrictToShortlist(candidate_groups)
+
+    def _lookupCandidates(self, getter, function_id_to_minhash, skips: BandDfSkips):
+        """getter(...) with this job's knobs, counting what the df cutoff skipped into `skips` (#201).
+
+        A storage whose lookup predates the `skips` argument is called without it, decided from its
+        signature rather than by catching a TypeError, which would also swallow a real error inside
+        the count and run the lookup twice.
+        """
+        if acceptsSkips(getter):
+            return getter(function_id_to_minhash, band_matches_required=self._band_matches_required, band_df_cutoff=self._band_df_cutoff, skips=skips)
+        skips.markUnmeasured("storage_unsupported")
+        skips.lookups_counted = False
+        return getter(function_id_to_minhash, band_matches_required=self._band_matches_required, band_df_cutoff=self._band_df_cutoff)
 
     # ---- two-stage matching: shortlist the corpus samples worth matching exactly ----------
 
@@ -234,6 +278,8 @@ class MatcherInterface:
         # Python cost 1.2 s of voting plus 1.1 s of restriction on a 361k-pair query.
         cached_groups: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
         per_function_votes: List[np.ndarray] = []
+        # counted apart and kept only once stage 1 succeeds: a fallback bands the query again
+        stage_skips = BandDfSkips()
         chunk_size = max(1, min(self._worker.config.MINHASH_CONFIG.MINHASH_MATCHING_FUNCTION_BATCH_SIZE, 1000))
         for start_index in range(0, len(self._function_entries), chunk_size):
             function_id_to_minhash = {}
@@ -242,12 +288,7 @@ class MatcherInterface:
             # ask for arrays where storage can produce them: the accumulation is already
             # numpy, and boxing it into sets only to unbox it here is pure overhead
             array_getter = getattr(self._storage, "getCandidateArraysForMinHashes", None)
-            if array_getter is not None:
-                candidate_groups = array_getter(function_id_to_minhash, band_matches_required=self._band_matches_required, band_df_cutoff=self._band_df_cutoff)
-            else:
-                candidate_groups = self._storage.getCandidatesForMinHashes(
-                    function_id_to_minhash, band_matches_required=self._band_matches_required, band_df_cutoff=self._band_df_cutoff
-                )
+            candidate_groups = self._lookupCandidates(array_getter or self._storage.getCandidatesForMinHashes, function_id_to_minhash, stage_skips)
             for function_id, candidate_ids in candidate_groups.items():
                 if not len(candidate_ids):
                     continue
@@ -269,21 +310,52 @@ class MatcherInterface:
             votes = Counter(dict(zip(voted_samples.tolist(), vote_counts.tolist())))
         # an exact match is worth more than a band collision; the weight only has to be big
         # enough that a pichash-only sample outranks a sample carried by a single band hit
-        for _own_function_id, foreign_sample_id, _foreign_function_id in pichash_matches or {}:
-            votes[foreign_sample_id] += self._PICHASH_SHORTLIST_VOTE_WEIGHT
+        # (counted per pair of copies, as it always was, though the matches list fewer of them)
+        if pichash_matches:
+            for foreign_sample_id, num_entries in self._pichash_vote_entries.items():
+                votes[foreign_sample_id] += self._PICHASH_SHORTLIST_VOTE_WEIGHT * num_entries
         # the query's own sample must never be shortlisted away - self-matches are how a
         # sample-vs-corpus result reports its own functions
         votes.pop(self._sample_id, None)
+        if (self._sample_info or {}).get("architecture"):
+            # the architecture filter below reads every voted sample's entry; the report needs the
+            # own one too, so it comes with them in the same lookup
+            self._prefetchSampleEntries(set(votes) | {self._sample_id})
         # samples of another architecture are dropped from the report, so they must not take the
         # places of samples that would be reported
         for sample_id in self._otherArchitectureSampleIds(set(votes)):
             del votes[sample_id]
-        shortlist = self._rankShortlist(votes, shortlist_size)
+        pichash_sample_ids = {match_ids[1] for match_ids in pichash_matches or {}}
+        shortlist = self._rankShortlistOfKnownSamples(votes, shortlist_size, pichash_sample_ids)
+        # counted once orphaned samples are out of the votes: they could not take a place
+        self._shortlist_voted_samples = len(votes)
+        self._shortlist_dropped_samples = len(votes) - len(shortlist)
         if self._sample_id is not None:
             shortlist.add(self._sample_id)
         self._shortlist_candidate_cache = cached_groups
+        self._band_df_skips.merge(stage_skips)
         LOGGER.info("Shortlisted %d of %d voted samples for exact matching", len(shortlist), len(votes))
         return shortlist
+
+    def _rankShortlistOfKnownSamples(self, votes: "Counter", shortlist_size: int, pichash_sample_ids: Set[int]) -> Set[int]:
+        """_rankShortlist, without the samples that have functions but no sample document.
+
+        Those cannot be reported, so they must not take a place either. Only the shortlisted
+        samples are looked up - together with the PicHash-matched ones and the own sample, which
+        the report needs anyway - so that is the job's one sample lookup; the ranking is redone
+        only when it shortlisted such a sample, each round one more lookup of the newly
+        shortlisted samples. An orphan that only voted and never made the shortlist is not looked
+        up, so it is not in the job's warning either; it took no place and has no matches.
+        """
+        also_needed = pichash_sample_ids | {self._sample_id}
+        while True:
+            shortlist = self._rankShortlist(votes, shortlist_size)
+            orphaned = self._findOrphanedSampleIds(shortlist | also_needed)
+            also_needed = set()
+            for sample_id in orphaned:
+                votes.pop(sample_id, None)
+            if not orphaned & shortlist:
+                return shortlist
 
     def _rankShortlist(self, votes: "Counter", shortlist_size: int) -> Set[int]:
         """Pick the samples to keep, by absolute *and* by relative evidence.
@@ -340,11 +412,20 @@ class MatcherInterface:
                 candidates = np.fromiter(entry, dtype=np.int64, count=len(entry))
                 resolved = self._resolveSampleIds(candidates)
                 if resolved is None:
-                    return entry
+                    # unreachable from the shipped matchers, whose shortlist always comes with
+                    # stage 1's (candidates, sample_ids) cache; kept for any other caller.
+                    # the index went incomplete since stage 1: what cannot be resolved cannot be
+                    # restricted, so this and every later batch match against the whole corpus
+                    LOGGER.warning("Shortlisting requested but the function range index is unavailable; matching against the whole corpus instead.")
+                    self._shortlist_fallback = "function_range_index_incomplete"
+                    self._sample_shortlist = None
+                    self._shortlist_array = None
+                    return {key: set(value[0].tolist()) if isinstance(value, tuple) else set(value) for key, value in candidate_groups.items()}
                 sample_ids = resolved
             if not candidates.size:
                 continue
             surviving = candidates[np.isin(sample_ids, self._shortlist_array)]
+            self._shortlist_dropped_candidates += int(candidates.size - surviving.size)
             if surviving.size:
                 restricted[function_id] = set(surviving.tolist())
         return restricted
@@ -470,23 +551,63 @@ class MatcherInterface:
                 minhash_matches = self._harmonizeMinHashMatches(self._sample_id, self._performMinHashMatching(candidate_groups, matching_cache))
                 all_minhash_matches.update(minhash_matches)
             LOGGER.info("Calculated MinHash matches.")
+            self._logCandidateGeneration()
+        # one lookup for the samples of both kinds of matches; stage 1 took orphaned samples out of
+        # its votes already, and has looked up what it shortlisted
+        orphaned = self._findOrphanedSampleIds({match_ids[1] for match_ids in pichash_matches} | {match_ids[1] for match_ids in all_minhash_matches})
+        pichash_matches = self._dropOrphanedSamples(pichash_matches, orphaned)
+        all_minhash_matches = self._dropOrphanedSamples(all_minhash_matches, orphaned)
         pichash_matches = self._dropOtherArchitectures(pichash_matches)
         all_minhash_matches = self._dropOtherArchitectures(all_minhash_matches)
         matching_report = self._craftResultDict(pichash_matches, all_minhash_matches)
+        if self._orphaned_sample_ids:
+            # one line per job, however many functions point to missing samples - also when they
+            # only had shortlist votes taken away and no match was left to drop
+            LOGGER.warning(
+                "Left out %d samples that have functions but no sample document, and %d matches against them (sample ids: %s)",
+                len(self._orphaned_sample_ids),
+                len(self._orphaned_matches),
+                sorted(self._orphaned_sample_ids)[:10],
+            )
         LOGGER.info("Returning aggregated match report.")
         return matching_report
 
+    def _findOrphanedSampleIds(self, sample_ids) -> Set[int]:
+        """The corpus samples among sample_ids that functions point to but that have no sample document.
+
+        Such functions are left behind by imports of older releases (#270), by a delete that did
+        not finish, or by a sample deleted while this job runs. They cannot be reported - there is
+        no family, name or size to report them with - so the matcher leaves them out rather than
+        failing the whole job on them. The query's own sample is never one of them.
+        """
+        self._prefetchSampleEntries(sample_ids)
+        return {sample_id for sample_id in sample_ids if sample_id in self._orphaned_sample_ids}
+
+    def _dropOrphanedSamples(self, matches: HarmonizedMatches, orphaned: Set[int]) -> HarmonizedMatches:
+        """Leave out matches against the orphaned samples, remembering them for the job's warning."""
+        if not matches or not orphaned:
+            return matches
+        kept: HarmonizedMatches = {}
+        for match_ids, strength in matches.items():
+            if match_ids[1] in orphaned:
+                self._orphaned_matches.add(match_ids)
+            else:
+                kept[match_ids] = strength
+        return kept
+
     def _prefetchSampleEntries(self, sample_ids) -> None:
         """Fetch the entries of sample_ids not fetched yet in one lookup, rather than one or two
-        per sample later on (N+1, #111). Lazy per-id lookups stay the fallback for anything the
-        batch did not return."""
-        missing = [sample_id for sample_id in sample_ids if sample_id not in self._sample_id_to_entry]
-        if not missing or not hasattr(self._storage, "getSampleEntriesByIds"):
+        per sample later on (N+1, #111). An id the lookup does not answer has no sample document;
+        it is remembered as orphaned, so it is neither looked up again nor reported."""
+        missing = [sample_id for sample_id in sample_ids if sample_id is not None and sample_id not in self._sample_id_to_entry and sample_id not in self._orphaned_sample_ids]
+        if not missing:
             return
-        for sample_id, entry in self._storage.getSampleEntriesByIds(missing).items():
+        entries = self._storage.getSampleEntriesByIds(missing)
+        for sample_id, entry in entries.items():
             self._sample_id_to_entry.setdefault(sample_id, entry)
             # same predicate as getLibraryInfoForSampleId(...) is not None
             self._sample_to_lib_info.setdefault(sample_id, bool(entry.is_library))
+        self._orphaned_sample_ids.update(sample_id for sample_id in missing if sample_id not in entries and sample_id != self._sample_id)
 
     def _otherArchitectureSampleIds(self, sample_ids) -> Set[int]:
         """The samples among sample_ids that are of another architecture than the one matched (#93).
@@ -702,6 +823,7 @@ class MatcherInterface:
         # Query, VS, Sample
         # all use this version
         pichash_match_mapping: HarmonizedMatches = {}
+        self._pichash_vote_entries = Counter()
         cached_function_id_to_sample_id: Dict[int, int] = {}
         # all_own_function_ids = {entry.function_id for entry in self._function_entries}
         sample_function_id_to_size = {entry.function_id: entry.num_instructions for entry in self._function_entries}
@@ -720,19 +842,32 @@ class MatcherInterface:
             if function_size < self._pichash_size:
                 continue
             # eval matches for this set of tuples
-            if len(pichash_tuples) > 1:
-                for own_function_id in current_own_function_ids:
-                    for foreign_function_id in current_foreign_function_ids:
-                        foreign_sample_id = cached_function_id_to_sample_id[foreign_function_id]
-                        foreign_tuple = (foreign_sample_id, foreign_function_id)
-                        pichash_match_mapping[(own_function_id, *foreign_tuple)] = (100, True, False)
-                    # include self matches
-                    for own_function_id_2 in current_own_function_ids:
-                        if own_function_id == own_function_id_2:
-                            continue
-                        foreign_sample_id = cached_function_id_to_sample_id[own_function_id_2]
-                        foreign_tuple = (foreign_sample_id, own_function_id_2)
-                        pichash_match_mapping[(own_function_id, *foreign_tuple)] = (100, True, False)
+            if len(pichash_tuples) > 1 and current_own_function_ids:
+                # Each own copy of the function is paired with the first copy a sample holds (the lowest function
+                # id, which MinHash matching keeps when the signatures of the copies are equal) and the other
+                # copies there are spread over the own ones: every own function still matches every sample
+                # holding the code and every copy is matched, which is all the summaries count. Pairing each
+                # copy with each made m own copies against n copies in one sample cost m*n entries, and
+                # m*(m-1) self matches - gigabytes for a few thousand copies in one report. The shortlist
+                # still votes by the entries that would have been listed, so it ranks as it did.
+                own_function_ids = sorted(current_own_function_ids)
+                holders_by_sample: Dict[int, List[int]] = {}
+                for foreign_function_id in sorted(current_foreign_function_ids):
+                    holders_by_sample.setdefault(cached_function_id_to_sample_id[foreign_function_id], []).append(foreign_function_id)
+                for sample_id, holder_ids in holders_by_sample.items():
+                    self._pichash_vote_entries[sample_id] += len(own_function_ids) * len(holder_ids)
+                if len(own_function_ids) > 1:
+                    for own_function_id in own_function_ids:
+                        self._pichash_vote_entries[cached_function_id_to_sample_id[own_function_id]] += len(own_function_ids) - 1
+                pairs: List[Tuple[int, int]] = []
+                for holder_ids in holders_by_sample.values():
+                    pairs.extend((own_function_id, holder_ids[0]) for own_function_id in own_function_ids)
+                    pairs.extend((own_function_ids[index % len(own_function_ids)], holder_ids[index]) for index in range(1, len(holder_ids)))
+                # include self matches: each own function with the next one of the group
+                if len(own_function_ids) > 1:
+                    pairs.extend(zip(own_function_ids, own_function_ids[1:] + own_function_ids[:1]))
+                for own_function_id, partner_id in pairs:
+                    pichash_match_mapping[(own_function_id, cached_function_id_to_sample_id[partner_id], partner_id)] = (100, True, False)
         return pichash_match_mapping
 
     def _harmonizeMinHashMatches(self, sample_id, minhash_matches: MinhashMatches) -> HarmonizedMatches:
@@ -822,6 +957,10 @@ class MatcherInterface:
                 self_matched_functions.add(own_function_id)
                 self_matched_functions.add(foreign_function_id)
             else:
+                # _getMatchesRoutineInner has dropped these already; this covers a caller that did not
+                if foreign_sample_id not in self._sample_id_to_entry and self._findOrphanedSampleIds({foreign_sample_id}):
+                    self._orphaned_matches.add(match_ids)
+                    continue
                 if foreign_sample_id not in self._sample_to_lib_info:
                     self._sample_to_lib_info[foreign_sample_id] = self._storage.getLibraryInfoForSampleId(foreign_sample_id) is not None
                 has_libinfo = self._sample_to_lib_info[foreign_sample_id]
@@ -834,10 +973,6 @@ class MatcherInterface:
                     # tuple per match is what grows with the number of matches (#69)
                     continue
 
-                if foreign_sample_id not in self._sample_id_to_entry:
-                    foreign_sample_entry = self._storage.getSampleById(foreign_sample_id)
-                    assert foreign_sample_entry is not None
-                    self._sample_id_to_entry[foreign_sample_id] = foreign_sample_entry
                 foreign_family_id = self._sample_id_to_entry[foreign_sample_id].family_id
 
                 flags = is_pichash_match * MatcherFlags.IS_PICHASH_FLAG + is_minhash_match * MatcherFlags.IS_MINHASH_FLAG + has_libinfo * MatcherFlags.IS_LIBRARY_FLAG
@@ -903,7 +1038,8 @@ class MatcherInterface:
             # rely on dynamically created function entries
             own_sample_function_entries = self._function_entries
         else:
-            own_sample_function_entries = self._storage.getFunctionsBySampleId(own_sample_info["sample_id"])
+            # sizes only: the disassembly is not read here
+            own_sample_function_entries = self._storage.getFunctionsBySampleId(own_sample_info["sample_id"], with_xcfg=False)
         for function_entry in own_sample_function_entries:
             if self._isMatchableFunction(function_entry):
                 own_sample_num_matchable_bytes += function_entry.binweight
@@ -919,11 +1055,16 @@ class MatcherInterface:
         family_adjustment = self._get_family_adjustment(match_report)
 
         for foreign_sample_id in matches_per_sample:
-            if foreign_sample_id not in self._sample_id_to_entry:
-                foreign_sample_entry = self._storage.getSampleById(foreign_sample_id)
-                assert foreign_sample_entry is not None
-                self._sample_id_to_entry[foreign_sample_id] = foreign_sample_entry
+            # _summarizeMatches left out matches against samples without a document, so every
+            # sample here has its entry cached; this only guards callers that skipped it
+            if foreign_sample_id not in self._sample_id_to_entry and self._findOrphanedSampleIds({foreign_sample_id}):
+                continue
             sample_info = self._sample_id_to_entry[foreign_sample_id]
+            # a sample whose report carried no statistics (smda reads them as None) holds {}: count its functions
+            if "num_functions" in sample_info.statistics:
+                num_functions = sample_info.statistics["num_functions"]
+            else:
+                num_functions = len(self._storage.getFunctionIdsBySampleId(foreign_sample_id) or [])
             sample_summary[foreign_sample_id] = {
                 "family": sample_info.family,
                 "family_id": sample_info.family_id,
@@ -934,7 +1075,7 @@ class MatcherInterface:
                 "sample_id": foreign_sample_id,
                 "num_bytes": sample_info.binweight,
                 "is_library": sample_info.is_library,
-                "num_functions": sample_info.statistics["num_functions"],
+                "num_functions": num_functions,
                 "matched": {
                     "functions": {
                         "minhashes": 0,
@@ -1015,8 +1156,52 @@ class MatcherInterface:
         return matches_per_sample
 
     def fellBackUnforeseen(self) -> bool:
-        """Whether a knob could not be applied although the job's arguments did not say it would not be."""
+        """Whether the result depends on state its arguments do not name, so it must not be cached.
+
+        A knob that could not be applied although the job's arguments did not say it would not be
+        (#217), or skip counts left unmeasured because the band df index was incomplete when the job
+        ran (#201): once the index is rebuilt, the same request should be counted, not served this.
+        """
+        if self._band_df_skips.unmeasured_reason == "band_df_index_incomplete":
+            return True
         return self._shortlist_fallback is not None and self._shortlist_unavailable is None
+
+    def _getCandidateGenerationInfo(self) -> Optional[Dict[str, Any]]:
+        """What candidate generation left out of this job (#201), None when it looked up no bands.
+
+        The df cutoff and the shortlist bound the work per query by not looking at everything, and
+        nothing else in a report says how much they did not look at. `degraded` is True only when
+        recall is at risk from the cutoff: it left a query function fewer unskipped bands than
+        band_matches_required, so the fuzzy path cannot find it at all. Shortlist drops are by design and only reported. Counted inside
+        the loops that already run; on MongoDB the skipped hashes come back from the band lookup's
+        own aggregation, which needs the df index and STORAGE_BAND_DF_COUNT_SKIPS - without either,
+        `band_df_skips_measured` is False with the reason, those counts are None and `degraded`
+        False.
+        """
+        if self._band_matches_required <= 0:
+            return None
+        info = self._band_df_skips.toDict(self._band_matches_required)
+        info["shortlist_voted_samples"] = self._shortlist_voted_samples
+        info["shortlist_dropped_samples"] = self._shortlist_dropped_samples
+        info["shortlist_dropped_candidates"] = self._shortlist_dropped_candidates if self._sample_shortlist is not None else None
+        info["degraded"] = bool(info["query_functions_cut_off"])
+        return info
+
+    def _logCandidateGeneration(self) -> None:
+        """One INFO line when the cutoff put recall at risk (#201); silent otherwise."""
+        info = self._getCandidateGenerationInfo()
+        if not info or not info["degraded"]:
+            return
+        LOGGER.info(
+            "Candidate generation degraded: band df cutoff left %d query functions fewer than %d bands, so no MinHash candidate; it skipped %d of %d band "
+            "lookups (%d band hits not fetched) and touched %d query functions.",
+            info["query_functions_cut_off"],
+            self._band_matches_required,
+            info["band_lookups_skipped"],
+            info["band_lookups"],
+            info["postings_skipped"],
+            info["query_functions_with_skipped_bands"],
+        )
 
     def _getMatchingInfo(self) -> Dict[str, Any]:
         """The knobs this job was asked for and the ones it applied, with why any of them differ (#217).
@@ -1051,6 +1236,7 @@ class MatcherInterface:
                 "band_df_cutoff": band_df_cutoff if minhash_stage else None,
             },
             "fallbacks": fallbacks,
+            "candidate_generation": self._getCandidateGenerationInfo(),
         }
 
     def _craftResultDict(self, pichash_matches: HarmonizedMatches, minhash_matches: HarmonizedMatches, num_matches=None) -> Dict:

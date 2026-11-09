@@ -309,5 +309,59 @@ class AwaitResultTest(unittest.TestCase):
                 client.awaitResult(self.JOB_ID, sleep_time=0)
 
 
+class UnknownJobIdsTest(unittest.TestCase):
+    """The job and result routes answer 404 for an unknown id; what each client method makes of it."""
+
+    JOB_ID = "a1b2c3d4e5f6a1b2c3d4e5f6"
+    UNKNOWN = {"status": "failed", "data": {"message": "We don't have a job with that id."}}
+
+    def _calls(self, client):
+        return {
+            "getJobData": lambda: client.getJobData(self.JOB_ID),
+            "getResultForJob": lambda: client.getResultForJob(self.JOB_ID),
+            "getResult": lambda: client.getResult(self.JOB_ID),
+            "getJobForResult": lambda: client.getJobForResult(self.JOB_ID),
+            "awaitResult": lambda: client.awaitResult(self.JOB_ID, sleep_time=0),
+        }
+
+    def test_the_default_client_answers_none_and_awaiting_reads_it_as_terminated(self):
+        client = McritClient("http://mcrit.test")
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=answer(404, self.UNKNOWN)):
+            for name, call in self._calls(client).items():
+                with self.subTest(method=name):
+                    if name == "awaitResult":
+                        with self.assertRaises(JobTerminatedError):
+                            call()
+                    else:
+                        self.assertIsNone(call())
+        with patch("mcrit.client.McritClient.requests.Session.delete", return_value=answer(404, self.UNKNOWN)):
+            self.assertIsNone(client.deleteJob(self.JOB_ID))
+
+    def test_a_client_raising_client_errors_raises_not_found(self):
+        client = McritClient("http://mcrit.test", raise_client_errors=True)
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=answer(404, self.UNKNOWN)):
+            for name, call in self._calls(client).items():
+                with self.subTest(method=name):
+                    with self.assertRaises(McritNotFound) as raised:
+                        call()
+                    self.assertEqual("We don't have a job with that id.", raised.exception.message)
+        with patch("mcrit.client.McritClient.requests.Session.delete", return_value=answer(404, self.UNKNOWN)):
+            with self.assertRaises(McritNotFound):
+                client.deleteJob(self.JOB_ID)
+
+    def test_a_job_deleted_while_awaited_raises_not_found_in_the_raising_mode(self):
+        client = McritClient("http://mcrit.test", raise_client_errors=True)
+        pending = answer(200, {"status": "successful", "data": {"_id": self.JOB_ID, "attempts_left": 1, "terminated": False, "result": None}})
+        with patch("mcrit.client.McritClient.requests.Session.get", side_effect=[pending, answer(404, self.UNKNOWN)]):
+            with self.assertRaises(McritNotFound):
+                client.awaitResult(self.JOB_ID, sleep_time=0)
+
+    def test_raw_mode_hands_out_the_404(self):
+        client = McritClient("http://mcrit.test", raw_responses=True)
+        response = answer(404, self.UNKNOWN)
+        with patch("mcrit.client.McritClient.requests.Session.get", return_value=response):
+            self.assertIs(response, client.getJobData(self.JOB_ID))
+
+
 if __name__ == "__main__":
     unittest.main()

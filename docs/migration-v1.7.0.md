@@ -138,3 +138,42 @@ instruction escaping changes, previously stored MinHashes stop being comparable 
 ones (v1.7.0 adds an escaper fingerprint to `/status` and to exports so you can detect this). With
 the disassembly present, repairing an 11.6M-function index is a few core-hours of local computation.
 Without it, the only route is re-submitting every sample.
+
+## Checking a corpus for older data
+
+Later releases stopped letting in records that older ones accepted (#265, #266, #270): reports with
+a `statistics.num_functions` that is not their function count, MinHashes of another signature
+length, imports attaching functions to the wrong sample. Upgrading does not touch what is already
+stored. A read-only check reports it:
+
+```bash
+$ python -m mcrit.migrations.verify_corpus --out corpus_check.json
+```
+
+It writes nothing, prints JSON and exits with 1 when it finds a problem, like the migration's verify
+mode. It lists samples whose stored functions do not number their statistics, functions without a
+sample or of another family than their sample's, samples holding MinHashes of the wrong length,
+stored binaries whose sha256 is not their sample's (`--hash-binaries` hashes the bytes instead of
+trusting the recorded hash), family counters that disagree with samples and functions,
+replacements an upload left unfinished, deletions that died after claiming their sample, and
+documents in `functions_staging`, `xcfg_staging` or `smda_extras_staging` under a staging id no
+sample records. It also counts samples by `sha256_verified`. Each check gives a complete count and
+the first 20 instances (`--max-examples`).
+
+`sha256_verified: true` says that the sample's stored analysis is MCRIT's own disassembly of bytes
+with that sha256, from a `POST /samples/binary` upload; it vouches for nothing the sample says about
+itself, such as family, version or filename. A sample indexed from a report or an import that reads
+`false` or `null` gets there when its binary is uploaded: the upload replaces its analysis in place.
+
+Family counters are fixed by `POST /recompute_family_stats`, MinHashes by `/repair_minhashes` or a
+re-submission of the sample. An unfinished replacement is a job that died between writing the
+new functions under the sample and removing the old ones, so the sample holds both function sets;
+the next upload of that sample's binary finishes it. An unfinished deletion is finished by
+deleting the sample again. Orphaned staging documents can be deleted by their `staging_id`.
+Functions without a sample can also be left by a deletion that landed while a replacement copied
+its new functions in, with the replacement's job dying right after. The rest needs a look at the
+samples named.
+
+The check is one aggregation over `functions`, projected to the three fields it counts, and
+projected scans of the other collections. It never reads disassembly, and its memory grows with
+the number of samples, not functions.

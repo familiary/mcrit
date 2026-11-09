@@ -39,7 +39,7 @@ Requires **Python 3.12 or newer** (`pyproject.toml` sets `requires-python = ">=3
 pip install -e ".[dev]"
 ```
 
-MongoDB 5.0+ is the recommended persistent backend (CI runs the integration suite against `mongo:8.0`), but the in-memory storage works for development without a database. The mongo-backed tests read the server from `TEST_MONGODB` and fall back to `127.0.0.1:27017`; the variable takes a bare host or a `host:port`, resolved for every one of them through `getTestMongoServerAndPort()` in `tests/context.py` - use that helper in a new mongo-backed test rather than reading the environment again.
+MongoDB 5.0+ is the recommended persistent backend (CI runs the integration suite against `mongo:7.0`), but the in-memory storage works for development without a database. The mongo-backed tests read the server from `TEST_MONGODB` and fall back to `127.0.0.1:27017`; the variable takes a bare host or a `host:port`, resolved for every one of them through `getTestMongoServerAndPort()` in `tests/context.py` - use that helper in a new mongo-backed test rather than reading the environment again.
 
 ## Common commands
 
@@ -70,7 +70,8 @@ docker run -d --rm --name mcrit-mongo --ulimit nofile=200000:200000 -p 27017:270
 
 Pick 5.0 or 7.0 rather than 8.0 for a local container: mongod 8.0 refuses to start on Linux kernels
 6.19 and newer (`MongoDB cannot start: ... known incompatibility`, jira SERVER-121912) and the
-container exits immediately. CI is unaffected, its runners are on older kernels.
+container exits immediately. CI uses 7.0 for the same reason: hosted runners now encounter this
+failure too, before checkout or any tests can run.
 
 The suite creates and drops the band collections repeatedly, which opens enough WiredTiger files
 to exceed docker's default `nofile`. mongod then hits EMFILE, panics and aborts mid-run, and every
@@ -122,7 +123,7 @@ mcrit client submit <file> -f <family_name>
 
 - **Never** run `git commit`, `git push`, or open a PR unless explicitly instructed.
 - **Do not** change MinHash/PicHash/shingler configuration or version numbers without explicit instruction — such changes require a full re-index of the database.
-- Integration tests require a running MongoDB (`mongo:8.0` in CI); the unit suite runs without one.
+- Integration tests require a running MongoDB (`mongo:7.0` in CI); the unit suite runs without one.
 - Always run `ruff format`/`ruff check`, `ty check`, and the unit test suite before considering work complete.
 
 ## Related repositories (reference only)

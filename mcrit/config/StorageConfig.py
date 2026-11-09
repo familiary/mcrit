@@ -123,6 +123,16 @@ class StorageConfig(ConfigInterface):
     # unaffected, and benchmarks/compare_quality.py measures what a given cutoff costs against
     # the uncapped result on a real corpus. See docs/scaling/ for measured numbers.
     STORAGE_BAND_DF_CUTOFF: int = 0
+    # Count, per matching job, the band lookups STORAGE_BAND_DF_CUTOFF skipped, and report them
+    # under info.matching.candidate_generation (#201). A fixed cutoff skips a growing share of a
+    # growing corpus; these counts show it on the queries it affects.
+    #
+    # MemoryStorage counts for free. MongoDB never returns a skipped hash, so the band lookup asks
+    # for them in the same aggregation, from the (band_hash, df) index entries alone (no band
+    # document is read). That repeats the lookup's index seeks: about 2 us per (query function,
+    # band) pair, measured as ~35 ms per 1,000 query functions on a synthetic 20-band corpus.
+    # False drops that probe; reports then say band_df_skips_measured: false, reason "disabled".
+    STORAGE_BAND_DF_COUNT_SKIPS: bool = True
     # Cap on how many function ids one band document may hold, splitting a posting list across
     # (band_hash, bucket) documents once it would exceed that. 0 keeps the single-document shape.
     #
@@ -130,10 +140,11 @@ class StorageConfig(ConfigInterface):
     # one. Measured directly, a document holds about 1.35 million ids while they fit in 32 bits
     # and about 1.05 million once they need BSON int64. On a 7,244-sample real corpus the longest
     # posting list across all 20 bands held 36,183 ids, which puts the wall near 270,000 samples
-    # if it grows linearly. Past it the $push does not slow down, it
-    # fails ("BSONObj size ... is invalid"), and indexing stops for any sample holding a function
-    # whose band hash is already at the cap. Sharding does not move this: a document cannot span
-    # shards.
+    # if it grows linearly - and far sooner for one function submitted over and over, since every
+    # copy adds a posting to the same hash in each band. Past it the $push does not slow down, it
+    # is refused: the hash takes no further postings, which are left out with an error record and
+    # a warning naming the hash, so a function holding it is no longer found through that band.
+    # Sharding does not move this: a document cannot span shards.
     #
     # 100,000 leaves a wide margin under the cap even if postings grow heavier than measured, and
     # keeps a single document small enough to be cheap to ship. It must stay comfortably above

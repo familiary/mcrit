@@ -584,6 +584,48 @@ class WorkerLivenessTest(TestCase):
         counters = {c["name"]: c for c in self.worker_a._getQueueCounters().find({"name": "test_method"})}
         self.assertEqual(1, counters["test_method"]["failed"])
 
+    def _counters(self):
+        return {c["name"]: c for c in self.worker_a._getQueueCounters().find({"name": "test_method"})}["test_method"]
+
+    def test_releasing_all_jobs_moves_a_held_job_from_in_progress_to_queued(self):
+        job = self._claimed_by(self.worker_a, "held")
+        before = self._counters()
+        self.assertEqual(1, before["in_progress"])
+        self.assertEqual(0, before["queued"])
+        self.worker_a.release_all_jobs()
+        released = self._document(job.job_id)
+        self.assertIsNone(released["locked_by"])
+        self.assertEqual(self.worker_a.max_attempts - 1, released["attempts_left"])
+        counters = self._counters()
+        self.assertEqual(0, counters["in_progress"])
+        self.assertEqual(1, counters["queued"])
+
+    def test_releasing_all_jobs_on_the_last_attempt_fails_the_job_and_frees_its_dependents(self):
+        job = self._claimed_by(self.worker_a, "last")
+        self.worker_a._getCollection().update_one({"_id": job.job_id}, {"$set": {"attempts_left": 1}})
+        self.worker_b.put({"method": "test_method", "descriptor": "waiting"}, await_jobs=[str(job.job_id)])
+        self.worker_a.release_all_jobs()
+        failed = self._document(job.job_id)
+        self.assertEqual(0, failed["attempts_left"])
+        self.assertIsNone(failed["locked_by"])
+        counters = self._counters()
+        self.assertEqual(1, counters["failed"])
+        self.assertEqual(0, counters["in_progress"])
+        waiting = self.worker_b.next()
+        assert waiting is not None
+        self.assertEqual("waiting", waiting.payload["descriptor"])
+
+    def test_releasing_all_jobs_leaves_other_consumers_and_finished_jobs_alone(self):
+        finished = self._claimed_by(self.worker_a, "finished")
+        finished.complete()
+        held_by_b = self._claimed_by(self.worker_b, "theirs")
+        before = self._counters()
+        self.worker_a.release_all_jobs()
+        self.assertEqual(self.worker_a.consumer_id, self._document(finished.job_id)["locked_by"])
+        self.assertEqual(self.worker_b.consumer_id, self._document(held_by_b.job_id)["locked_by"])
+        self.assertEqual(self.worker_a.max_attempts, self._document(held_by_b.job_id)["attempts_left"])
+        self.assertEqual(before, self._counters())
+
     def test_a_stranded_job_is_not_served_as_a_cached_result(self):
         job = self._claimed_by(self.worker_a, "shared")
         payload = {"descriptor": "shared"}

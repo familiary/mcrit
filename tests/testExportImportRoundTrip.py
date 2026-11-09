@@ -1,3 +1,5 @@
+import copy
+import dataclasses
 import json
 import logging
 import os
@@ -54,7 +56,8 @@ class ExportImportRoundTripMixin(unittest.TestCase):
         with open(EXAMPLE_REPORT) as fjson:
             report = SmdaReport.fromDict(json.load(fjson))
         assert report is not None
-        sample_entry = index.getStorage().addSmdaReport(report)
+        # as if disassembled from the binary, so the export carries a verified sample (#270)
+        sample_entry = index.getStorage().addSmdaReport(report, sha256_verified=True)
         assert sample_entry is not None
         # a job on the local queue: fetching the result runs it
         index.getResultForJob(index.updateMinHashesForSample(sample_entry.sample_id, force_recalculation=True))
@@ -75,6 +78,9 @@ class ExportImportRoundTripMixin(unittest.TestCase):
         self.assertEqual(sample_entry.family, imported.family)
         self.assertEqual(sample_entry.filename, imported.filename)
         self.assertEqual(sample_entry.statistics, imported.statistics)
+        # the export tells what the source knew; the target never saw the bytes (#270)
+        self.assertIs(True, export_data["sample_entries"][sample_entry.sha256]["sha256_verified"])
+        self.assertIs(False, imported.sha256_verified)
         source_functions = by_offset(source.getStorage().getFunctionsBySampleId(sample_entry.sample_id))
         target_functions = by_offset(target.getStorage().getFunctionsBySampleId(imported.sample_id))
         self.assertEqual(set(source_functions), set(target_functions))
@@ -117,6 +123,73 @@ class ExportImportRoundTripMixin(unittest.TestCase):
         self.assertEqual(sample_entry.statistics["num_functions"], target.getStatus(with_pichash=False)["status"]["num_functions"])
         return source, target
 
+    def _storedComposition(self, storage, function_id):
+        """the shingle composition as the storage holds it for the function, not as an entry reads it"""
+        raise NotImplementedError
+
+    def _importKeepsCompositions(self, target_config):
+        """The import stores each function's shingle composition with its entry and then bands the
+        minhashes; banding them wrote an empty composition over the one just stored."""
+        # compositions are only recorded where shingles are tracked, which is not the default
+        source_config = copy.deepcopy(config)
+        source_config.MINHASH_CONFIG = dataclasses.replace(config.MINHASH_CONFIG, MINHASH_TRACK_SHINGLES=True)
+        source, sample_entry = self._index_with_report(source_config)
+        source_functions = by_offset(source.getStorage().getFunctionsBySampleId(sample_entry.sample_id))
+        compositions = {offset: entry.minhash_shingle_composition for offset, entry in source_functions.items() if entry.minhash}
+        self.assertGreater(len(compositions), 0)
+        self.assertTrue(all(compositions.values()))
+        target = MinHashIndex(target_config)
+        target.addImportData(json.loads(json.dumps(source.getExportData())))
+        target_storage = target.getStorage()
+        imported = target_storage.getSampleBySha256(sample_entry.sha256)
+        assert imported is not None
+        target_functions = by_offset(target_storage.getFunctionsBySampleId(imported.sample_id))
+        for offset, composition in compositions.items():
+            function_id = target_functions[offset].function_id
+            self.assertEqual(composition, self._storedComposition(target_storage, function_id), offset)
+            function_entry = target_storage.getFunctionById(function_id)
+            assert function_entry is not None
+            self.assertEqual(composition, function_entry.minhash_shingle_composition, offset)
+            self.assertEqual(composition, target_functions[offset].minhash_shingle_composition, offset)
+
+    def _importWrongLengthMinHashes(self, mcrit_config):
+        """An export is data from elsewhere: a minhash of another length than this instance's
+        signatures is dropped at import. Kept, it was banded beside the code it was copied from
+        and failed every matching job that drew it as a candidate, or did not fit the band
+        projection at all. The function itself is imported, and a repair hashes it again."""
+        index, sample_entry = self._index_with_report(mcrit_config)
+        export_data = json.loads(json.dumps(index.getExportData(compress_data=False)))
+        # a renamed copy of the indexed sample, so that it lands next to the code it copies
+        copy_sha256 = "ab" * 32
+        sample_dict = export_data["sample_entries"].pop(sample_entry.sha256)
+        sample_dict["sha256"] = copy_sha256
+        export_data["sample_entries"][copy_sha256] = sample_dict
+        functions = export_data["function_entries"].pop(sample_entry.sha256)
+        export_data["function_entries"][copy_sha256] = functions
+        hashed = sorted((function_id for function_id, function in functions.items() if function["minhash"]), key=int)
+        self.assertGreater(len(hashed), 2)
+        # the first keeps its signature, the second is cut short, the others carry a byte too many
+        functions[hashed[1]]["minhash"] = functions[hashed[1]]["minhash"][:16]
+        for function_id in hashed[2:]:
+            functions[function_id]["minhash"] += "00"
+        report = index.addImportData(export_data)
+        self.assertEqual(1, report["num_samples_imported"])
+        self.assertEqual(len(functions), report["num_functions_imported"])
+        storage = index.getStorage()
+        imported = storage.getSampleBySha256(copy_sha256)
+        assert imported is not None
+        minhash_config = mcrit_config.MINHASH_CONFIG
+        signature_bytes = minhash_config.MINHASH_SIGNATURE_LENGTH * (1 if minhash_config.MINHASH_SIGNATURE_BITS <= 8 else 4)
+        imported_functions = storage.getFunctionsBySampleId(imported.sample_id)
+        self.assertEqual([signature_bytes], [len(entry.minhash) for entry in imported_functions if entry.minhash])
+        kept = next(entry for entry in imported_functions if entry.minhash)
+        self.assertIn(kept.function_id, storage.getCandidatesForMinHash(kept.getMinHash(minhash_bits=minhash_config.MINHASH_SIGNATURE_BITS)))
+        # imported samples record no minhash version, so a repair hashes the dropped ones again
+        repair = index.getResultForJob(index.repairMinHashes(force_recalculation=True))
+        self.assertEqual(len(hashed), repair["num_functions_rehashed"])
+        source_minhashes = sorted(entry.minhash for entry in storage.getFunctionsBySampleId(sample_entry.sample_id) if entry.minhash)
+        self.assertEqual(source_minhashes, sorted(entry.minhash for entry in storage.getFunctionsBySampleId(imported.sample_id) if entry.minhash))
+
 
 class MemoryExportImportRoundTrip(ExportImportRoundTripMixin):
     def test_plain_export(self):
@@ -124,6 +197,15 @@ class MemoryExportImportRoundTrip(ExportImportRoundTripMixin):
 
     def test_compressed_export(self):
         self._roundTrip(config, config, compress_data=True)
+
+    def test_wrong_length_minhashes_are_dropped(self):
+        self._importWrongLengthMinHashes(config)
+
+    def _storedComposition(self, storage, function_id):
+        return storage._functions[function_id].toDict()["minhash_shingle_composition"]
+
+    def test_shingle_compositions_survive_the_import(self):
+        self._importKeepsCompositions(config)
 
 
 @pytest.mark.mongo
@@ -152,6 +234,15 @@ class MongoExportImportRoundTrip(ExportImportRoundTripMixin):
     def test_mongo_export_into_mongo(self):
         source, target = self._roundTrip(mongo_config(self.SOURCE_DB), mongo_config(self.TARGET_DB), compress_data=True)
         self.assertEqual(source.getStorage()._getDb().xcfg.count_documents({}), target.getStorage()._getDb().xcfg.count_documents({}))
+
+    def test_wrong_length_minhashes_are_dropped(self):
+        self._importWrongLengthMinHashes(mongo_config(self.TARGET_DB))
+
+    def _storedComposition(self, storage, function_id):
+        return storage._getDb().functions.find_one({"function_id": function_id})["minhash_shingle_composition"]
+
+    def test_shingle_compositions_survive_the_import(self):
+        self._importKeepsCompositions(mongo_config(self.TARGET_DB))
 
     def test_disassembly_dropped_at_the_source_stays_dropped(self):
         """what mcritweb#67 saw: not the export dropping the xcfg, but STORAGE_DROP_DISASSEMBLY

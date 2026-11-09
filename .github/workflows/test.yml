@@ -89,10 +89,12 @@ jobs:
       TEST_MONGODB: 127.0.0.1:27017
     services:
       mongo:
-        image: mongo:8.0
+        # MongoDB 8.0 refuses Linux 6.19+ (SERVER-121912), now used by hosted runners.
+        image: mongo:7.0
         ports:
           - 27017:27017
         options: >-
+          --ulimit nofile=200000:200000
           --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping: 1})'"
           --health-interval 10s
           --health-timeout 5s
