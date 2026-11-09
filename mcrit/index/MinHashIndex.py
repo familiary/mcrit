@@ -17,7 +17,7 @@ from mcrit.config.StorageConfig import StorageConfig
 from mcrit.index.MatchingParameters import applyMatchingPreset, resolveMatchingParams
 from mcrit.index.SearchCursor import FullSearchCursor, MinimalSearchCursor, sortSpec
 from mcrit.index.SearchQueryParser import SearchQueryParser
-from mcrit.libs.tags import MAX_TAGS_PER_ENTITY, TagLimitError, normalizeTags
+from mcrit.libs.tags import MAX_TAGS_PER_ENTITY, TagLimitError, countInvalidTags, normalizeTags
 from mcrit.libs.utility import MAX_DECOMPRESSION_RATIO, MIN_IMPORT_DECOMPRESSED_SIZE, compress_encode, compress_encode_fragments, decompress_decode
 from mcrit.matchers.MatcherQueryFunction import MatcherQueryFunction
 from mcrit.minhash.EscaperFingerprint import FINGERPRINT_UNAVAILABLE, getEscaperFingerprint, getEscaperFingerprints
@@ -403,11 +403,13 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             LOGGER.warning("Dropped %d imported minhashes that are not %d bytes long, the next minhash repair recalculates them.", num_minhashes_dropped, signature_bytes)
         return family_names, family_actors, samples_to_import, num_samples_skipped, num_functions_skipped
 
-    def _prepareImportedSample(self, export_data, sample_sha256, family_names, signature_bytes, inflation_budget):
+    def _prepareImportedSample(self, export_data, sample_sha256, family_names, signature_bytes, inflation_budget, report_dropped_tags=False):
         """Inflate and parse the content of one sample of an export, up to inflation_budget bytes, build
         its sample and function entries and check that the storage can hold them; the entries keep the
         export's family_id. Returns the sample entry, the function entries, the number of minhashes
-        dropped for their length and the number of bytes the content inflated to."""
+        dropped for their length and the number of bytes the content inflated to. Both import passes
+        read every sample through here, so only the one passing report_dropped_tags logs the tags the
+        entries leave out, and an import reports each of them once."""
         sample_entry_dict = export_data["sample_entries"][sample_sha256]
         # exported as a bool; the family statistics count it as 0 or 1
         if sample_entry_dict["is_library"] not in (True, False):
@@ -421,8 +423,14 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             function_entry_dicts = json.loads(inflated)
             del inflated
         sample_entry = SampleEntry.fromDict(sample_entry_dict)
-        # an export is data from elsewhere: a tag this instance would not accept is dropped (#53)
-        sample_entry.tags = normalizeTags(sample_entry.tags, drop_invalid=True)[:MAX_TAGS_PER_ENTITY]
+        # an export is data from elsewhere: a tag this instance would not accept is dropped (#53), and
+        # so are those past the cap. Counted on the dict: fromDict reads a value that is not a list as no tags
+        num_invalid_tags = countInvalidTags(sample_entry_dict.get("tags"))
+        sample_entry.tags = normalizeTags(sample_entry.tags, drop_invalid=True)
+        num_tags_past_cap = max(0, len(sample_entry.tags) - MAX_TAGS_PER_ENTITY)
+        sample_entry.tags = sample_entry.tags[:MAX_TAGS_PER_ENTITY]
+        if report_dropped_tags and (num_invalid_tags or num_tags_past_cap):
+            LOGGER.warning("Dropping %d invalid tag(s) and %d past the cap of %d of imported sample %s.", num_invalid_tags, num_tags_past_cap, MAX_TAGS_PER_ENTITY, sample_sha256)
         if sample_entry.family_id not in family_names:
             raise ImportRejected(f"sample {sample_sha256} names family {sample_entry.family_id}, which the export does not hold")
         # the fields stored as they are read; family_id and sample_id are this instance's, and the
@@ -447,10 +455,15 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
         if sample_entry.family is None:
             sample_entry.family = family_names[sample_entry.family_id]
         num_minhashes_dropped = 0
+        # the functions' dropped tags are counted over the sample and reported once, not once per function
+        num_invalid_tags = num_tags_past_cap = 0
         function_entries = []
         for function_entry_dict in (function_entry_dicts or {}).values():
             function_entry = FunctionEntry.fromDict(function_entry_dict)
-            function_entry.tags = normalizeTags(function_entry.tags, drop_invalid=True)[:MAX_TAGS_PER_ENTITY]
+            num_invalid_tags += countInvalidTags(function_entry_dict.get("tags"))
+            function_entry.tags = normalizeTags(function_entry.tags, drop_invalid=True)
+            num_tags_past_cap += max(0, len(function_entry.tags) - MAX_TAGS_PER_ENTITY)
+            function_entry.tags = function_entry.tags[:MAX_TAGS_PER_ENTITY]
             # the storage keys its pichash index by it
             # null as FunctionEntry stores a function without one
             if function_entry.pichash is None:
@@ -481,6 +494,14 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 function_entry.minhash_shingle_composition = {}
                 num_minhashes_dropped += 1
             function_entries.append(function_entry)
+        if report_dropped_tags and (num_invalid_tags or num_tags_past_cap):
+            LOGGER.warning(
+                "Dropping %d invalid tag(s) and %d past the cap of %d of the imported functions of sample %s.",
+                num_invalid_tags,
+                num_tags_past_cap,
+                MAX_TAGS_PER_ENTITY,
+                sample_sha256,
+            )
         return sample_entry, function_entries, num_minhashes_dropped, num_inflated
 
     def addImportData(self, export_data, import_size=None):
@@ -633,8 +654,11 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
                 index += 1
                 # read again, as the first pass did: it kept no more than the sha256 to bound memory. The
                 # same content inflates to the same size, so this pass draws on a budget of its own, as
-                # large as the first pass's, and cannot exceed it where the first did not
-                sample_entry, function_entries, _, num_inflated = self._prepareImportedSample(export_data, sample_sha256, family_names, signature_bytes, inflation_budget)
+                # large as the first pass's, and cannot exceed it where the first did not. This pass
+                # logs the tags the entries leave out: it reads only an export accepted as a whole
+                sample_entry, function_entries, _, num_inflated = self._prepareImportedSample(
+                    export_data, sample_sha256, family_names, signature_bytes, inflation_budget, report_dropped_tags=True
+                )
                 inflation_budget -= num_inflated
                 sample_entry.family_id = family_id_remapping[sample_entry.family_id]
                 # add sample_entry to storage and receive new sample_id; None when its sha256 is known
@@ -727,6 +751,9 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
             for exported_family_id, tags in family_tags.items() if isinstance(family_tags, dict) else []:
                 remapped_family_id = family_id_remapping.get(int(exported_family_id))
                 local_family = storage.getFamily(remapped_family_id) if remapped_family_id is not None else None
+                num_invalid = countInvalidTags(tags)
+                if num_invalid:
+                    LOGGER.warning("Dropping %d invalid tag(s) of imported family %s.", num_invalid, exported_family_id)
                 tags = normalizeTags(tags, drop_invalid=True)
                 if local_family is None or not tags:
                     continue

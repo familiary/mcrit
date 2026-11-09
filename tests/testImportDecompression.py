@@ -300,9 +300,9 @@ class ImportDecompressionTestSuite(unittest.TestCase):
         prepare = index._prepareImportedSample
         reads = []
 
-        def recording(export_data, sample_sha256, *args):
+        def recording(export_data, sample_sha256, *args, **kwargs):
             reads.append((sample_sha256, len(storage.getFunctions(0, 0))))
-            return prepare(export_data, sample_sha256, *args)
+            return prepare(export_data, sample_sha256, *args, **kwargs)
 
         with (
             patch.object(index, "_prepareImportedSample", side_effect=recording),

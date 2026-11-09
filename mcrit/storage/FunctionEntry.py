@@ -4,6 +4,7 @@ import smda.common.SmdaFunction as smda_function_module
 from smda.common.BinaryInfo import BinaryInfo
 from smda.common.SmdaFunction import SmdaFunction
 
+from mcrit.libs.tags import tagsOfEntryDict
 from mcrit.libs.utility import decode_two_complement, encode_two_complement
 from mcrit.minhash.MinHash import MinHash
 from mcrit.storage.FunctionLabelEntry import FunctionLabelEntry
@@ -228,7 +229,7 @@ class FunctionEntry:
         function_entry.offset = decode_two_complement(entry_dict["offset"])
         function_entry.xcfg = entry_dict["xcfg"] if "xcfg" in entry_dict else None
         # functions stored before #53 carry no tags, and MongoDbStorage leaves the field out while empty
-        function_entry.tags = list(entry_dict.get("tags") or [])
+        function_entry.tags = tagsOfEntryDict(entry_dict)
         return function_entry
 
     def __str__(self):

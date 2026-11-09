@@ -1,6 +1,7 @@
 import re
 from typing import Dict, List, Optional, Tuple
 
+from mcrit.libs.tags import tagsOfEntryDict
 from mcrit.storage.SampleEntry import SampleEntry
 
 
@@ -87,7 +88,7 @@ class FamilyEntry:
         # families stored before #57 carry no actors
         family_entry.actors = list(entry_dict.get("actors") or [])
         # and families stored before #53 no tags
-        family_entry.tags = list(entry_dict.get("tags") or [])
+        family_entry.tags = tagsOfEntryDict(entry_dict)
         samples = entry_dict.get("samples", None)
         if samples is not None:
             family_entry.samples = {id: SampleEntry.fromDict(sample) for id, sample in samples.items()}

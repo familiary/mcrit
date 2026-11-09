@@ -3,6 +3,7 @@ import json
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from mcrit.libs.tags import tagsOfEntryDict
 from mcrit.libs.utility import decode_two_complement, encode_two_complement
 
 # how a sample's timestamp is stored and sent; its text order is the chronological order
@@ -191,7 +192,7 @@ class SampleEntry:
         sample_entry.statistics = statistics if isinstance(statistics, dict) else {}
         sample_entry.timestamp = cls._parseTimestamp(entry_dict.get("timestamp"))
         # samples stored before #53 carry no tags
-        sample_entry.tags = list(entry_dict.get("tags") or [])
+        sample_entry.tags = tagsOfEntryDict(entry_dict)
         return sample_entry
 
     @staticmethod

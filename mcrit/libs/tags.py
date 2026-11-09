@@ -17,7 +17,7 @@ Two caps keep a tag list small, in the REST request as in the stored document:
 """
 
 import re
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 # the entities that carry tags, as the REST API and McritClient name them
 TAG_ENTITIES = ("family", "sample", "function")
@@ -67,6 +67,24 @@ def normalizeTags(tags: Any, drop_invalid: bool = False, limit: Optional[int] = 
         normalized.append(normalizeTag(tag))
     # a dict keeps the first of each in order, and deduplicates in linear time
     return list(dict.fromkeys(normalized))
+
+
+def tagsOfEntryDict(entry_dict: Dict[str, Any]) -> List[str]:
+    """The tags an entry's dict carries, for the entries' fromDict. Every writer stores a list, and a
+    dict stored before #53 has none; anything else, such as a string in an export edited elsewhere,
+    reads as no tags rather than as one tag per character. Validity is the importer's to check."""
+    tags = entry_dict.get("tags")
+    return list(tags) if isinstance(tags, list) else []
+
+
+def countInvalidTags(tags: Any) -> int:
+    """How many entries normalizeTags(tags, drop_invalid=True) drops as invalid: an import reports
+    them rather than dropping them unseen. A value that is not a list at all counts as one."""
+    if tags is None:
+        return 0
+    if isinstance(tags, (str, bytes)) or not isinstance(tags, (list, tuple, set)):
+        return 1
+    return sum(1 for tag in tags if not isValidTag(tag))
 
 
 def mergeTags(tags: List[str], added: List[str]) -> List[str]:
