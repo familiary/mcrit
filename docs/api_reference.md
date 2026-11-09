@@ -13,6 +13,7 @@ A query parameter given more than once answers 400 naming it (`RepeatedParameter
 | `GET` | `/complete_minhashes` | Schedule a job that calculates every missing minhash - for samples submitted with deferred hashing, or whose hashing job failed earlier - and finishes the samples it completes. Answers the job id. | `completeMinhashes` |
 | `GET` | `/config` | Not implemented; answers 501. | - |
 | `POST` | `/delete_orphaned_queue_files` | Schedule a job that deletes the GridFS files and chunks no job refers to any more; with ``dry_run=true`` it only counts them. Answers the job id. | `deleteOrphanedQueueFiles` |
+| `POST` | `/delete_orphaned_sample_binaries` | Schedule a job that deletes the kept binaries (``sample_binaries``) no existing sample refers to any more; with ``dry_run=true`` it only counts them. Answers the job id. | `deleteOrphanedSampleBinaries` |
 | `GET` | `/export` | Export every family, sample and function entry (with minhashes) of the instance for import into another one. ``compress=true`` compresses the function entries per sample. | `getExportData` |
 | `GET` | `/export/{comma_separated_sample_ids}` | Export only the samples with the given comma separated ids, in the same format as ``/export``. | `getExportData` |
 | `GET` | `/families` | All families keyed by id; optional ``start`` (first family id) and ``limit``. | `getFamilies` |

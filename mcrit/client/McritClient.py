@@ -388,15 +388,13 @@ class McritClient:
             return self._passthrough(response)
         return self._handle(response)
 
-    def deleteOrphanedSampleBinaries(self, dry_run=False):
-        """
-        Schedule a job that deletes the kept binaries no existing sample refers to any more (#80); with dry_run it only counts them; answers the job id
-        """
+    def deleteOrphanedSampleBinaries(self, dry_run: bool = False) -> Optional[str]:
+        """POST /delete_orphaned_sample_binaries: schedule a job that deletes the kept binaries no existing sample refers to any more (#80); with ``dry_run`` it only counts them. Answers the job id."""
         response = self._session.post(
             f"{self.mcrit_server}/delete_orphaned_sample_binaries", params={"dry_run": "true" if dry_run else "false"}, headers=self.headers, timeout=self.timeout
         )
         if self.raw:
-            return response
+            return self._passthrough(response)
         return self._handle(response)
 
     def recalculatePicHashes(self) -> Optional[str]:
