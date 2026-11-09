@@ -477,6 +477,8 @@ class ExportImportTags(unittest.TestCase):
         self.assertIn(f"Dropping 2 invalid tag(s) of imported family {sample.family_id}.", warnings)
         self.assertIn(f"Dropping 1 invalid tag(s) and 3 past the cap of {MAX_TAGS_PER_ENTITY} of imported sample {sample.sha256}.", warnings)
         self.assertIn(f"Dropping 2 invalid tag(s) and 0 past the cap of {MAX_TAGS_PER_ENTITY} of the imported functions of sample {sample.sha256}.", warnings)
+        # both import passes read every sample, and only one of them reports
+        self.assertEqual(3, len([warning for warning in warnings if warning.startswith("Dropping")]), warnings)
         # what is kept is unchanged by the reporting
         imported = target.getStorage().getSampleBySha256(sample.sha256)
         self.assertEqual(MAX_TAGS_PER_ENTITY, len(imported.tags))
