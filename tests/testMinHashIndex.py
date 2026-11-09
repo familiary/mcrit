@@ -413,12 +413,11 @@ class EscaperProvenanceTestSuite(unittest.TestCase):
         target = MinHashIndex(config)
         target_family_id = target.getStorage().addFamily("actors_family")
         target.getStorage().modifyFamily(target_family_id, {"actors": ["Actor B"]})
-        with patch("mcrit.index.MinHashIndex.LOGGER") as logger:
+        # refused before anything is stored, as #266 refuses actors that are not a list
+        with self.assertRaisesRegex(ImportRejected, "actors of family .* other than a list"):
             target.addImportData(export_data)
         self.assertEqual(["Actor B"], target.getStorage().getFamily(target_family_id).actors)
-        self.assertIn(
-            f"Dropping the actors of imported family {sample_entry.family_id}, which are not a list.", [call.args[0] % call.args[1:] for call in logger.warning.call_args_list]
-        )
+        self.assertIsNone(target.getStorage().getSampleBySha256(sample_entry.sha256))
 
     def testImportOfMatchingEscaperIsNotFlagged(self):
         index = MinHashIndex(config)
