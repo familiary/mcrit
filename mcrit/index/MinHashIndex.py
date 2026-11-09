@@ -785,6 +785,7 @@ class MinHashIndex(QueueRemoteCaller(Worker)):
     def rebuildIndex(self):
     def recomputeFamilyStats(self):
     def deleteOrphanedQueueFiles(self, dry_run=False):
+    def deleteOrphanedSampleBinaries(self, dry_run=False):
     def recalculatePicHashes(self):
     def recalculateMinHashes(self):
     def repairMinHashes(self):
