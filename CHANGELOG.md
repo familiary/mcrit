@@ -674,6 +674,15 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
   zero-padded pichash entry). `POST /samples` also answers 400 instead of 500 for any report smda
   refuses as malformed.
 
+- **A family's actors given as a string read as one actor per character** ([#57]). An import
+  iterated whatever `family_actors` held for a family, so an export carrying `"APT28"` instead of
+  `["APT28"]` added the actors A, P, T, 2 and 8 to the target family; each is a valid name, so the
+  check against the API's rule let them all through and nothing was logged. `FamilyEntry.fromDict`
+  took `list()` of the stored value the same way. A value that is not a list is now no actors: an
+  import drops it with a warning naming the family, and keeps the target's own actors. Every
+  writer in mcrit stores a list, so only an export edited by hand or written elsewhere was
+  affected; families already imported that way keep the single-character actors until edited.
+
 ### Security
 
 - A sample whose SMDA report had no timestamp (missing or empty) was stored, but reading it back

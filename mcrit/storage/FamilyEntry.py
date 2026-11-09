@@ -85,8 +85,10 @@ class FamilyEntry:
         family_entry.num_samples = entry_dict["num_samples"]
         family_entry.num_functions = entry_dict["num_functions"]
         family_entry.num_library_samples = entry_dict["num_library_samples"]
-        # families stored before #57 carry no actors
-        family_entry.actors = list(entry_dict.get("actors") or [])
+        # families stored before #57 carry no actors. Every writer stores a list; anything else, as
+        # a string in an export edited by hand, is no actors rather than one actor per character
+        actors = entry_dict.get("actors")
+        family_entry.actors = list(actors) if isinstance(actors, list) else []
         # and families stored before #53 no tags
         family_entry.tags = tagsOfEntryDict(entry_dict)
         samples = entry_dict.get("samples", None)
