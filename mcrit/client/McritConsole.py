@@ -10,6 +10,7 @@ from smda.common.SmdaReport import SmdaReport
 from smda.Disassembler import Disassembler
 
 from mcrit.client.McritClient import McritClient
+from mcrit.config.SmdaConfigFactory import createSmdaConfig
 from mcrit.storage.FamilyEntry import FamilyEntry
 from mcrit.storage.FunctionEntry import FunctionEntry
 from mcrit.storage.MatchingResult import MatchingResult
@@ -147,7 +148,7 @@ def getSmdaReportFromFilepath(args, filepath):
         if args.executables_only and not is_pe_or_elf(filepath):
             print(f"Skipping a file not recognized as executable: {filepath}")
         else:
-            disassembler = Disassembler()
+            disassembler = Disassembler(createSmdaConfig())
             if get_base_addr(filename) is not None:
                 base_addr = get_base_addr(filename)
                 try:
