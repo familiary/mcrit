@@ -20,6 +20,7 @@ from mcrit.config.McritConfig import McritConfig
 from mcrit.config.MinHashConfig import MinHashConfig
 from mcrit.config.QueueConfig import QueueConfig
 from mcrit.config.ShinglerConfig import ShinglerConfig
+from mcrit.config.SmdaConfigFactory import createSmdaConfig
 from mcrit.config.StorageConfig import StorageConfig
 from mcrit.libs.parallel import create_process_pool
 from mcrit.matchers.MatcherCross import MatcherCross
@@ -153,6 +154,11 @@ class Worker(QueueRemoteCallee):
             self.updateMinHashesForSample(sample_entry.sample_id)
         return sample_entry
 
+    def _createSmdaConfig(self):
+        """The SmdaConfig of every disassembly this worker does, submission and query alike."""
+        # a config object from before the setting existed has no such attribute: fall back to the environment
+        return createSmdaConfig(getattr(getattr(self, "config", None), "API_COLLECTION_FILES", None))
+
     # Reports PROGRESS
     @Remote(progress=True, file_locations=[0])
     def addBinarySample(self, binary, filename, family, version, is_dump, base_address, bitness, progress_reporter=NoProgressReporter()):
@@ -166,7 +172,7 @@ class Worker(QueueRemoteCallee):
                 # sample submitted before binaries were kept: complete it here
                 result["binary_stored"] = self._storage.storeSampleBinary(sample_entry.sample_id, binary)
             return result
-        config = SmdaConfig()
+        config = self._createSmdaConfig()
         SMDA_REPORT = None
         DISASSEMBLER = Disassembler(config)
         LOGGER.info("Disassembling...")
@@ -616,7 +622,7 @@ class Worker(QueueRemoteCallee):
         shortlist_unavailable=None,
         progress_reporter=NoProgressReporter(),
     ):
-        config = SmdaConfig()
+        config = self._createSmdaConfig()
         SMDA_REPORT = None
         DISASSEMBLER = Disassembler(config)
         SMDA_REPORT = DISASSEMBLER.disassembleBuffer(binary, base_address)
@@ -646,7 +652,7 @@ class Worker(QueueRemoteCallee):
         shortlist_unavailable=None,
         progress_reporter=NoProgressReporter(),
     ):
-        config = SmdaConfig()
+        config = self._createSmdaConfig()
         SMDA_REPORT = None
         DISASSEMBLER = Disassembler(config)
         SMDA_REPORT = DISASSEMBLER.disassembleUnmappedBuffer(binary)

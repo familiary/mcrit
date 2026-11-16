@@ -18,6 +18,13 @@ class McritConfig:
     # It can be supplied via the environment, so that it does not have to be stored in a config file.
     AUTH_TOKEN = os.getenv("MCRIT_AUTH_TOKEN", "")
 
+    # ApiScout WinAPI databases handed to SMDA, which resolves the API references of memory dumps
+    # with them (files get theirs from the import table either way). Off when empty, the default.
+    # "os_name=path" entries separated by ";" or ",", or just a path; see mcrit/config/SmdaConfigFactory.py
+    # and the README. Enabling it can change the code SMDA recovers from a dump, so dumps indexed
+    # before and after are not disassembled alike.
+    API_COLLECTION_FILES = os.getenv("MCRIT_API_COLLECTION_FILES", "")
+
     ### global logging-config setup
     # Only do basicConfig if no handlers have been configured
     LOG_PATH = "./"

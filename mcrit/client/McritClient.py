@@ -9,6 +9,7 @@ import requests
 from smda.common.SmdaReport import SmdaReport
 from smda.Disassembler import Disassembler
 
+from mcrit.config.SmdaConfigFactory import createSmdaConfig
 from mcrit.queue.LocalQueue import Job
 from mcrit.storage.FamilyEntry import FamilyEntry
 from mcrit.storage.FunctionEntry import FunctionEntry
@@ -748,7 +749,7 @@ class McritClient:
         preset=None,
     ) -> Any:
         if disassemble_locally:
-            disassembler = Disassembler()
+            disassembler = Disassembler(createSmdaConfig())
             smda_report = disassembler.disassembleBuffer(binary, base_address)
             if smda_report.status == "error":
                 return None
@@ -784,7 +785,7 @@ class McritClient:
         preset=None,
     ) -> Any:
         if disassemble_locally:
-            disassembler = Disassembler()
+            disassembler = Disassembler(createSmdaConfig())
             smda_report = disassembler.disassembleUnmappedBuffer(binary)
             if smda_report.status == "error":
                 return None

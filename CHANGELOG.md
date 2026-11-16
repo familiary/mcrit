@@ -15,6 +15,28 @@ reasoning is still at hand, rather than reconstructing it from the commit log at
 
 ## [Unreleased]
 
+- **New setting, off by default:** the environment variable `MCRIT_API_COLLECTION_FILES`
+  (`McritConfig.API_COLLECTION_FILES`) names [ApiScout](https://github.com/danielplohmann/apiscout)
+  WinAPI databases that are handed to SMDA, so that the functions of a memory dump get their API
+  references. Until now every disassembly ran on a default `SmdaConfig()`, which resolves the APIs of
+  files from their import table and those of dumps not at all. It takes `os_name=path` entries
+  separated by `;` or `,`, or a single path. All disassembly goes through it - the worker's
+  `addBinarySample`, `getMatchesForMappedBinary` and `getMatchesForUnmappedBinary`, and the local
+  disassembly of `McritClient` and `mcrit client` - so set it for the workers and for the clients
+  alike. Unset, nothing changes, and `RESULTS_VERSION` stays as it is. See the README.
+  - A file that is missing or is not an ApiScout database is skipped with one warning per process
+    and disassembly carries on without it, rather than failing the job.
+  - **Enabling it can change the code recovered from a dump**, not just add references: SMDA does
+    not follow a call target it resolved to an API as a function candidate and ends a function at
+    a jump to one. That shows where a database address lies inside the dump itself; elsewhere the
+    references are an annotation and functions, blocks and PicHashes stay the same. Dumps indexed
+    before enabling it are not re-disassembled, and a match report cached for a dump query before
+    is handed out again unless the query asks for `force_recalculation`.
+  - A database only resolves dumps from the system it was crawled on. SMDA up to 5.0.2 ignores
+    the per-DLL `aslr_offset` of a database: harmless for ApiScout's Windows XP and Windows 7
+    databases (all offsets 0), but the Windows 10 1803 one is mostly unusable (5,706 of 86,703 addresses
+    right) until an SMDA release applies the offsets, and is then valid for dumps from the same boot only.
+
 ## [1.16.0] - 2026-10-16
 
 **Minor release: bounded search and listing, the SMDA report rebuilt from storage, and correct
